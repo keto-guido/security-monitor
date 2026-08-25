@@ -21,6 +21,11 @@ dependencies = [
     "ultralytics>=8.1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/keto-guido/security-monitor"
+Repository = "https://github.com/keto-guido/security-monitor"
+Issues = "https://github.com/keto-guido/security-monitor/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
 
