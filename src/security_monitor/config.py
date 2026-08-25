@@ -18,6 +18,8 @@ VALID_TRANSPORTS = ("tcp", "udp", "auto")
 VALID_CAMERA_KINDS = ("ubiquiti", "reolink", "amcrest", "dahua")
 VALID_SCREEN_ROTATIONS = ("none", "normal", "left", "right", "inverted")
 VALID_CAMERA_ROTATIONS = (0, 90, 180, 270)
+VALID_DECODE_MODES = ("auto", "cpu", "gpu")
+VALID_HWACCELS = ("auto", "none", "cuda", "qsv", "vaapi", "d3d11va", "videotoolbox")
 URL_SCHEMES = ("rtsp", "rtp", "http", "https", "file", "rtmp")
 
 # Esc → Cameras → Layout presets (columns, rows).
@@ -126,6 +128,10 @@ class DisplayConfig:
     # Auto-erase unlocked captures/events (0 = off). Locked items are kept.
     capture_retention_days: float = 14.0
     capture_max_gb: float = 20.0
+    # Stream decode: auto | cpu | gpu — hwaccel: auto | none | cuda | qsv | vaapi | d3d11va
+    decode_mode: str = "auto"
+    hwaccel: str = "auto"
+    hwaccel_device: str = ""  # e.g. /dev/dri/renderD128
     # Auto-advance focused camera (0 / False = off). Menu: Esc → Cameras.
     cycle_focus: bool = False
     cycle_focus_seconds: float = 10.0
@@ -370,6 +376,9 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["person_max_event_seconds"] = float(d.person_max_event_seconds)
     display["capture_retention_days"] = float(d.capture_retention_days)
     display["capture_max_gb"] = float(d.capture_max_gb)
+    display["decode_mode"] = str(d.decode_mode)
+    display["hwaccel"] = str(d.hwaccel)
+    display["hwaccel_device"] = str(d.hwaccel_device or "")
     display["cycle_focus"] = bool(d.cycle_focus)
     display["cycle_focus_seconds"] = float(d.cycle_focus_seconds)
 
@@ -466,6 +475,13 @@ def _parse_display(raw: Any) -> DisplayConfig:
     data.capture_max_gb = float(raw.get("capture_max_gb", data.capture_max_gb) or 0)
     if data.capture_max_gb < 0 or data.capture_max_gb > 10_000:
         raise ConfigError("display.capture_max_gb must be between 0 and 10000")
+    data.decode_mode = str(raw.get("decode_mode", data.decode_mode)).strip().lower() or "auto"
+    if data.decode_mode not in VALID_DECODE_MODES:
+        raise ConfigError(f"display.decode_mode must be one of {VALID_DECODE_MODES}")
+    data.hwaccel = str(raw.get("hwaccel", data.hwaccel)).strip().lower() or "auto"
+    if data.hwaccel not in VALID_HWACCELS:
+        raise ConfigError(f"display.hwaccel must be one of {VALID_HWACCELS}")
+    data.hwaccel_device = str(raw.get("hwaccel_device", data.hwaccel_device) or "").strip()
     data.cycle_focus = _bool(raw, "cycle_focus", data.cycle_focus)
     data.cycle_focus_seconds = _positive_float(
         raw, "cycle_focus_seconds", data.cycle_focus_seconds

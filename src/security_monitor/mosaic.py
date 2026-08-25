@@ -91,7 +91,13 @@ from security_monitor.config import (
     save_display_settings,
     unique_camera_name,
 )
-from security_monitor.detection import DetectionEngine, draw_boxes
+from security_monitor.decode import (
+    decode_mode_label,
+    next_decode_mode,
+    next_hwaccel,
+    opencv_decode_summary,
+    probe_hwaccels,
+)
 from security_monitor.events import (
     PERSON_POST_ROLL_CHOICES,
     PERSON_PRE_ROLL_CHOICES,
@@ -171,6 +177,7 @@ _NESTED_MENU_PAGES = frozenset(
         "capture",
         "detection",
         "detection_cams",
+        "decode_status",
         *_CAMERA_MENU_PAGES,
         *_CAPTURE_BROWSER_PAGES,
         *_EVENT_BROWSER_PAGES,
@@ -685,6 +692,10 @@ class MosaicApp:
             self._activate_menu(items[self._menu_index][0])
             return
         if ch in (ord("q"), ord("Q")):
+            if self._menu_page == "decode_status":
+                self._menu_page = "video"
+                self._menu_index = 0
+                return
             if self._menu_page == "detection_cams":
                 self._menu_page = "detection"
                 self._menu_index = 0
@@ -731,6 +742,10 @@ class MosaicApp:
     def _on_escape(self) -> None:
         if self._prompt is not None:
             self._prompt = None
+            return
+        if self._menu_open and self._menu_page == "decode_status":
+            self._menu_page = "video"
+            self._menu_index = 0
             return
         if self._menu_open and self._menu_page == "detection_cams":
             self._menu_page = "detection"
@@ -812,13 +827,34 @@ class MosaicApp:
             d = self.display
             smooth = "On" if d.smooth_buffer else "Off"
             rewind = "On" if d.rewind_buffer else "Off"
+            decode = decode_mode_label(d.decode_mode, d.hwaccel)
             return [
                 ("smooth_toggle", f"Smooth buffer: {smooth}"),
                 ("smooth_length", f"Buffer length: {d.smooth_buffer_seconds:g}s"),
                 ("rewind_toggle", f"Rewind buffer: {rewind}"),
                 ("rewind_length", f"Rewind length: {d.rewind_buffer_seconds:g}s"),
+                ("decode_mode", f"Decode: {d.decode_mode.upper()} — {decode}"),
+                ("hwaccel", f"HW backend: {d.hwaccel}"),
+                ("decode_status", "Decode status…"),
                 ("video_back", "Back"),
             ]
+        if self._menu_page == "decode_status":
+            items: list[tuple[str, str]] = [
+                ("decode_summary", opencv_decode_summary()[:70]),
+            ]
+            accels = probe_hwaccels()
+            items.append(
+                (
+                    "decode_available",
+                    "Available: " + (", ".join(accels) if accels else "none detected"),
+                )
+            )
+            for source in self.sources:
+                snap = source.snapshot()
+                label = snap.decode or "—"
+                items.append((f"decode_cam:{source.name}", f"{source.name}: {label}"))
+            items.append(("decode_status_back", "Back"))
+            return items
         if self._menu_page == "capture":
             d = self.display
             folder = self._save_dir()
@@ -1185,6 +1221,24 @@ class MosaicApp:
         elif action == "video_back":
             self._menu_page = "root"
             self._menu_index = 0
+        elif action == "decode_mode":
+            self._adjust_menu_item("decode_mode", 1)
+        elif action == "hwaccel":
+            self._adjust_menu_item("hwaccel", 1)
+        elif action == "decode_status":
+            self._menu_page = "decode_status"
+            self._menu_index = 0
+            self._reboot_notice = opencv_decode_summary()
+        elif action == "decode_status_back":
+            self._menu_page = "video"
+            self._menu_index = 0
+        elif action == "decode_summary" or action == "decode_available":
+            self._reboot_notice = opencv_decode_summary()
+        elif action.startswith("decode_cam:"):
+            name = action.split(":", 1)[1]
+            source = next((s for s in self.sources if s.name == name), None)
+            if source is not None:
+                self._reboot_notice = f"{name}: {source.snapshot().decode or '—'}"
         elif action == "smooth_toggle":
             self._set_smooth_buffer(not self.display.smooth_buffer)
         elif action == "smooth_length":
@@ -1286,6 +1340,22 @@ class MosaicApp:
             self.display.rewind_buffer_seconds = float(value)
             self.display.rewind_buffer = True
             self._apply_buffer_settings(persist=True)
+        elif action == "decode_mode":
+            previous = self.display.decode_mode
+            self.display.decode_mode = next_decode_mode(self.display.decode_mode, step)
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = decode_mode_label(
+                self.display.decode_mode, self.display.hwaccel
+            )
+            if previous != self.display.decode_mode:
+                self._reconnect_all()
+        elif action == "hwaccel":
+            previous = self.display.hwaccel
+            self.display.hwaccel = next_hwaccel(self.display.hwaccel, step)
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = f"HW backend: {self.display.hwaccel}"
+            if previous != self.display.hwaccel:
+                self._reconnect_all()
         elif action == "clip_length":
             value = next_choice(CLIP_LENGTH_CHOICES, self.display.clip_seconds, step)
             self.display.clip_seconds = float(value)
@@ -2351,6 +2421,7 @@ class MosaicApp:
         items = self._menu_items()
         wide = self._menu_page in {
             "video",
+            "decode_status",
             "capture",
             "detection",
             "detection_cams",
@@ -2358,7 +2429,7 @@ class MosaicApp:
             *_CAPTURE_BROWSER_PAGES,
             *_EVENT_BROWSER_PAGES,
         }
-        card_w, row_h, pad = (600 if wide else 480), 46, 20
+        card_w, row_h, pad = (720 if self._menu_page == "decode_status" else 600 if wide else 480), 46, 20
         title_h = 56
         footer_h = 36
         notice_h = 28 if self._reboot_notice else 0
@@ -2385,6 +2456,7 @@ class MosaicApp:
         heading = {
             "reboot_confirm": "Confirm reboot",
             "video": "Video settings",
+            "decode_status": "Decode status",
             "capture": "Capture",
             "detection": "Detection",
             "detection_cams": "Cameras for detection",
@@ -2447,6 +2519,8 @@ class MosaicApp:
             footer = "This will restart every camera"
         elif self._menu_page == "video":
             footer = "Enter toggle/cycle    ← → adjust    Esc back"
+        elif self._menu_page == "decode_status":
+            footer = "Per-camera decode path    Esc back"
         elif self._menu_page == "capture":
             footer = "s snapshot  c clip    ← → length    Esc back"
         elif self._menu_page == "events_play":

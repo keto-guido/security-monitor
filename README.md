@@ -195,6 +195,16 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 
 The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detection**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
 
+### Video decode (GPU / CPU)
+
+`Esc` → **Video settings**:
+
+- **Decode** — `auto` (prefer GPU, fall back to CPU), `cpu`, or `gpu`
+- **HW backend** — `auto`, `none`, or a specific FFmpeg accel (`cuda`, `qsv`, `vaapi`, `d3d11va`, `videotoolbox`)
+- **Decode status…** — OpenCV/FFmpeg capability summary plus the path each camera actually opened with (e.g. `auto/vaapi`, `cpu (fallback)`)
+
+Changing decode mode or backend reconnects streams. Optional `display.hwaccel_device` (e.g. `/dev/dri/renderD128`) is for VAAPI. Stock `opencv-python` wheels often still decode on the CPU even when hardware acceleration is requested — use `security-monitor check` to see what this build reports.
+
 ### Person events (auto capture)
 
 `Esc` → **Detection** → **Auto person capture** (also **Person events…** on the root menu):
@@ -271,13 +281,14 @@ python -m security_monitor       # same as security-monitor
 
 Each camera is read on its own thread and only the latest frame is kept, so a slow stream does not stall the others. The UI thread composites a grid, letterboxes (or crops) each tile, and draws name / status / FPS. Dropped streams retry on `reconnect_seconds`.
 
-OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-python`, not `opencv-python-headless`.
+OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-python`, not `opencv-python-headless`. Decode mode (`display.decode_mode` / Video settings) sets `OPENCV_FFMPEG_CAPTURE_OPTIONS` (`hwaccel=…`) when opening RTSP streams and falls back to software decode if the GPU path fails a smoke read.
 
 ## Troubleshooting
 
 - **NO SIGNAL / connect failed** — verify the URL in VLC first, then try `transport: tcp`.
 - **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python`.
-- **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost.
+- **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost. Try `decode_mode: cpu` if a bad GPU path stalls opens.
+- **Want GPU decode** — set `decode_mode: gpu` (or `auto`) and pick a backend under Video settings. Confirm with **Decode status…** or `security-monitor check`. Pip wheels frequently lack working CUDA/VAAPI decode; a custom OpenCV/FFmpeg build may be required.
 - **Linux display** — needs an X11/Wayland session. SSH needs X forwarding or a desktop.
 - **Squished / stretched mosaic on Linux** — OpenCV’s Qt window backend often reports the wrong window size (especially fullscreen). This build ignores bad rects and paints at the real screen size from `xrandr`. Update to the latest package, then:
   ```bash

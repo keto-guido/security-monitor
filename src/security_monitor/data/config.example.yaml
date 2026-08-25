@@ -50,6 +50,11 @@ display:
   # Auto-erase unlocked captures/events (0 = off). Lock items in the browser to keep them.
   capture_retention_days: 14
   capture_max_gb: 20
+  # Stream decode (Esc → Video settings). auto tries GPU then falls back to CPU.
+  # Stock opencv-python wheels often still decode on CPU even when GPU is requested.
+  decode_mode: auto            # auto | cpu | gpu
+  hwaccel: auto                # auto | none | cuda | qsv | vaapi | d3d11va | videotoolbox
+  # hwaccel_device: /dev/dri/renderD128   # optional VAAPI render node
   # Auto-advance focused camera (Esc → Cameras → Cycle focus). Off by default.
   cycle_focus: false
   cycle_focus_seconds: 10
