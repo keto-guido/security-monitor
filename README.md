@@ -202,7 +202,7 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detection**, **Weather HUD**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detection**, **Weather HUD**, **Home Assistant**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
 
 ### Weather HUD
 
@@ -218,6 +218,30 @@ The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detec
 - °F / °C units; optional `weather_latitude` / `weather_longitude` in config (blank = IP auto-locate)
 
 By default, camera tiles **shrink around** the widget so they never draw under it. When placed between two feeds, both cameras lose a shared strip. Turn on **Overlay cameras** (and lower **Opacity**) if you prefer a translucent HUD on top of the feed instead. Camera name/status strip opacity is under **Video settings** → **HUD opacity**.
+
+### Home Assistant (door sensors)
+
+`Esc` → **Home Assistant…** (local LAN only):
+
+- Connect with your HA base URL + a [long-lived access token](https://www.home-assistant.io/docs/authentication/)
+- Map `binary_sensor.*` door/window entities to cameras (`Door sensors…`, or `ha_door_entity` on a camera)
+- **Show door HUD** — top strip when a door is open / connection errors
+- **Highlight camera** — pulse the mapped tile while open (and for **Hold focus** seconds after)
+- **Autofocus camera** — zoom that tile on open (encroachment autofocus still wins if both fire)
+- Optional alarm beep on open; poll interval defaults to 2s over the REST API
+
+Example:
+
+```yaml
+display:
+  ha_enabled: true
+  ha_url: http://homeassistant.local:8123
+  ha_token: YOUR_LONG_LIVED_ACCESS_TOKEN
+  ha_doors:
+    - entity_id: binary_sensor.front_door
+      label: Front door
+      camera: Front Door
+```
 
 ### Video decode (GPU / CPU)
 

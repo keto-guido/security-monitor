@@ -14,6 +14,12 @@ from urllib.parse import quote, urlparse, urlunparse
 import yaml
 
 from security_monitor.encroachment import EncroachZone
+from security_monitor.home_assistant import (
+    HADoorMapping,
+    door_mapping_to_dict,
+    normalize_ha_url,
+    parse_door_mappings,
+)
 
 VALID_SCALE_MODES = ("fit", "fill", "stretch")
 VALID_TRANSPORTS = ("tcp", "udp", "auto")
@@ -79,6 +85,9 @@ class CameraConfig:
     # Legacy single tripwire (used when encroach_zones is empty).
     encroach_line: tuple[float, float, float, float] | None = None
     encroach_side: str = "positive"  # positive | negative
+    # Optional 1:1 Home Assistant door → this camera shortcut.
+    ha_door_entity: str = ""
+    ha_door_label: str = ""
 
     @property
     def is_device(self) -> bool:
@@ -179,6 +188,17 @@ class DisplayConfig:
     weather_longitude: float | None = None
     weather_place: str = ""
     weather_refresh_seconds: float = 300.0
+    # Local Home Assistant door sensors (Esc → Home Assistant).
+    ha_enabled: bool = False
+    ha_url: str = "http://homeassistant.local:8123"
+    ha_token: str = ""
+    ha_poll_seconds: float = 2.0
+    ha_show_hud: bool = True
+    ha_highlight: bool = True
+    ha_autofocus: bool = True
+    ha_alarm_sound: bool = True
+    ha_hold_seconds: float = 20.0
+    ha_doors: list[HADoorMapping] = field(default_factory=list)
 
     @property
     def tile_count(self) -> int:
@@ -340,6 +360,10 @@ def camera_to_dict(cam: CameraConfig) -> dict[str, Any]:
         item["encroach_line"] = [float(v) for v in cam.encroach_line]
     if cam.encroach_side and cam.encroach_side != "positive":
         item["encroach_side"] = str(cam.encroach_side)
+    if cam.ha_door_entity:
+        item["ha_door_entity"] = str(cam.ha_door_entity)
+    if cam.ha_door_label:
+        item["ha_door_label"] = str(cam.ha_door_label)
     return item
 
 
@@ -459,6 +483,16 @@ def save_display_settings(config: AppConfig) -> Path | None:
         display["weather_longitude"] = float(d.weather_longitude)
     display["weather_place"] = str(d.weather_place or "")
     display["weather_refresh_seconds"] = float(d.weather_refresh_seconds)
+    display["ha_enabled"] = bool(d.ha_enabled)
+    display["ha_url"] = str(d.ha_url or "")
+    display["ha_token"] = str(d.ha_token or "")
+    display["ha_poll_seconds"] = float(d.ha_poll_seconds)
+    display["ha_show_hud"] = bool(d.ha_show_hud)
+    display["ha_highlight"] = bool(d.ha_highlight)
+    display["ha_autofocus"] = bool(d.ha_autofocus)
+    display["ha_alarm_sound"] = bool(d.ha_alarm_sound)
+    display["ha_hold_seconds"] = float(d.ha_hold_seconds)
+    display["ha_doors"] = [door_mapping_to_dict(door) for door in d.ha_doors]
 
     raw["cameras"] = [camera_to_dict(cam) for cam in config.cameras]
 
@@ -630,6 +664,23 @@ def _parse_display(raw: Any) -> DisplayConfig:
     )
     if data.weather_refresh_seconds < 60 or data.weather_refresh_seconds > 7200:
         raise ConfigError("display.weather_refresh_seconds must be between 60 and 7200")
+    data.ha_enabled = _bool(raw, "ha_enabled", data.ha_enabled)
+    data.ha_url = normalize_ha_url(str(raw.get("ha_url", data.ha_url) or data.ha_url))
+    data.ha_token = str(raw.get("ha_token", data.ha_token) or "").strip()
+    data.ha_poll_seconds = float(raw.get("ha_poll_seconds", data.ha_poll_seconds) or data.ha_poll_seconds)
+    if not (0.5 <= data.ha_poll_seconds <= 60.0):
+        raise ConfigError("display.ha_poll_seconds must be between 0.5 and 60")
+    data.ha_show_hud = _bool(raw, "ha_show_hud", data.ha_show_hud)
+    data.ha_highlight = _bool(raw, "ha_highlight", data.ha_highlight)
+    data.ha_autofocus = _bool(raw, "ha_autofocus", data.ha_autofocus)
+    data.ha_alarm_sound = _bool(raw, "ha_alarm_sound", data.ha_alarm_sound)
+    data.ha_hold_seconds = float(raw.get("ha_hold_seconds", data.ha_hold_seconds) or data.ha_hold_seconds)
+    if not (0.0 <= data.ha_hold_seconds <= 300.0):
+        raise ConfigError("display.ha_hold_seconds must be between 0 and 300")
+    try:
+        data.ha_doors = parse_door_mappings(raw.get("ha_doors", data.ha_doors))
+    except ValueError as exc:
+        raise ConfigError(f"display.{exc}") from exc
     return data
 
 
@@ -723,6 +774,8 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
             encroach_zones = parse_encroach_zones(raw.get("encroach_zones"))
         except ValueError as exc:
             raise ConfigError(f"cameras[{index}].{exc}") from exc
+    ha_door_entity = str(raw.get("ha_door_entity", "") or "").strip()
+    ha_door_label = str(raw.get("ha_door_label", "") or "").strip()
     return CameraConfig(
         name=name,
         url=url,
@@ -742,6 +795,8 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
         encroach_zones=encroach_zones,
         encroach_line=encroach_line,
         encroach_side=encroach_side,
+        ha_door_entity=ha_door_entity,
+        ha_door_label=ha_door_label,
     )
 
 

@@ -124,6 +124,17 @@ from security_monitor.events import (
     delete_person_event,
     list_person_events,
 )
+from security_monitor.home_assistant import (
+    HA_HOLD_CHOICES,
+    HA_POLL_CHOICES,
+    HADoorMapping,
+    HomeAssistantService,
+    cameras_highlighted_by_doors,
+    draw_door_hud,
+    mask_token,
+    merge_camera_door_entities,
+    normalize_ha_url,
+)
 from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
 from security_monitor.retention import (
     RETENTION_DAY_CHOICES,
@@ -212,6 +223,8 @@ _NESTED_MENU_PAGES = frozenset(
         "decode_status",
         "weather",
         "weather_place",
+        "ha",
+        "ha_doors",
         *_CAMERA_MENU_PAGES,
         *_CAPTURE_BROWSER_PAGES,
         *_EVENT_BROWSER_PAGES,
@@ -314,6 +327,13 @@ class MosaicApp:
         self._weather_place_still: np.ndarray | None = None
         self._weather_drag_offset: tuple[int, int] | None = None
         self._configure_weather_service()
+        self._ha = HomeAssistantService()
+        self._door_active: dict[str, str] = {}  # camera name → door label
+        self._door_prev_open: dict[str, bool] = {}  # entity_id → open
+        self._door_owned_focus = False
+        self._ha_pending_entity = ""
+        self._ha_pending_camera = ""
+        self._configure_ha_service()
 
     def _configure_weather_service(self) -> None:
         d = self.display
@@ -323,6 +343,19 @@ class MosaicApp:
             longitude=d.weather_longitude,
             place=d.weather_place or "",
             refresh_seconds=float(d.weather_refresh_seconds or 300),
+        )
+
+    def _effective_ha_doors(self) -> list[HADoorMapping]:
+        return merge_camera_door_entities(list(self.display.ha_doors), self.config.cameras)
+
+    def _configure_ha_service(self) -> None:
+        d = self.display
+        self._ha.configure(
+            enabled=bool(d.ha_enabled),
+            url=d.ha_url,
+            token=d.ha_token,
+            poll_seconds=float(d.ha_poll_seconds or 2.0),
+            doors=self._effective_ha_doors(),
         )
 
     def _start_weather_place_editor(self) -> None:
@@ -463,6 +496,7 @@ class MosaicApp:
     def _shutdown(self) -> None:
         self._stop_event_playback()
         self._weather.stop()
+        self._ha.stop()
         for name, recorder in list(self._person_recorders.items()):
             # Force-complete any open person event so the clip is written.
             recorder.lost_at = time.monotonic() - recorder.post_roll - 1.0
@@ -510,6 +544,7 @@ class MosaicApp:
     def _compose(self) -> np.ndarray:
         self._tick_person_events()
         self._update_encroachment_state()
+        self._update_door_state()
         d = self.display
         cell_w, cell_h, width, height = self._sync_layout()
         if self._weather_place_mode and self._weather_place_still is not None:
@@ -526,6 +561,8 @@ class MosaicApp:
             self._draw_buffer_badge(cell, snap)
             self._feed_clip_job(cell)
             self._draw_capture_hud(cell)
+            if d.ha_enabled and d.ha_show_hud:
+                draw_door_hud(cell, self._ha.snapshot, opacity=d.hud_opacity)
             return self._finalize_ui(cell)
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
@@ -580,6 +617,8 @@ class MosaicApp:
                 self._draw_buffer_badge(canvas, sample)
         self._feed_clip_job(canvas)
         self._draw_capture_hud(canvas)
+        if d.ha_enabled and d.ha_show_hud and not zoomed:
+            draw_door_hud(canvas, self._ha.snapshot, opacity=d.hud_opacity)
         return self._finalize_ui(canvas)
 
     def _resolve_weather_rect(
@@ -688,6 +727,10 @@ class MosaicApp:
                 labels = ["alert"]
             pulse = 0.55 + 0.45 * abs(math.sin(time.monotonic() * 7.0))
             draw_alarm_banner(canvas, labels, pulse=pulse)
+        elif self.display.ha_enabled and self._door_active:
+            labels = [f"{label}" for label in self._door_active.values()]
+            pulse = 0.55 + 0.45 * abs(math.sin(time.monotonic() * 5.0))
+            draw_alarm_banner(canvas, labels[:4], pulse=pulse, title="DOOR OPEN")
         if self._menu_open and self._menu_page in {"captures_view", "captures_delete"}:
             if self._capture_preview is not None:
                 canvas = self._paint_capture_preview(
@@ -831,13 +874,14 @@ class MosaicApp:
                     draw_boxes(frame, boxes)
             mode = self.display.scale_mode if self.view_zoom <= 1.001 else "fill"
             tile = scale_frame(frame, width, height, mode)
-            if active:
+            door_on = bool(self.display.ha_highlight and self._door_active.get(name))
+            if active or door_on:
                 pulse = 0.55 + 0.45 * abs(math.sin(time.monotonic() * 6.0))
                 draw_encroach_highlight(
                     tile,
                     active=True,
                     pulse=pulse,
-                    strong=bool(self.display.encroachment_alarm),
+                    strong=bool(active and self.display.encroachment_alarm) or door_on,
                 )
         if overlay:
             self._draw_cell_overlay(tile, snap, name)
@@ -851,12 +895,15 @@ class MosaicApp:
             shown = self._stable_fps(name, snap.fps)
             fps_text = f"{shown:2d} fps" if shown else "-- fps"
         alert = bool(self._encroach_active.get(name))
+        door_label = self._door_active.get(name) if self.display.ha_highlight else None
         draw_status_bar(
             tile,
             name,
             snap,
             fps_text,
             encroach=alert,
+            door_open=bool(door_label),
+            door_label=door_label or "",
             hud_opacity=self.display.hud_opacity,
         )
         if self._zone_edit_name == name:
@@ -1046,6 +1093,10 @@ class MosaicApp:
                 self._menu_page = "detection"
                 self._menu_index = 0
                 return
+            if self._menu_page == "ha_doors":
+                self._menu_page = "ha"
+                self._menu_index = 0
+                return
             if self._menu_page in {"captures_view", "captures_delete", "captures_delete_all"}:
                 self._close_capture_view()
                 self._menu_page = "captures"
@@ -1094,6 +1145,8 @@ class MosaicApp:
             return
         if self._prompt is not None:
             self._prompt = None
+            self._ha_pending_entity = ""
+            self._ha_pending_camera = ""
             return
         if self._menu_open and self._menu_page == "decode_status":
             self._menu_page = "video"
@@ -1101,6 +1154,10 @@ class MosaicApp:
             return
         if self._menu_open and self._menu_page == "detection_cams":
             self._menu_page = "detection"
+            self._menu_index = 0
+            return
+        if self._menu_open and self._menu_page == "ha_doors":
+            self._menu_page = "ha"
             self._menu_index = 0
             return
         if self._menu_open and self._menu_page in {
@@ -1169,6 +1226,8 @@ class MosaicApp:
         self._reset_view()
         self._menu_open = False
         self._menu_page = "root"
+        self._door_owned_focus = False
+        self._encroach_owned_focus = False
 
     def _menu_items(self) -> list[tuple[str, str]]:
         if self._menu_page == "reboot_confirm":
@@ -1396,6 +1455,43 @@ class MosaicApp:
                 ("weather_loc", f"Location: {loc[:42]}"),
                 ("weather_back", "Back"),
             ]
+        if self._menu_page == "ha":
+            d = self.display
+            snap = self._ha.snapshot
+            enabled = "On" if d.ha_enabled else "Off"
+            status = snap.status_line()
+            doors = self._effective_ha_doors()
+            return [
+                ("ha_toggle", f"Home Assistant: {enabled}"),
+                ("ha_url", f"URL: {(d.ha_url or '(not set)')[:42]}"),
+                ("ha_token", f"Token: {mask_token(d.ha_token)}"),
+                ("ha_poll", f"Poll interval: {d.ha_poll_seconds:g}s"),
+                ("ha_hud", f"Show door HUD: {'On' if d.ha_show_hud else 'Off'}"),
+                ("ha_highlight", f"Highlight camera: {'On' if d.ha_highlight else 'Off'}"),
+                ("ha_autofocus", f"Autofocus camera: {'On' if d.ha_autofocus else 'Off'}"),
+                ("ha_sound", f"Door alarm sound: {'On' if d.ha_alarm_sound else 'Off'}"),
+                ("ha_hold", f"Hold focus: {d.ha_hold_seconds:g}s"),
+                ("ha_doors", f"Door sensors… ({len(doors)})"),
+                ("ha_refresh", "Test connection / refresh"),
+                ("ha_status", status[:64]),
+                ("ha_back", "Back"),
+            ]
+        if self._menu_page == "ha_doors":
+            doors = self._effective_ha_doors()
+            items: list[tuple[str, str]] = []
+            for index, door in enumerate(doors):
+                cam = door.camera or "no camera"
+                items.append(
+                    (
+                        f"ha_door:{index}",
+                        f"{door.display_label} → {cam}",
+                    )
+                )
+            items.append(("ha_door_add", "Add door mapping…"))
+            if self.display.ha_doors:
+                items.append(("ha_door_remove", "Remove last display mapping"))
+            items.append(("ha_doors_back", "Back"))
+            return items
         if self._menu_page == "cameras":
             d = self.display
             enabled = sum(1 for cam in self.config.cameras if cam.enabled)
@@ -1451,6 +1547,7 @@ class MosaicApp:
             ("events_root", "Person events…"),
             ("detection", "Detection"),
             ("weather", "Weather HUD…"),
+            ("ha", "Home Assistant…"),
             ("video", "Video settings"),
             ("reconnect", "Reconnect streams"),
             ("reboot", "Reboot cameras"),
@@ -1494,6 +1591,92 @@ class MosaicApp:
                 if snap.error and not snap.ok
                 else f"{snap.place or 'Local'}: {snap.temp_label(self.display.weather_units)} {snap.condition}"
             )
+        elif action == "ha":
+            self._menu_page = "ha"
+            self._menu_index = 0
+            self._configure_ha_service()
+            self._reboot_notice = self._ha.snapshot.status_line()
+        elif action == "ha_back":
+            self._menu_page = "root"
+            self._menu_index = 0
+        elif action == "ha_doors":
+            self._menu_page = "ha_doors"
+            self._menu_index = 0
+        elif action == "ha_doors_back":
+            self._menu_page = "ha"
+            self._menu_index = 0
+        elif action == "ha_toggle":
+            self.display.ha_enabled = not self.display.ha_enabled
+            self._configure_ha_service()
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = (
+                "Home Assistant on" if self.display.ha_enabled else "Home Assistant off"
+            )
+        elif action == "ha_url":
+            self._prompt = TextPrompt(
+                title="Home Assistant URL (http://host:8123)",
+                kind="ha_url",
+                value=self.display.ha_url or "http://homeassistant.local:8123",
+            )
+        elif action == "ha_token":
+            self._prompt = TextPrompt(
+                title="Long-lived access token",
+                kind="ha_token",
+                value="",
+            )
+        elif action == "ha_poll":
+            self._adjust_menu_item("ha_poll", 1)
+        elif action == "ha_hold":
+            self._adjust_menu_item("ha_hold", 1)
+        elif action == "ha_hud":
+            self.display.ha_show_hud = not self.display.ha_show_hud
+            self._apply_buffer_settings(persist=True)
+        elif action == "ha_highlight":
+            self.display.ha_highlight = not self.display.ha_highlight
+            self._apply_buffer_settings(persist=True)
+        elif action == "ha_autofocus":
+            self.display.ha_autofocus = not self.display.ha_autofocus
+            if not self.display.ha_autofocus and self._door_owned_focus:
+                self._door_owned_focus = False
+                self._go_main_layout()
+            self._apply_buffer_settings(persist=True)
+        elif action == "ha_sound":
+            self.display.ha_alarm_sound = not self.display.ha_alarm_sound
+            self._apply_buffer_settings(persist=True)
+            if self.display.ha_alarm_sound:
+                play_alert_beep(double=False)
+        elif action == "ha_refresh":
+            self._configure_ha_service()
+            snap = self._ha.refresh_now()
+            self._reboot_notice = snap.status_line()
+        elif action == "ha_status":
+            self._reboot_notice = self._ha.snapshot.status_line()
+        elif action == "ha_door_add":
+            self._prompt = TextPrompt(
+                title="Door entity_id (binary_sensor.front_door)",
+                kind="ha_door_entity",
+                value="binary_sensor.",
+            )
+        elif action == "ha_door_remove":
+            if self.display.ha_doors:
+                removed = self.display.ha_doors.pop()
+                self._configure_ha_service()
+                self._apply_buffer_settings(persist=True)
+                self._reboot_notice = f"Removed {removed.display_label}"
+            else:
+                self._reboot_notice = "No display.ha_doors entries (camera shortcuts stay)"
+        elif action.startswith("ha_door:"):
+            try:
+                index = int(action.split(":", 1)[1])
+            except ValueError:
+                index = -1
+            doors = self._effective_ha_doors()
+            if 0 <= index < len(doors):
+                door = doors[index]
+                self._reboot_notice = (
+                    f"{door.entity_id} → {door.camera or 'no camera'} "
+                    f"({'open' if self._door_prev_open.get(door.entity_id.lower()) else 'closed'})"
+                )
         elif action == "weather_back":
             self._menu_page = "root"
             self._menu_index = 0
@@ -2015,6 +2198,27 @@ class MosaicApp:
         elif action == "weather_size_h":
             self.display.weather_h = max(0.10, min(0.45, self.display.weather_h + 0.02 * step))
             self._apply_buffer_settings(persist=True)
+        elif action == "ha_poll":
+            self.display.ha_poll_seconds = float(
+                next_choice(HA_POLL_CHOICES, self.display.ha_poll_seconds, step)
+            )
+            self._configure_ha_service()
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = f"HA poll {self.display.ha_poll_seconds:g}s"
+        elif action == "ha_hold":
+            self.display.ha_hold_seconds = float(
+                next_choice(HA_HOLD_CHOICES, self.display.ha_hold_seconds, step)
+            )
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = f"Door hold {self.display.ha_hold_seconds:g}s"
+        elif action in {
+            "ha_toggle",
+            "ha_hud",
+            "ha_highlight",
+            "ha_autofocus",
+            "ha_sound",
+        }:
+            self._activate_menu(action)
         elif action in {
             "weather_toggle",
             "weather_units",
@@ -2390,6 +2594,7 @@ class MosaicApp:
             # Re-apply history clip after apply_buffer_settings overwrote it.
             source.history.configure(clip_seconds=history_clip)
         self._configure_weather_service()
+        self._configure_ha_service()
         if persist:
             path = save_display_settings(self.config)
             if path is not None:
@@ -2399,6 +2604,8 @@ class MosaicApp:
                 "detection",
                 "detection_cams",
                 "weather",
+                "ha",
+                "ha_doors",
                 *_CAMERA_MENU_PAGES,
                 *_EVENT_BROWSER_PAGES,
             }:
@@ -2501,6 +2708,77 @@ class MosaicApp:
             return
         if self._encroach_owned_focus:
             self._encroach_owned_focus = False
+            self._go_main_layout()
+
+    def _update_door_state(self) -> None:
+        """React to Home Assistant door opens: HUD, highlight, optional autofocus."""
+        d = self.display
+        if not d.ha_enabled:
+            if self._door_active or self._door_owned_focus:
+                self._door_active = {}
+                if self._door_owned_focus and not self._encroach_owned_focus:
+                    self._door_owned_focus = False
+                    self._go_main_layout()
+                else:
+                    self._door_owned_focus = False
+            return
+
+        snap = self._ha.snapshot
+        prev = self._door_prev_open
+        for door in snap.doors:
+            was = prev.get(door.entity_id.lower(), False)
+            if door.open and not was:
+                label = door.label
+                cam = door.camera or "—"
+                self._flash_capture(f"DOOR OPEN: {label} → {cam}", seconds=4.0)
+                print(f"Door open: {label} ({door.entity_id}) → camera {cam}")
+                if d.ha_alarm_sound:
+                    play_alert_beep(double=True)
+        self._door_prev_open = {door.entity_id.lower(): door.open for door in snap.doors}
+
+        if d.ha_highlight or d.ha_autofocus:
+            self._door_active = cameras_highlighted_by_doors(
+                snap.doors,
+                hold_seconds=float(d.ha_hold_seconds),
+            )
+        else:
+            self._door_active = {}
+        self._apply_door_focus()
+
+    def _apply_door_focus(self) -> None:
+        if not self.display.ha_autofocus:
+            if self._door_owned_focus and not self._encroach_owned_focus:
+                self._door_owned_focus = False
+                self._go_main_layout()
+            else:
+                self._door_owned_focus = False
+            return
+        if self._encroach_owned_focus:
+            return
+        if self._menu_open or self._prompt is not None or self._reboot_job is not None:
+            return
+        if self._zone_edit_name is not None or self._line_edit_name is not None:
+            return
+        if self._weather_place_mode:
+            return
+        active_indices = [
+            i
+            for i, source in enumerate(self.sources)
+            if source.name in self._door_active
+        ]
+        if active_indices:
+            if self.zoom_index in active_indices:
+                self._door_owned_focus = True
+                return
+            self._door_owned_focus = True
+            self.zoom_index = active_indices[0]
+            self._reset_view()
+            self._cycle_deadline = time.monotonic() + max(
+                1.0, float(self.display.ha_hold_seconds or self.display.cycle_focus_seconds)
+            )
+            return
+        if self._door_owned_focus:
+            self._door_owned_focus = False
             self._go_main_layout()
 
     def _tick_person_events(self) -> None:
@@ -2689,7 +2967,7 @@ class MosaicApp:
             return
         if self._menu_open or self._prompt is not None or self._reboot_job is not None:
             return
-        if self._encroach_owned_focus or self._zone_edit_name is not None:
+        if self._encroach_owned_focus or self._door_owned_focus or self._zone_edit_name is not None:
             return
         if not self.sources:
             return
@@ -2707,7 +2985,9 @@ class MosaicApp:
             return
         if key in KEY_ESC or ch == 27:
             self._prompt = None
-            self._reboot_notice = "Add cancelled"
+            self._ha_pending_entity = ""
+            self._ha_pending_camera = ""
+            self._reboot_notice = "Cancelled"
             return
         if key in KEY_ENTER or ch in (13, 10):
             self._finish_prompt()
@@ -2742,6 +3022,75 @@ class MosaicApp:
                 return
             name = unique_camera_name(self.config.cameras, prompt.pending_name)
             self._add_camera(CameraConfig(name=name, url=text, enabled=True))
+            return
+        if prompt.kind == "ha_url":
+            self._prompt = None
+            if not text:
+                self._reboot_notice = "URL required"
+                return
+            self.display.ha_url = normalize_ha_url(text)
+            self._configure_ha_service()
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = f"HA URL {self.display.ha_url}"
+            return
+        if prompt.kind == "ha_token":
+            self._prompt = None
+            if not text:
+                self._reboot_notice = "Token unchanged"
+                return
+            self.display.ha_token = text.strip()
+            self._configure_ha_service()
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = f"HA token set ({mask_token(self.display.ha_token)})"
+            return
+        if prompt.kind == "ha_door_entity":
+            if not text:
+                self._reboot_notice = "entity_id required"
+                return
+            self._ha_pending_entity = text.strip()
+            names = ", ".join(cam.name for cam in self.config.cameras[:6])
+            self._prompt = TextPrompt(
+                title=f"Camera name ({names}…)" if names else "Camera name",
+                kind="ha_door_camera",
+                value="",
+            )
+            return
+        if prompt.kind == "ha_door_camera":
+            self._ha_pending_camera = text.strip()
+            self._prompt = TextPrompt(
+                title="Label (optional — Enter to skip)",
+                kind="ha_door_label",
+                value="",
+            )
+            return
+        if prompt.kind == "ha_door_label":
+            self._prompt = None
+            entity = self._ha_pending_entity
+            camera = self._ha_pending_camera
+            label = text.strip()
+            self._ha_pending_entity = ""
+            self._ha_pending_camera = ""
+            if not entity:
+                self._reboot_notice = "Add cancelled"
+                return
+            # Prefer updating an existing display mapping; else append.
+            updated = False
+            for door in self.display.ha_doors:
+                if door.entity_id.lower() == entity.lower():
+                    door.camera = camera
+                    if label:
+                        door.label = label
+                    updated = True
+                    break
+            if not updated:
+                self.display.ha_doors.append(
+                    HADoorMapping(entity_id=entity, label=label, camera=camera)
+                )
+            self._configure_ha_service()
+            self._apply_buffer_settings(persist=True)
+            self._menu_page = "ha_doors"
+            self._menu_index = 0
+            self._reboot_notice = f"Mapped {entity} → {camera or 'no camera'}"
             return
         self._prompt = None
 
@@ -3397,6 +3746,8 @@ class MosaicApp:
             "detection": "Detection",
             "detection_cams": "Cameras for detection",
             "weather": "Weather HUD",
+            "ha": "Home Assistant",
+            "ha_doors": "Door sensors",
             "cameras": "Cameras",
             "cameras_arrange": "Arrange tiles",
             "cameras_toggle": "Show / hide",
@@ -3460,6 +3811,10 @@ class MosaicApp:
             footer = "Per-camera decode path    Esc back"
         elif self._menu_page == "weather":
             footer = "Place on layout…    ← → adjust    Esc back"
+        elif self._menu_page == "ha":
+            footer = "Set URL + token    ← → adjust    Esc back"
+        elif self._menu_page == "ha_doors":
+            footer = "Add entity → camera    Esc back"
         elif self._menu_page == "capture":
             footer = "s snapshot  c clip    ← → length    Esc back"
         elif self._menu_page == "events_play":
@@ -3483,6 +3838,8 @@ class MosaicApp:
             "detection_cams",
             "capture",
             "weather",
+            "ha",
+            "ha_doors",
         }:
             footer = "Enter select    ← → adjust    Esc back"
         else:
@@ -3824,6 +4181,8 @@ def draw_status_bar(
     fps_text: str | None,
     *,
     encroach: bool = False,
+    door_open: bool = False,
+    door_label: str = "",
     hud_opacity: float = 0.70,
 ) -> None:
     h, w = tile.shape[:2]
@@ -3831,7 +4190,12 @@ def draw_status_bar(
     fade = max(10, bar_h // 3)
     alpha = max(0.12, min(1.0, float(hud_opacity)))
     shade_bottom_bar(tile, bar_h, alpha=alpha, fade=fade)
-    color = (40, 70, 255) if encroach else STATUS_COLOR.get(snap.status, (180, 180, 180))
+    if encroach:
+        color = (40, 70, 255)
+    elif door_open:
+        color = (40, 120, 255)
+    else:
+        color = STATUS_COLOR.get(snap.status, (180, 180, 180))
     cy = h - bar_h // 2
     name_size = max(14, min(22, int(h * 0.038)))
     meta_size = max(12, min(18, int(h * 0.032)))
@@ -3840,13 +4204,15 @@ def draw_status_bar(
     status = snap.status.upper()
     if encroach:
         status = "ENCROACH"
+    elif door_open:
+        status = f"DOOR {door_label}".strip().upper()[:28] if door_label else "DOOR OPEN"
     elif snap.rewinding:
         status = f"REWIND -{snap.behind:.1f}s"
     elif snap.detail and snap.status not in ("live", "demo"):
         status = f"{status}  {snap.detail}"
-    if fps_text and not snap.rewinding and not encroach:
+    if fps_text and not snap.rewinding and not encroach and not door_open:
         status = f"{status}   {fps_text}"
-    elif fps_text and encroach:
+    elif fps_text and (encroach or door_open):
         status = f"{status}   {fps_text}"
     draw_text(
         tile,

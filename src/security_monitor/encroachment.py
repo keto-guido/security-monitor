@@ -564,8 +564,9 @@ def draw_alarm_banner(
     labels: Sequence[str],
     *,
     pulse: float = 1.0,
+    title: str = "ENCROACHMENT",
 ) -> np.ndarray:
-    """Full-mosaic encroachment alarm: pulsing vignette + banner."""
+    """Full-mosaic alarm: pulsing vignette + banner."""
     if canvas is None or canvas.size == 0 or not labels:
         return canvas
     h, w = canvas.shape[:2]
@@ -583,7 +584,7 @@ def draw_alarm_banner(
     names = ", ".join(labels[:4])
     if len(labels) > 4:
         names += f" +{len(labels) - 4}"
-    text = f"ENCROACHMENT  —  {names}"
+    text = f"{title}  —  {names}"
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.7, min(1.6, w / 700))
     (tw, th), _ = cv2.getTextSize(text, font, scale, 2)
