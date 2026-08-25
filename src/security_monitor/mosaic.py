@@ -74,6 +74,9 @@ class MosaicApp:
         self._menu_hitboxes: list[tuple[str, int, int, int, int]] = []
         self._reboot_job: RebootJob | None = None
         self._reboot_notice = ""
+        self._view_w, self._view_h = self.display.canvas_size
+        self._cell_w = self.display.cell_width
+        self._cell_h = self.display.cell_height
 
     def run(self) -> int:
         if not self.sources:
@@ -135,36 +138,55 @@ class MosaicApp:
             source.stop()
         cv2.destroyAllWindows()
 
+    def _window_size(self) -> tuple[int, int]:
+        try:
+            _x, _y, ww, wh = cv2.getWindowImageRect(self.window)
+            if ww >= 320 and wh >= 180:
+                return int(ww), int(wh)
+        except cv2.error:
+            pass
+        return self.display.canvas_size
+
+    def _sync_layout(self) -> tuple[int, int, int, int]:
+        """Fit the mosaic to the live window so HUD text is not upscaled."""
+        ww, wh = self._window_size()
+        cols, rows = self.display.columns, self.display.rows
+        cell_w = max(160, ww // cols)
+        cell_h = max(90, wh // rows)
+        self._cell_w, self._cell_h = cell_w, cell_h
+        self._view_w, self._view_h = cell_w * cols, cell_h * rows
+        return cell_w, cell_h, self._view_w, self._view_h
+
     def _compose(self) -> np.ndarray:
         d = self.display
+        cell_w, cell_h, width, height = self._sync_layout()
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
             snap = self.sources[self.zoom_index].snapshot()
             name = self.sources[self.zoom_index].name
-            width, height = d.columns * d.cell_width, d.rows * d.cell_height
             cell = self._render_cell(snap, name, width, height, overlay=False)
             cell = magnify(cell, self.view_zoom, self.pan_x, self.pan_y)
             self._draw_cell_overlay(cell, snap, name)
             self._draw_zoom_badge(cell)
             return self._draw_menu(self._draw_reboot(self._draw_help(cell)))
 
-        canvas = np.zeros((d.rows * d.cell_height, d.columns * d.cell_width, 3), dtype=np.uint8)
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
         canvas[:] = (12, 12, 14)
         zoomed = self.view_zoom > 1.001
         for index in range(d.tile_count):
             row, col = divmod(index, d.columns)
-            y, x = row * d.cell_height, col * d.cell_width
+            y, x = row * cell_h, col * cell_w
             if index < len(self.sources):
                 snap = self.sources[index].snapshot()
                 tile = self._render_cell(
                     snap,
                     self.sources[index].name,
-                    d.cell_width,
-                    d.cell_height,
+                    cell_w,
+                    cell_h,
                     overlay=not zoomed,
                 )
             else:
-                tile = placeholder(d.cell_width, d.cell_height, "Empty", "No camera assigned")
-            canvas[y : y + d.cell_height, x : x + d.cell_width] = tile
+                tile = placeholder(cell_w, cell_h, "Empty", "No camera assigned")
+            canvas[y : y + cell_h, x : x + cell_w] = tile
         if not zoomed:
             self._draw_grid_lines(canvas)
         canvas = magnify(canvas, self.view_zoom, self.pan_x, self.pan_y)
@@ -172,15 +194,16 @@ class MosaicApp:
         return self._draw_menu(self._draw_reboot(self._draw_help(canvas)))
 
     def _draw_grid_lines(self, canvas: np.ndarray) -> None:
-        d = self.display
+        cols, rows = self.display.columns, self.display.rows
+        cell_w, cell_h = self._cell_w, self._cell_h
         tint = np.array([18, 18, 20], dtype=np.float32)
         alpha = 0.45
-        for col in range(1, d.columns):
-            x = col * d.cell_width
+        for col in range(1, cols):
+            x = col * cell_w
             col_pixels = canvas[:, x].astype(np.float32)
             canvas[:, x] = (col_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
-        for row in range(1, d.rows):
-            y = row * d.cell_height
+        for row in range(1, rows):
+            y = row * cell_h
             row_pixels = canvas[y, :].astype(np.float32)
             canvas[y, :] = (row_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
 
@@ -697,8 +720,7 @@ class MosaicApp:
 
     def _event_to_pixel(self, x: int, y: int) -> tuple[int, int]:
         nx, ny = self._event_norm(x, y)
-        cw, ch = self.display.canvas_size
-        return int(nx * cw), int(ny * ch)
+        return int(nx * self._view_w), int(ny * self._view_h)
 
     def _event_norm(self, x: int, y: int) -> tuple[float, float]:
         ww, wh = self.display.canvas_size
@@ -722,21 +744,28 @@ def scale_frame(frame: np.ndarray, cell_w: int, cell_h: int, mode: str) -> np.nd
     src_h, src_w = frame.shape[:2]
     if src_w == 0 or src_h == 0:
         return placeholder(cell_w, cell_h, "", "BAD FRAME")
+
+    def _resize(src: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+        sw, sh = src.shape[1], src.shape[0]
+        shrinking = size[0] < sw or size[1] < sh
+        interp = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+        return cv2.resize(src, size, interpolation=interp)
+
     if mode == "stretch":
-        return cv2.resize(frame, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+        return _resize(frame, (cell_w, cell_h))
     if mode == "fill":
         scale = max(cell_w / src_w, cell_h / src_h)
         new_w, new_h = max(1, int(src_w * scale)), max(1, int(src_h * scale))
-        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        resized = _resize(frame, (new_w, new_h))
         x = max(0, (new_w - cell_w) // 2)
         y = max(0, (new_h - cell_h) // 2)
         cropped = resized[y : y + cell_h, x : x + cell_w]
         if cropped.shape[0] != cell_h or cropped.shape[1] != cell_w:
-            return cv2.resize(cropped, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+            return _resize(cropped, (cell_w, cell_h))
         return cropped
     scale = min(cell_w / src_w, cell_h / src_h)
     new_w, new_h = max(1, int(src_w * scale)), max(1, int(src_h * scale))
-    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    resized = _resize(frame, (new_w, new_h))
     canvas = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
     canvas[:] = (8, 8, 10)
     x = (cell_w - new_w) // 2
@@ -785,12 +814,15 @@ def draw_status_bar(
     fps_text: str | None,
 ) -> None:
     h, w = tile.shape[:2]
-    bar_h = 36
-    shade_bottom_bar(tile, bar_h, alpha=0.70, fade=12)
+    bar_h = max(34, int(h * 0.08))
+    fade = max(10, bar_h // 3)
+    shade_bottom_bar(tile, bar_h, alpha=0.70, fade=fade)
     color = STATUS_COLOR.get(snap.status, (180, 180, 180))
-    cy = h - 15
-    draw_dot(tile, (16, cy), 5.5, color)
-    draw_text(tile, name, (28, h - 8), size=15, valign="bottom")
+    cy = h - bar_h // 2
+    name_size = max(14, min(22, int(h * 0.038)))
+    meta_size = max(12, min(18, int(h * 0.032)))
+    draw_dot(tile, (16 + name_size // 8, cy), max(5.0, name_size * 0.32), color)
+    draw_text(tile, name, (28 + name_size // 4, h - 8), size=name_size, valign="bottom")
     status = snap.status.upper()
     if snap.detail and snap.status not in ("live", "demo"):
         status = f"{status}  {snap.detail}"
@@ -800,7 +832,7 @@ def draw_status_bar(
         tile,
         status,
         (w - 12, h - 8),
-        size=13,
+        size=meta_size,
         color=color,
         align="right",
         valign="bottom",

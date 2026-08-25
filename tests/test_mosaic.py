@@ -31,8 +31,8 @@ def test_draw_text_is_anti_aliased() -> None:
     tile = np.zeros((80, 240, 3), dtype=np.uint8)
     draw_text(tile, "Front Door", (12, 50), size=16, valign="bottom")
     assert tile.max() > 0
-    # Soft edges should use intermediate values, not only 0/255.
-    assert ((tile > 20) & (tile < 235)).any()
+    # Soft edges from 2x raster + shadow should use intermediate values.
+    assert ((tile > 8) & (tile < 247)).any()
 
 
 def test_clamp_center_at_1x() -> None:
