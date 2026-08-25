@@ -18,3 +18,8 @@ config.local.yaml
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Downloaded ML weights (Ultralytics / OpenCV caches)
+*.pt
+*.caffemodel
+*.part
