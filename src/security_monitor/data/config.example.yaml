@@ -96,6 +96,11 @@ display:
   #   - entity_id: binary_sensor.front_door
   #     label: Front door
   #     camera: Front Door
+  #     open_states: [on]
+  #     notify_hud: true
+  #     notify_highlight: true
+  #     notify_autofocus: true
+  #     notify_sound: true
 
 cameras:
   - name: Front Door

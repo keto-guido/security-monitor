@@ -19,20 +19,70 @@ from security_monitor.overlay import draw_text, shade_round_rect
 HA_POLL_CHOICES: tuple[float, ...] = (1.0, 2.0, 3.0, 5.0, 10.0)
 HA_HOLD_CHOICES: tuple[float, ...] = (5.0, 10.0, 15.0, 20.0, 30.0, 60.0)
 DEFAULT_OPEN_STATES: tuple[str, ...] = ("on", "open", "unlocked")
+# Domains that commonly map to doors / openings / occupancy alerts.
+HA_BROWSE_DOMAINS: tuple[str, ...] = (
+    "binary_sensor",
+    "cover",
+    "lock",
+    "switch",
+    "input_boolean",
+    "sensor",
+)
+DOMAIN_STATE_HINTS: dict[str, tuple[str, ...]] = {
+    "binary_sensor": ("on", "off"),
+    "cover": ("open", "opening", "closed", "closing", "stopped"),
+    "lock": ("unlocked", "locked", "locking", "unlocking", "jammed"),
+    "switch": ("on", "off"),
+    "input_boolean": ("on", "off"),
+    "sensor": (),
+}
 
 
 @dataclass
 class HADoorMapping:
-    """Maps a Home Assistant entity to an optional camera and HUD label."""
+    """Maps a Home Assistant entity to a camera and notification options."""
 
     entity_id: str
     label: str = ""
     camera: str = ""
     open_states: tuple[str, ...] = DEFAULT_OPEN_STATES
+    notify_hud: bool = True
+    notify_highlight: bool = True
+    notify_autofocus: bool = True
+    notify_sound: bool = True
 
     @property
     def display_label(self) -> str:
         return (self.label or self.entity_id.split(".", 1)[-1] or self.entity_id).strip()
+
+    @property
+    def domain(self) -> str:
+        return self.entity_id.split(".", 1)[0].lower() if "." in self.entity_id else ""
+
+    def trigger_label(self) -> str:
+        return "/".join(self.open_states) if self.open_states else "—"
+
+
+@dataclass
+class HAEntityInfo:
+    """One entity from HA `/api/states` for the browse UI."""
+
+    entity_id: str
+    state: str = ""
+    friendly_name: str = ""
+    domain: str = ""
+    device_class: str = ""
+    unit: str = ""
+
+    @property
+    def display_name(self) -> str:
+        return (self.friendly_name or self.entity_id.split(".", 1)[-1] or self.entity_id).strip()
+
+    def menu_label(self) -> str:
+        bits = [self.display_name[:34], f"[{self.state or '?'}]"]
+        if self.device_class:
+            bits.append(self.device_class)
+        return "  ".join(bits)[:64]
 
 
 @dataclass
@@ -45,6 +95,10 @@ class DoorState:
     changed_at: float = 0.0  # wall time of last poll that saw this entity
     local_changed_at: float = 0.0  # monotonic of last open/closed flip
     last_opened_at: float = 0.0  # monotonic of most recent closed→open edge
+    notify_hud: bool = True
+    notify_highlight: bool = True
+    notify_autofocus: bool = True
+    notify_sound: bool = True
 
 
 @dataclass
@@ -102,6 +156,10 @@ def door_mapping_to_dict(door: HADoorMapping) -> dict[str, Any]:
         item["camera"] = door.camera
     if door.open_states and tuple(door.open_states) != DEFAULT_OPEN_STATES:
         item["open_states"] = list(door.open_states)
+    item["notify_hud"] = bool(door.notify_hud)
+    item["notify_highlight"] = bool(door.notify_highlight)
+    item["notify_autofocus"] = bool(door.notify_autofocus)
+    item["notify_sound"] = bool(door.notify_sound)
     return item
 
 
@@ -143,9 +201,88 @@ def parse_door_mappings(raw: Any) -> list[HADoorMapping]:
                 label=label,
                 camera=camera,
                 open_states=open_states,
+                notify_hud=_mapping_bool(item, "notify_hud", True),
+                notify_highlight=_mapping_bool(item, "notify_highlight", True),
+                notify_autofocus=_mapping_bool(item, "notify_autofocus", True),
+                notify_sound=_mapping_bool(item, "notify_sound", True),
             )
         )
     return out
+
+
+def _mapping_bool(raw: dict[str, Any], key: str, default: bool) -> bool:
+    if key not in raw:
+        return default
+    value = raw.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def default_trigger_states(entity: HAEntityInfo | None, domain: str = "") -> tuple[str, ...]:
+    """Pick sensible alert states for a newly selected entity."""
+    dom = (entity.domain if entity else domain) or ""
+    device = (entity.device_class if entity else "") or ""
+    if dom == "binary_sensor":
+        if device in {"door", "window", "garage_door", "opening", "lock"}:
+            return ("on",)
+        if device in {"motion", "occupancy", "presence", "moving"}:
+            return ("on",)
+        return ("on",)
+    if dom == "cover":
+        return ("open", "opening")
+    if dom == "lock":
+        return ("unlocked",)
+    if dom in {"switch", "input_boolean"}:
+        return ("on",)
+    if entity and entity.state:
+        return (entity.state.lower(),)
+    hints = DOMAIN_STATE_HINTS.get(dom, ())
+    return hints[:1] if hints else DEFAULT_OPEN_STATES
+
+
+def suggested_states_for_entity(entity: HAEntityInfo | None, domain: str = "") -> list[str]:
+    """States offered in the trigger-state picker."""
+    dom = (entity.domain if entity else domain) or ""
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def _add(state: str) -> None:
+        key = state.lower().strip()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        ordered.append(key)
+
+    for hint in DOMAIN_STATE_HINTS.get(dom, ()):
+        _add(hint)
+    if entity and entity.state:
+        _add(entity.state)
+    for extra in DEFAULT_OPEN_STATES:
+        _add(extra)
+    # Always allow common closed/idle counterparts so users can invert.
+    for extra in ("off", "closed", "locked", "unavailable", "unknown"):
+        _add(extra)
+    return ordered
+
+
+def toggle_open_state(current: tuple[str, ...], state: str) -> tuple[str, ...]:
+    key = state.lower().strip()
+    if not key:
+        return current
+    values = [s for s in current if s.lower() != key]
+    if len(values) == len(current):
+        values.append(key)
+    if not values:
+        values = [key]
+    return tuple(values)
 
 
 def merge_camera_door_entities(
@@ -286,6 +423,10 @@ def fetch_door_states(
                     changed_at=now_wall,
                     local_changed_at=local_changed,
                     last_opened_at=last_opened,
+                    notify_hud=bool(mapping.notify_hud),
+                    notify_highlight=bool(mapping.notify_highlight),
+                    notify_autofocus=bool(mapping.notify_autofocus),
+                    notify_sound=bool(mapping.notify_sound),
                 )
             )
         return HASnapshot(
@@ -305,6 +446,96 @@ def fetch_door_states(
         return HASnapshot(error=str(exc)[:120], updated_at=now_wall)
 
 
+def parse_entity_catalog(rows: Any) -> list[HAEntityInfo]:
+    """Parse `/api/states` payload into browseable entity infos."""
+    if not isinstance(rows, list):
+        return []
+    out: list[HAEntityInfo] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        entity_id = str(row.get("entity_id") or "").strip()
+        if not entity_id or "." not in entity_id:
+            continue
+        domain = entity_id.split(".", 1)[0].lower()
+        attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+        out.append(
+            HAEntityInfo(
+                entity_id=entity_id,
+                state=str(row.get("state") or "").strip().lower(),
+                friendly_name=str(attrs.get("friendly_name") or "").strip(),
+                domain=domain,
+                device_class=str(attrs.get("device_class") or "").strip().lower(),
+                unit=str(attrs.get("unit_of_measurement") or "").strip(),
+            )
+        )
+    out.sort(key=lambda e: (e.domain, e.display_name.lower(), e.entity_id.lower()))
+    return out
+
+
+def filter_entities(
+    entities: list[HAEntityInfo],
+    *,
+    domain: str | None = None,
+    query: str = "",
+) -> list[HAEntityInfo]:
+    domain_key = (domain or "").strip().lower()
+    q = (query or "").strip().lower()
+    out: list[HAEntityInfo] = []
+    for entity in entities:
+        if domain_key and domain_key != "all" and entity.domain != domain_key:
+            continue
+        if q:
+            blob = f"{entity.entity_id} {entity.friendly_name} {entity.device_class}".lower()
+            if q not in blob:
+                continue
+        out.append(entity)
+    return out
+
+
+def domain_counts(entities: list[HAEntityInfo]) -> list[tuple[str, int]]:
+    counts: dict[str, int] = {}
+    for entity in entities:
+        counts[entity.domain] = counts.get(entity.domain, 0) + 1
+    preferred = [d for d in HA_BROWSE_DOMAINS if counts.get(d)]
+    others = sorted(d for d in counts if d not in HA_BROWSE_DOMAINS)
+    ordered = preferred + others
+    return [(domain, counts[domain]) for domain in ordered]
+
+
+def fetch_entity_catalog(
+    base_url: str,
+    token: str,
+    *,
+    timeout: float = 8.0,
+) -> tuple[list[HAEntityInfo], str]:
+    """
+    Fetch all accessible HA entities.
+
+    Returns (entities, error). error is empty on success.
+    """
+    base = normalize_ha_url(base_url)
+    token = (token or "").strip()
+    if not base:
+        return [], "Home Assistant URL not set"
+    if not token:
+        return [], "Long-lived access token not set"
+    try:
+        rows = _ha_request(base, token, "/api/states", timeout=timeout)
+        entities = parse_entity_catalog(rows)
+        if not entities:
+            return [], "No entities returned (check token permissions)"
+        return entities, ""
+    except HTTPError as exc:
+        if exc.code == 401:
+            return [], "Unauthorized (check token)"
+        if exc.code == 404:
+            return [], "API not found (check URL)"
+        return [], f"HTTP {exc.code}"
+    except (URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+        return [], str(exc)[:120]
+
+
 class HomeAssistantService:
     """Background poller for Home Assistant door sensors."""
 
@@ -319,11 +550,29 @@ class HomeAssistantService:
         self._token = ""
         self._interval = 2.0
         self._mappings: list[HADoorMapping] = []
+        self._entities: list[HAEntityInfo] = []
+        self._entities_error = ""
+        self._entities_updated_at = 0.0
 
     @property
     def snapshot(self) -> HASnapshot:
         with self._lock:
             return self._snapshot
+
+    @property
+    def entities(self) -> list[HAEntityInfo]:
+        with self._lock:
+            return list(self._entities)
+
+    @property
+    def entities_error(self) -> str:
+        with self._lock:
+            return self._entities_error
+
+    @property
+    def entities_updated_at(self) -> float:
+        with self._lock:
+            return self._entities_updated_at
 
     def configure(
         self,
@@ -359,6 +608,17 @@ class HomeAssistantService:
         self._refresh_once()
         return self.snapshot
 
+    def refresh_entities(self) -> tuple[list[HAEntityInfo], str]:
+        with self._lock:
+            url = self._url
+            token = self._token
+        entities, error = fetch_entity_catalog(url, token)
+        with self._lock:
+            self._entities = entities
+            self._entities_error = error
+            self._entities_updated_at = time.time()
+        return entities, error
+
     def _refresh_once(self) -> None:
         with self._lock:
             if not self._enabled:
@@ -387,9 +647,11 @@ def cameras_highlighted_by_doors(
     *,
     hold_seconds: float,
     now: float | None = None,
+    require_highlight: bool = False,
+    require_autofocus: bool = False,
 ) -> dict[str, str]:
     """
-    Return camera_name → door label for cameras that should highlight.
+    Return camera_name → door label for cameras that should highlight / focus.
 
     Active while the door is open, or within ``hold_seconds`` after the most
     recent open edge (so a quick open/close still gets attention).
@@ -398,6 +660,10 @@ def cameras_highlighted_by_doors(
     hold = max(0.0, float(hold_seconds))
     active: dict[str, str] = {}
     for door in doors:
+        if require_highlight and not door.notify_highlight:
+            continue
+        if require_autofocus and not door.notify_autofocus:
+            continue
         camera = (door.camera or "").strip()
         if not camera:
             continue
@@ -419,7 +685,7 @@ def draw_door_hud(
     """Paint a compact door-status strip near the top of the mosaic."""
     if canvas is None or canvas.size == 0:
         return
-    opens = snap.open_doors
+    opens = [d for d in snap.open_doors if d.notify_hud]
     if opens:
         title = "DOOR OPEN"
         detail = " · ".join(d.label for d in opens[:4])

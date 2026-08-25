@@ -223,12 +223,13 @@ By default, camera tiles **shrink around** the widget so they never draw under i
 
 `Esc` → **Home Assistant…** (local LAN only):
 
-- Connect with your HA base URL + a [long-lived access token](https://www.home-assistant.io/docs/authentication/)
-- Map `binary_sensor.*` door/window entities to cameras (`Door sensors…`, or `ha_door_entity` on a camera)
-- **Show door HUD** — top strip when a door is open / connection errors
-- **Highlight camera** — pulse the mapped tile while open (and for **Hold focus** seconds after)
-- **Autofocus camera** — zoom that tile on open (encroachment autofocus still wins if both fire)
-- Optional alarm beep on open; poll interval defaults to 2s over the REST API
+1. Set HA base URL + a [long-lived access token](https://www.home-assistant.io/docs/authentication/)
+2. **Browse HA entities…** — pick a domain, then an entity from the live list
+3. Toggle which **state(s)** should alert (e.g. `on` / `open` / `unlocked`)
+4. Pick a **camera** to link
+5. Choose notification types: **HUD**, **Highlight**, **Autofocus**, **Sound** — then **Save link**
+
+**Linked sensors…** edits or removes existing links. Optional YAML / per-camera `ha_door_entity` shortcuts still work.
 
 Example:
 
@@ -241,6 +242,11 @@ display:
     - entity_id: binary_sensor.front_door
       label: Front door
       camera: Front Door
+      open_states: [on]
+      notify_hud: true
+      notify_highlight: true
+      notify_autofocus: true
+      notify_sound: true
 ```
 
 ### Video decode (GPU / CPU)

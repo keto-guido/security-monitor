@@ -14,12 +14,18 @@ from security_monitor.home_assistant import (
     HADoorMapping,
     HASnapshot,
     cameras_highlighted_by_doors,
+    default_trigger_states,
+    domain_counts,
     draw_door_hud,
     fetch_door_states,
+    filter_entities,
     mask_token,
     merge_camera_door_entities,
     normalize_ha_url,
     parse_door_mappings,
+    parse_entity_catalog,
+    suggested_states_for_entity,
+    toggle_open_state,
 )
 
 
@@ -159,6 +165,11 @@ def test_config_ha_roundtrip(tmp_path) -> None:
                         "entity_id": "binary_sensor.front_door",
                         "label": "Front",
                         "camera": "A",
+                        "open_states": ["on"],
+                        "notify_hud": True,
+                        "notify_highlight": False,
+                        "notify_autofocus": True,
+                        "notify_sound": False,
                     }
                 ],
             },
@@ -178,12 +189,77 @@ def test_config_ha_roundtrip(tmp_path) -> None:
     assert cfg.display.ha_token == "secret-token-value"
     assert cfg.display.ha_highlight is False
     assert cfg.display.ha_doors[0].entity_id == "binary_sensor.front_door"
+    assert cfg.display.ha_doors[0].notify_highlight is False
+    assert cfg.display.ha_doors[0].notify_sound is False
     assert cfg.cameras[0].ha_door_entity == "binary_sensor.side"
     assert save_display_settings(cfg) == path
     text = path.read_text(encoding="utf-8")
     assert "ha_enabled: true" in text
     assert "binary_sensor.front_door" in text
+    assert "notify_sound: false" in text
     assert "ha_door_entity: binary_sensor.side" in text
+
+
+def test_entity_catalog_helpers() -> None:
+    rows = [
+        {
+            "entity_id": "binary_sensor.front_door",
+            "state": "on",
+            "attributes": {"friendly_name": "Front Door", "device_class": "door"},
+        },
+        {
+            "entity_id": "cover.garage",
+            "state": "closed",
+            "attributes": {"friendly_name": "Garage"},
+        },
+        {
+            "entity_id": "sensor.temp",
+            "state": "21.5",
+            "attributes": {"friendly_name": "Temp", "unit_of_measurement": "°C"},
+        },
+    ]
+    entities = parse_entity_catalog(rows)
+    assert len(entities) == 3
+    doors = filter_entities(entities, domain="binary_sensor")
+    assert len(doors) == 1
+    assert doors[0].display_name == "Front Door"
+    counts = dict(domain_counts(entities))
+    assert counts["binary_sensor"] == 1
+    assert counts["cover"] == 1
+    assert default_trigger_states(doors[0]) == ("on",)
+    states = suggested_states_for_entity(doors[0])
+    assert "on" in states and "off" in states
+    assert toggle_open_state(("on",), "off") == ("on", "off")
+    assert toggle_open_state(("on", "off"), "on") == ("off",)
+
+
+def test_cameras_highlighted_respects_notify_flags() -> None:
+    doors = [
+        DoorState(
+            entity_id="a",
+            label="A",
+            camera="Cam A",
+            open=True,
+            last_opened_at=1000.0,
+            notify_highlight=False,
+            notify_autofocus=True,
+        ),
+        DoorState(
+            entity_id="b",
+            label="B",
+            camera="Cam B",
+            open=True,
+            last_opened_at=1000.0,
+            notify_highlight=True,
+            notify_autofocus=False,
+        ),
+    ]
+    hl = cameras_highlighted_by_doors(doors, hold_seconds=20, now=1001.0, require_highlight=True)
+    af = cameras_highlighted_by_doors(doors, hold_seconds=20, now=1001.0, require_autofocus=True)
+    assert "Cam A" not in hl
+    assert hl["Cam B"] == "B"
+    assert af["Cam A"] == "A"
+    assert "Cam B" not in af
 
 
 def test_config_rejects_bad_ha_poll() -> None:
