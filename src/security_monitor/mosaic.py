@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -98,16 +99,22 @@ from security_monitor.decode import (
     opencv_decode_summary,
     probe_hwaccels,
 )
+from security_monitor.alarm import play_alert_beep
 from security_monitor.detection import DetectionEngine, draw_boxes
 from security_monitor.encroachment import (
     DEFAULT_ENCROACH_LINE,
-    any_person_in_zone,
+    EncroachZone,
+    draw_alarm_banner,
     draw_encroach_highlight,
-    draw_encroach_line,
+    draw_zones,
+    effective_zones,
+    evaluate_zones,
     line_preset_label,
     map_tile_click_to_frame_norm,
     next_line_preset,
-    resolve_line,
+    next_polygon_preset,
+    polygon_preset_label,
+    unique_zone_name,
 )
 from security_monitor.events import (
     PERSON_POST_ROLL_CHOICES,
@@ -268,9 +275,15 @@ class MosaicApp:
         self._person_recorders: dict[str, PersonEventRecorder] = {}
         self._person_cooldown_until: dict[str, float] = {}
         self._encroach_active: dict[str, bool] = {}
+        self._encroach_zone_hits: dict[str, tuple[str, ...]] = {}
         self._encroach_prev: dict[str, bool] = {}
         self._encroach_owned_focus = False
-        self._line_edit_name: str | None = None
+        self._zone_edit_name: str | None = None
+        self._zone_edit_mode: str | None = None  # line | polygon
+        self._zone_edit_points: list[tuple[float, float]] = []
+        self._alarm_until = 0.0
+        self._alarm_last_beep = 0.0
+        self._line_edit_name: str | None = None  # alias kept for older checks
         self._line_edit_point: tuple[float, float] | None = None
         self._events: list[PersonEventItem] = []
         self._events_origin = "detection"
@@ -464,6 +477,18 @@ class MosaicApp:
         return self._finalize_ui(canvas)
 
     def _finalize_ui(self, canvas: np.ndarray) -> np.ndarray:
+        if self.display.encroachment_alarm and (
+            any(self._encroach_active.values()) or time.monotonic() < self._alarm_until
+        ):
+            labels = [
+                name
+                for name, on in self._encroach_active.items()
+                if on
+            ]
+            if not labels:
+                labels = ["alert"]
+            pulse = 0.55 + 0.45 * abs(math.sin(time.monotonic() * 7.0))
+            draw_alarm_banner(canvas, labels, pulse=pulse)
         if self._menu_open and self._menu_page in {"captures_view", "captures_delete"}:
             if self._capture_preview is not None:
                 canvas = self._paint_capture_preview(
@@ -586,17 +611,35 @@ class MosaicApp:
                 and cam.detect_encroachment
             )
             active = bool(self._encroach_active.get(name))
-            if boxes or encroach_on:
+            draft = (
+                self._zone_edit_points
+                if self._zone_edit_name == name and self._zone_edit_points
+                else None
+            )
+            if boxes or encroach_on or draft:
                 frame = frame.copy()
                 if encroach_on and cam is not None:
-                    line = resolve_line(cam.encroach_line, cam.encroach_side)
-                    draw_encroach_line(frame, line, active=active)
+                    zones = self._camera_zones(cam)
+                    draw_zones(
+                        frame,
+                        zones,
+                        active_names=self._encroach_zone_hits.get(name, ()),
+                        draft_points=draft,
+                    )
+                elif draft:
+                    draw_zones(frame, [], draft_points=draft)
                 if boxes:
                     draw_boxes(frame, boxes)
             mode = self.display.scale_mode if self.view_zoom <= 1.001 else "fill"
             tile = scale_frame(frame, width, height, mode)
             if active:
-                draw_encroach_highlight(tile, active=True)
+                pulse = 0.55 + 0.45 * abs(math.sin(time.monotonic() * 6.0))
+                draw_encroach_highlight(
+                    tile,
+                    active=True,
+                    pulse=pulse,
+                    strong=bool(self.display.encroachment_alarm),
+                )
         if overlay:
             self._draw_cell_overlay(tile, snap, name)
         return tile
@@ -610,12 +653,20 @@ class MosaicApp:
             fps_text = f"{shown:2d} fps" if shown else "-- fps"
         alert = bool(self._encroach_active.get(name))
         draw_status_bar(tile, name, snap, fps_text, encroach=alert)
-        if self._line_edit_name == name:
-            tip = (
-                "Click second point for tripwire"
-                if self._line_edit_point is not None
-                else "Click first point for tripwire  (Esc cancel)"
-            )
+        if self._zone_edit_name == name:
+            if self._zone_edit_mode == "polygon":
+                n = len(self._zone_edit_points)
+                tip = (
+                    f"Polygon: {n} pts — click add, Enter finish (≥3), Esc cancel"
+                    if n
+                    else "Polygon: click corners  Enter finish  Esc cancel"
+                )
+            else:
+                tip = (
+                    "Tripwire: click second point"
+                    if self._zone_edit_points
+                    else "Tripwire: click first point  (Esc cancel)"
+                )
             draw_text(
                 tile,
                 tip,
@@ -657,9 +708,16 @@ class MosaicApp:
 
     def _handle_key(self, key: int) -> None:
         ch = key if 0 <= key < 256 else key & 0xFF
-        if self._line_edit_name is not None and (key in KEY_ESC or ch == 27 or ch in (ord("q"), ord("Q"))):
-            # Esc/Q cancel tripwire edit (Q does not quit while drawing).
-            self._cancel_line_edit()
+        editing = self._zone_edit_name is not None or self._line_edit_name is not None
+        if editing:
+            if key in KEY_ESC or ch == 27 or ch in (ord("q"), ord("Q")):
+                self._cancel_zone_edit()
+                return
+            if key in KEY_ENTER or ch in (13, 10):
+                if self._zone_edit_mode == "polygon":
+                    self._finish_zone_edit()
+                return
+            # Ignore other keys while drawing a zone.
             return
         if self._prompt is not None:
             self._handle_prompt_key(key, ch)
@@ -802,8 +860,8 @@ class MosaicApp:
                 self._activate_menu(items[index][0])
 
     def _on_escape(self) -> None:
-        if self._line_edit_name is not None:
-            self._cancel_line_edit()
+        if self._zone_edit_name is not None or self._line_edit_name is not None:
+            self._cancel_zone_edit()
             return
         if self._prompt is not None:
             self._prompt = None
@@ -987,23 +1045,38 @@ class MosaicApp:
             auto = "On" if d.auto_person_capture else "Off"
             encroach = "On" if d.encroachment_detection else "Off"
             autofocus = "On" if d.encroachment_autofocus else "Off"
+            alarm = "On" if d.encroachment_alarm else "Off"
+            sound = "On" if d.encroachment_alarm_sound else "Off"
             cam = self._target_camera()
             baseline_label = cam.name if cam else "(focus a camera)"
+            zones = self._camera_zones(cam) if cam else []
+            zone_count = len(zones)
             line_label = line_preset_label(cam.encroach_line if cam else None)
+            poly_label = "Bottom half"
+            if cam and cam.encroach_zones:
+                last_poly = next((z for z in reversed(cam.encroach_zones) if z.is_polygon), None)
+                if last_poly is not None:
+                    poly_label = polygon_preset_label(last_poly.points)
             side = (cam.encroach_side if cam else "positive") or "positive"
             return [
                 ("people_master", f"People detection: {people}"),
                 ("object_master", f"Object detection: {objects}"),
                 ("encroach_master", f"Encroachment: {encroach}"),
                 ("encroach_autofocus", f"Autofocus on encroach: {autofocus}"),
+                ("encroach_alarm", f"On-screen alarm: {alarm}"),
+                ("encroach_sound", f"Alarm sound: {sound}"),
                 ("auto_person", f"Auto person capture: {auto}"),
                 ("person_pre", f"Pre-roll: {d.person_pre_roll_seconds:g}s"),
                 ("person_post", f"Post-roll: {d.person_post_roll_seconds:g}s"),
                 ("events_browse", "Person events…"),
                 ("detection_cams", "Cameras included…"),
-                ("encroach_preset", f"Tripwire preset: {line_label}"),
-                ("encroach_side", f"Zone side: {side}"),
+                ("encroach_zones_info", f"Zones on {baseline_label}: {zone_count}"),
+                ("encroach_preset", f"Add tripwire preset: {line_label}"),
+                ("encroach_side", f"Tripwire zone side: {side}"),
                 ("encroach_edit", f"Draw tripwire: {baseline_label}"),
+                ("encroach_poly_preset", f"Add polygon preset: {poly_label}"),
+                ("encroach_poly_edit", f"Draw polygon ROI: {baseline_label}"),
+                ("encroach_clear_zones", f"Clear all zones: {baseline_label}"),
                 ("set_baseline", f"Set empty-area baseline: {baseline_label}"),
                 ("detection_back", "Back"),
             ]
@@ -1156,12 +1229,40 @@ class MosaicApp:
             self._set_encroachment_detection(not self.display.encroachment_detection)
         elif action == "encroach_autofocus":
             self._set_encroachment_autofocus(not self.display.encroachment_autofocus)
+        elif action == "encroach_alarm":
+            self.display.encroachment_alarm = not self.display.encroachment_alarm
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = (
+                "On-screen alarm on" if self.display.encroachment_alarm else "On-screen alarm off"
+            )
+        elif action == "encroach_sound":
+            self.display.encroachment_alarm_sound = not self.display.encroachment_alarm_sound
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = (
+                "Alarm sound on" if self.display.encroachment_alarm_sound else "Alarm sound off"
+            )
+            if self.display.encroachment_alarm_sound:
+                play_alert_beep(double=False)
         elif action == "encroach_preset":
             self._adjust_menu_item("encroach_preset", 1)
         elif action == "encroach_side":
             self._adjust_menu_item("encroach_side", 1)
         elif action == "encroach_edit":
-            self._start_line_edit()
+            self._start_zone_edit("line")
+        elif action == "encroach_poly_preset":
+            self._adjust_menu_item("encroach_poly_preset", 1)
+        elif action == "encroach_poly_edit":
+            self._start_zone_edit("polygon")
+        elif action == "encroach_clear_zones":
+            self._clear_camera_zones()
+        elif action == "encroach_zones_info":
+            cam = self._target_camera()
+            if cam is None:
+                self._reboot_notice = "Focus a camera first"
+            else:
+                zones = self._camera_zones(cam)
+                names = ", ".join(z.name for z in zones) or "(none)"
+                self._reboot_notice = f"{cam.name}: {names}"
         elif action == "auto_person":
             self._set_auto_person_capture(not self.display.auto_person_capture)
         elif action == "person_pre":
@@ -1469,6 +1570,10 @@ class MosaicApp:
             self._set_encroachment_detection(not self.display.encroachment_detection)
         elif action == "encroach_autofocus":
             self._set_encroachment_autofocus(not self.display.encroachment_autofocus)
+        elif action == "encroach_alarm":
+            self._activate_menu("encroach_alarm")
+        elif action == "encroach_sound":
+            self._activate_menu("encroach_sound")
         elif action == "encroach_preset":
             cam = self._target_camera()
             if cam is None:
@@ -1476,12 +1581,13 @@ class MosaicApp:
                 return
             coords = next_line_preset(cam.encroach_line, step)
             cam.encroach_line = coords
-            for cfg_cam in self.config.cameras:
-                if cfg_cam.name == cam.name:
-                    cfg_cam.encroach_line = coords
-                    break
-            self._apply_buffer_settings(persist=True)
-            self._reboot_notice = f"Tripwire: {line_preset_label(coords)}"
+            zone = EncroachZone(
+                name=unique_zone_name(cam.encroach_zones, "Tripwire"),
+                points=((coords[0], coords[1]), (coords[2], coords[3])),
+                side=cam.encroach_side or "positive",
+            )
+            self._append_camera_zone(cam, zone, also_set_legacy_line=True)
+            self._reboot_notice = f"Added tripwire: {line_preset_label(coords)}"
         elif action == "encroach_side":
             cam = self._target_camera()
             if cam is None:
@@ -1489,12 +1595,36 @@ class MosaicApp:
                 return
             side = "negative" if (cam.encroach_side or "positive") == "positive" else "positive"
             cam.encroach_side = side
+            # Flip side on legacy line zones / last tripwire zone.
+            updated: list[EncroachZone] = []
+            for zone in cam.encroach_zones:
+                if zone.is_line:
+                    updated.append(
+                        EncroachZone(name=zone.name, points=zone.points, side=side)
+                    )
+                else:
+                    updated.append(zone)
+            cam.encroach_zones = updated
             for cfg_cam in self.config.cameras:
                 if cfg_cam.name == cam.name:
                     cfg_cam.encroach_side = side
+                    cfg_cam.encroach_zones = list(updated)
                     break
             self._apply_buffer_settings(persist=True)
-            self._reboot_notice = f"Zone side: {side}"
+            self._reboot_notice = f"Tripwire zone side: {side}"
+        elif action == "encroach_poly_preset":
+            cam = self._target_camera()
+            if cam is None:
+                self._reboot_notice = "Focus a camera first"
+                return
+            last = next((z for z in reversed(cam.encroach_zones) if z.is_polygon), None)
+            name, pts = next_polygon_preset(last.points if last else None, step)
+            zone = EncroachZone(
+                name=unique_zone_name(cam.encroach_zones, name),
+                points=pts,
+            )
+            self._append_camera_zone(cam, zone)
+            self._reboot_notice = f"Added polygon: {name}"
         elif action == "auto_person":
             self._set_auto_person_capture(not self.display.auto_person_capture)
         elif action == "person_pre":
@@ -1629,6 +1759,57 @@ class MosaicApp:
         )
         print(f"Encroachment autofocus {'on' if enabled else 'off'}")
 
+    def _camera_zones(self, cam: CameraConfig | None) -> list[EncroachZone]:
+        if cam is None:
+            return []
+        return effective_zones(
+            cam.encroach_zones,
+            legacy_line=cam.encroach_line,
+            legacy_side=cam.encroach_side,
+        )
+
+    def _sync_camera_zones(self, cam: CameraConfig) -> None:
+        for cfg_cam in self.config.cameras:
+            if cfg_cam.name == cam.name:
+                cfg_cam.encroach_zones = list(cam.encroach_zones)
+                cfg_cam.encroach_line = cam.encroach_line
+                cfg_cam.encroach_side = cam.encroach_side
+                cfg_cam.detect_encroachment = cam.detect_encroachment
+                cfg_cam.detect_people = cam.detect_people
+                break
+        self._camera_by_name[cam.name] = cam
+
+    def _append_camera_zone(
+        self,
+        cam: CameraConfig,
+        zone: EncroachZone,
+        *,
+        also_set_legacy_line: bool = False,
+    ) -> None:
+        cam.encroach_zones = [*cam.encroach_zones, zone]
+        cam.detect_encroachment = True
+        cam.detect_people = True
+        if also_set_legacy_line and zone.is_line:
+            line = zone.as_line_tuple()
+            if line is not None:
+                cam.encroach_line = line
+                cam.encroach_side = zone.side
+        self.display.encroachment_detection = True
+        self.display.people_detection = True
+        self._sync_camera_zones(cam)
+        self._apply_buffer_settings(persist=True)
+
+    def _clear_camera_zones(self) -> None:
+        cam = self._target_camera()
+        if cam is None:
+            self._reboot_notice = "Focus a camera first"
+            return
+        cam.encroach_zones = []
+        cam.encroach_line = None
+        self._sync_camera_zones(cam)
+        self._apply_buffer_settings(persist=True)
+        self._reboot_notice = f"Cleared zones on {cam.name}"
+
     def _toggle_camera_encroachment(self, index: int) -> None:
         if index < 0 or index >= len(self.cameras):
             return
@@ -1640,7 +1821,7 @@ class MosaicApp:
                 if cam.detect_encroachment:
                     cfg_cam.detect_people = True
                     cam.detect_people = True
-                    if cam.encroach_line is None:
+                    if not cam.encroach_zones and cam.encroach_line is None:
                         cfg_cam.encroach_line = DEFAULT_ENCROACH_LINE
                         cam.encroach_line = DEFAULT_ENCROACH_LINE
                 break
@@ -1651,7 +1832,7 @@ class MosaicApp:
             self._detection.ensure_ready()
         self._apply_buffer_settings(persist=True)
 
-    def _start_line_edit(self) -> None:
+    def _start_zone_edit(self, mode: str) -> None:
         cam = self._target_camera()
         if cam is None:
             self._reboot_notice = "Focus a camera first"
@@ -1660,45 +1841,81 @@ class MosaicApp:
         if index is None:
             self._reboot_notice = "Camera not visible"
             return
-        self._line_edit_name = cam.name
+        self._zone_edit_name = cam.name
+        self._zone_edit_mode = mode
+        self._zone_edit_points = []
+        self._line_edit_name = cam.name  # keep alias for cancel paths
         self._line_edit_point = None
         self._menu_open = False
         self._menu_page = "root"
         self._focus_camera(index)
-        self._flash_capture(f"Draw tripwire on {cam.name}: click two points", seconds=4.0)
-        print(f"Tripwire edit: {cam.name}")
+        if mode == "polygon":
+            self._flash_capture(
+                f"Draw polygon on {cam.name}: click corners, Enter to finish",
+                seconds=4.0,
+            )
+        else:
+            self._flash_capture(f"Draw tripwire on {cam.name}: click two points", seconds=4.0)
+        print(f"Zone edit ({mode}): {cam.name}")
 
-    def _cancel_line_edit(self) -> None:
-        if self._line_edit_name is None:
+    def _cancel_zone_edit(self) -> None:
+        if self._zone_edit_name is None and self._line_edit_name is None:
             return
+        self._zone_edit_name = None
+        self._zone_edit_mode = None
+        self._zone_edit_points = []
         self._line_edit_name = None
         self._line_edit_point = None
-        self._flash_capture("Tripwire edit cancelled")
+        self._flash_capture("Zone edit cancelled")
 
-    def _finish_line_edit(self, p1: tuple[float, float], p2: tuple[float, float]) -> None:
-        name = self._line_edit_name
+    def _finish_zone_edit(self) -> None:
+        name = self._zone_edit_name
+        mode = self._zone_edit_mode
+        points = list(self._zone_edit_points)
+        self._zone_edit_name = None
+        self._zone_edit_mode = None
+        self._zone_edit_points = []
         self._line_edit_name = None
         self._line_edit_point = None
-        if name is None:
+        if name is None or mode is None:
             return
-        coords = (p1[0], p1[1], p2[0], p2[1])
         cam = self._camera_by_name.get(name)
         if cam is None:
             return
-        cam.encroach_line = coords
-        cam.detect_encroachment = True
-        cam.detect_people = True
-        for cfg_cam in self.config.cameras:
-            if cfg_cam.name == name:
-                cfg_cam.encroach_line = coords
-                cfg_cam.detect_encroachment = True
-                cfg_cam.detect_people = True
-                break
-        self.display.encroachment_detection = True
-        self.display.people_detection = True
-        self._apply_buffer_settings(persist=True)
-        self._flash_capture(f"Tripwire saved: {name}")
-        print(f"Tripwire for {name}: {coords}")
+        if mode == "line":
+            if len(points) < 2:
+                self._flash_capture("Need two points for a tripwire")
+                return
+            p1, p2 = points[0], points[1]
+            zone = EncroachZone(
+                name=unique_zone_name(cam.encroach_zones, "Tripwire"),
+                points=(p1, p2),
+                side=cam.encroach_side or "positive",
+            )
+            self._append_camera_zone(cam, zone, also_set_legacy_line=True)
+            self._flash_capture(f"Tripwire saved: {name}")
+        else:
+            if len(points) < 3:
+                self._flash_capture("Need at least 3 points for a polygon")
+                return
+            zone = EncroachZone(
+                name=unique_zone_name(cam.encroach_zones, "ROI"),
+                points=tuple(points),
+            )
+            self._append_camera_zone(cam, zone)
+            self._flash_capture(f"Polygon ROI saved: {name} ({len(points)} pts)")
+        print(f"Zone saved for {name}: {zone.name} ({zone.kind})")
+
+    # Back-compat wrappers used by older key/mouse paths.
+    def _start_line_edit(self) -> None:
+        self._start_zone_edit("line")
+
+    def _cancel_line_edit(self) -> None:
+        self._cancel_zone_edit()
+
+    def _finish_line_edit(self, p1: tuple[float, float], p2: tuple[float, float]) -> None:
+        self._zone_edit_points = [p1, p2]
+        self._finish_zone_edit()
 
     def _toggle_camera_detection(self, index: int, *, people: bool) -> None:
         if index < 0 or index >= len(self.cameras):
@@ -1806,13 +2023,16 @@ class MosaicApp:
                 self._reboot_notice = "Settings applied (demo — not saved)"
 
     def _update_encroachment_state(self) -> None:
-        """Evaluate tripwire zones, notify on entry, optional autofocus."""
+        """Evaluate ROI zones, alarm on entry, optional autofocus."""
         active: dict[str, bool] = {}
-        if not self.display.encroachment_detection or self._line_edit_name is not None:
+        hits: dict[str, tuple[str, ...]] = {}
+        editing = self._zone_edit_name is not None or self._line_edit_name is not None
+        if not self.display.encroachment_detection or editing:
             for name in list(self._encroach_active):
                 active[name] = False
             self._encroach_active = active
-            if self._encroach_owned_focus and self._line_edit_name is None:
+            self._encroach_zone_hits = hits
+            if self._encroach_owned_focus and not editing:
                 self._encroach_owned_focus = False
                 self._go_main_layout()
             return
@@ -1821,11 +2041,13 @@ class MosaicApp:
             cam = self._camera_by_name.get(source.name)
             if cam is None or not cam.detect_encroachment:
                 active[source.name] = False
+                hits[source.name] = ()
                 continue
             snap = source.snapshot()
             frame = snap.frame
             if frame is None:
                 active[source.name] = False
+                hits[source.name] = ()
                 continue
             boxes = self._detection.process(
                 source.name,
@@ -1835,15 +2057,38 @@ class MosaicApp:
             )
             people = [b for b in boxes if b.label == "person"]
             h, w = frame.shape[:2]
-            line = resolve_line(cam.encroach_line, cam.encroach_side)
-            active[source.name] = any_person_in_zone(line, people, w, h)
+            zones = self._camera_zones(cam)
+            is_on, zone_names = evaluate_zones(zones, people, w, h)
+            active[source.name] = is_on
+            hits[source.name] = zone_names
 
+        now = time.monotonic()
         for name, is_on in active.items():
             if is_on and not self._encroach_prev.get(name, False):
-                self._flash_capture(f"Encroachment: {name}", seconds=2.5)
-                print(f"Encroachment alert: {name}")
+                zone_bit = ""
+                if hits.get(name):
+                    zone_bit = f" [{', '.join(hits[name])}]"
+                self._flash_capture(f"ENCROACHMENT: {name}{zone_bit}", seconds=3.0)
+                print(f"Encroachment alert: {name}{zone_bit}")
+                self._alarm_until = max(self._alarm_until, now + 6.0)
+                if self.display.encroachment_alarm_sound:
+                    play_alert_beep(double=True)
+                    self._alarm_last_beep = now
+        # Periodic reminder beep while anyone remains in a zone.
+        any_active = any(active.values())
+        if (
+            any_active
+            and self.display.encroachment_alarm_sound
+            and now - self._alarm_last_beep >= 4.0
+        ):
+            play_alert_beep(double=False)
+            self._alarm_last_beep = now
+        if any_active and self.display.encroachment_alarm:
+            self._alarm_until = max(self._alarm_until, now + 0.8)
+
         self._encroach_prev = dict(active)
         self._encroach_active = active
+        self._encroach_zone_hits = hits
         self._apply_encroachment_focus()
 
     def _apply_encroachment_focus(self) -> None:
@@ -1854,7 +2099,7 @@ class MosaicApp:
             return
         if self._menu_open or self._prompt is not None or self._reboot_job is not None:
             return
-        if self._line_edit_name is not None:
+        if self._zone_edit_name is not None or self._line_edit_name is not None:
             return
         active_indices = [
             i
@@ -2062,7 +2307,7 @@ class MosaicApp:
             return
         if self._menu_open or self._prompt is not None or self._reboot_job is not None:
             return
-        if self._encroach_owned_focus or self._line_edit_name is not None:
+        if self._encroach_owned_focus or self._zone_edit_name is not None:
             return
         if not self.sources:
             return
@@ -2953,8 +3198,8 @@ class MosaicApp:
             if event == cv2.EVENT_LBUTTONUP and self._reboot_job.finished:
                 self._finish_reboot()
             return
-        if self._line_edit_name is not None:
-            self._on_line_edit_mouse(event, x, y)
+        if self._line_edit_name is not None or self._zone_edit_name is not None:
+            self._on_zone_edit_mouse(event, x, y)
             return
         if self._menu_open:
             self._on_menu_mouse(event, x, y, flags)
@@ -2986,15 +3231,15 @@ class MosaicApp:
         if index < len(self.sources):
             self._focus_camera(index)
 
-    def _on_line_edit_mouse(self, event: int, x: int, y: int) -> None:
+    def _on_zone_edit_mouse(self, event: int, x: int, y: int) -> None:
         if event != cv2.EVENT_LBUTTONUP:
             return
-        name = self._line_edit_name
+        name = self._zone_edit_name or self._line_edit_name
         if name is None:
             return
         source = next((s for s in self.sources if s.name == name), None)
         if source is None:
-            self._cancel_line_edit()
+            self._cancel_zone_edit()
             return
         snap = source.snapshot()
         if snap.frame is None:
@@ -3002,7 +3247,6 @@ class MosaicApp:
             return
         fh, fw = snap.frame.shape[:2]
         px, py = self._event_to_pixel(x, y)
-        # Line edit always focuses the camera full-canvas.
         mapped = map_tile_click_to_frame_norm(
             px,
             py,
@@ -3015,11 +3259,22 @@ class MosaicApp:
         if mapped is None:
             self._flash_capture("Click on the video (not letterbox)")
             return
-        if self._line_edit_point is None:
-            self._line_edit_point = mapped
-            self._flash_capture("Click second point", seconds=3.0)
+        mode = self._zone_edit_mode or "line"
+        self._zone_edit_points.append(mapped)
+        if mode == "line":
+            if len(self._zone_edit_points) == 1:
+                self._flash_capture("Click second point", seconds=3.0)
+                return
+            self._finish_zone_edit()
             return
-        self._finish_line_edit(self._line_edit_point, mapped)
+        n = len(self._zone_edit_points)
+        self._flash_capture(
+            f"Point {n} — click more or Enter to finish (≥3)",
+            seconds=2.5,
+        )
+
+    def _on_line_edit_mouse(self, event: int, x: int, y: int) -> None:
+        self._on_zone_edit_mouse(event, x, y)
 
     def _on_menu_mouse(self, event: int, x: int, y: int, flags: int) -> None:
         wheel = getattr(cv2, "EVENT_MOUSEWHEEL", None)

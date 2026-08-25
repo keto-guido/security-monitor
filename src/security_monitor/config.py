@@ -13,6 +13,8 @@ from urllib.parse import quote, urlparse, urlunparse
 
 import yaml
 
+from security_monitor.encroachment import EncroachZone
+
 VALID_SCALE_MODES = ("fit", "fill", "stretch")
 VALID_TRANSPORTS = ("tcp", "udp", "auto")
 VALID_CAMERA_KINDS = ("ubiquiti", "reolink", "amcrest", "dahua")
@@ -63,8 +65,10 @@ class CameraConfig:
     rotate: int = 0  # clockwise degrees: 0 | 90 | 180 | 270
     detect_people: bool = False
     detect_objects: bool = False
-    # Encroachment tripwire (normalized line + which half-plane is the zone).
+    # Encroachment: tripwire / polygon ROIs (normalized coords).
     detect_encroachment: bool = False
+    encroach_zones: list[EncroachZone] = field(default_factory=list)
+    # Legacy single tripwire (used when encroach_zones is empty).
     encroach_line: tuple[float, float, float, float] | None = None
     encroach_side: str = "positive"  # positive | negative
 
@@ -125,9 +129,11 @@ class DisplayConfig:
     # Detection masters (still requires per-camera opt-in).
     people_detection: bool = False
     object_detection: bool = False
-    # Encroachment: person in tripwire zone → highlight (+ optional autofocus).
+    # Encroachment: person in ROI → highlight (+ optional autofocus / alarm).
     encroachment_detection: bool = False
     encroachment_autofocus: bool = False
+    encroachment_alarm: bool = True  # stronger on-screen alarm while in zone
+    encroachment_alarm_sound: bool = True  # beep on entry (+ periodic while active)
     # Auto person events: snapshot + pre/during/post clip (Esc → Detection).
     auto_person_capture: bool = False
     person_pre_roll_seconds: float = 5.0
@@ -296,6 +302,10 @@ def camera_to_dict(cam: CameraConfig) -> dict[str, Any]:
         item["detect_objects"] = True
     if cam.detect_encroachment:
         item["detect_encroachment"] = True
+    if cam.encroach_zones:
+        from security_monitor.encroachment import zone_to_dict
+
+        item["encroach_zones"] = [zone_to_dict(z) for z in cam.encroach_zones]
     if cam.encroach_line is not None:
         item["encroach_line"] = [float(v) for v in cam.encroach_line]
     if cam.encroach_side and cam.encroach_side != "positive":
@@ -386,6 +396,8 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["object_detection"] = bool(d.object_detection)
     display["encroachment_detection"] = bool(d.encroachment_detection)
     display["encroachment_autofocus"] = bool(d.encroachment_autofocus)
+    display["encroachment_alarm"] = bool(d.encroachment_alarm)
+    display["encroachment_alarm_sound"] = bool(d.encroachment_alarm_sound)
     display["auto_person_capture"] = bool(d.auto_person_capture)
     display["person_pre_roll_seconds"] = float(d.person_pre_roll_seconds)
     display["person_post_roll_seconds"] = float(d.person_post_roll_seconds)
@@ -472,6 +484,10 @@ def _parse_display(raw: Any) -> DisplayConfig:
     )
     data.encroachment_autofocus = _bool(
         raw, "encroachment_autofocus", data.encroachment_autofocus
+    )
+    data.encroachment_alarm = _bool(raw, "encroachment_alarm", data.encroachment_alarm)
+    data.encroachment_alarm_sound = _bool(
+        raw, "encroachment_alarm_sound", data.encroachment_alarm_sound
     )
     data.auto_person_capture = _bool(raw, "auto_person_capture", data.auto_person_capture)
     data.person_pre_roll_seconds = _positive_float(
@@ -595,6 +611,14 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
         raise ConfigError(
             f"cameras[{index}].encroach_side must be one of {VALID_ENCROACH_SIDES}"
         )
+    encroach_zones: list[EncroachZone] = []
+    if "encroach_zones" in raw and raw.get("encroach_zones") is not None:
+        try:
+            from security_monitor.encroachment import parse_encroach_zones
+
+            encroach_zones = parse_encroach_zones(raw.get("encroach_zones"))
+        except ValueError as exc:
+            raise ConfigError(f"cameras[{index}].{exc}") from exc
     return CameraConfig(
         name=name,
         url=url,
@@ -611,6 +635,7 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
         detect_people=_bool(raw, "detect_people", False),
         detect_objects=_bool(raw, "detect_objects", False),
         detect_encroachment=_bool(raw, "detect_encroachment", False),
+        encroach_zones=encroach_zones,
         encroach_line=encroach_line,
         encroach_side=encroach_side,
     )

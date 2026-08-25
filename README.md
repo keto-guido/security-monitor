@@ -130,8 +130,10 @@ display:
   clip_seconds: 15               # default Save clip length
   people_detection: false        # master switch (also enable per camera)
   object_detection: false        # packages / left-behind items vs baseline
-  encroachment_detection: false  # tripwire zone alerts (also enable per camera)
-  encroachment_autofocus: false  # focus that camera while someone is in the zone
+  encroachment_detection: false  # tripwire / polygon ROI alerts (also enable per camera)
+  encroachment_autofocus: false  # focus that camera while someone is in a zone
+  encroachment_alarm: true       # pulsing banner + strong tile highlight
+  encroachment_alarm_sound: true # beep on entry (and periodically while active)
   cycle_focus: false             # auto-advance focused camera
   cycle_focus_seconds: 10
 
@@ -147,8 +149,10 @@ cameras:
     # detect_people: false  # opt this camera into people boxes
     # detect_objects: false # opt this camera into "new object" boxes
     # detect_encroachment: false
-    # encroach_line: [0.0, 0.5, 1.0, 0.5]  # normalized tripwire endpoints
-    # encroach_side: positive              # which half-plane is the zone
+    # encroach_zones:
+    #   - name: Porch
+    #     kind: polygon
+    #     points: [[0.05, 0.55], [0.95, 0.55], [0.95, 0.98], [0.05, 0.98]]
 ```
 
 Config search order:
@@ -251,17 +255,20 @@ Files land under `~/security-monitor/captures/events/<timestamp>_<camera>/` (`sn
 - **Add camera** — RTSP/URL (on-screen text entry), webcam device 0/1, or a demo tile
 - **Remove camera** — delete from the running mosaic and from `config.yaml`
 
-### Encroachment (tripwire)
+### Encroachment (tripwire + polygon ROIs)
 
 `Esc` → **Detection**:
 
 - **Encroachment** — master switch (also turns on people detection)
-- **Autofocus on encroach** — while a person is in the zone, focus that camera full-screen; return to the grid when they leave
-- **Cameras included…** — per-camera **encroach** opt-in (also enables people on that camera)
-- **Tripwire preset** / **Zone side** — apply to the focused camera (or first visible)
-- **Draw tripwire** — focus the camera and click two points; Esc cancels
+- **Autofocus on encroach** — while a person is in any zone, focus that camera; return to the grid when they leave
+- **On-screen alarm** — pulsing red mosaic banner + stronger tile border while active
+- **Alarm sound** — double beep on entry, then a reminder beep every few seconds while someone remains in a zone
+- **Cameras included…** — per-camera **encroach** opt-in
+- **Add tripwire preset** / **Tripwire zone side** / **Draw tripwire** — directed half-plane zones
+- **Add polygon preset** / **Draw polygon ROI** — click corners, **Enter** to finish (≥3 points); Esc cancels
+- **Clear all zones** — remove every ROI on the focused camera
 
-When someone crosses into the zone, the tile gets a red highlight + `ENCROACH` status, and a brief on-screen notice. The tripwire line is drawn on the feed (arrow marks the inside). Coordinates are normalized `0–1` in the rotated camera frame so they survive resolution changes.
+A camera can have **multiple zones** (mix of lines and polygons). Any person whose feet land inside a zone triggers highlight + alarm. Zones are stored under `encroach_zones` in `config.yaml` (legacy `encroach_line` still works as a fallback).
 
 ### Detection notes
 
