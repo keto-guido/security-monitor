@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -16,6 +17,48 @@ def _prefer_x11_on_wayland() -> None:
         return
     if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
         os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+
+def _configure_linux_gui() -> None:
+    """
+    Stabilize OpenCV's Qt HighGUI on Linux.
+
+    Without this, Qt may apply HiDPI scaling and return unstable
+    getWindowImageRect() sizes — the mosaic then paints at the wrong aspect
+    and the toolkit stretches it (classic "squished" look).
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    _prefer_x11_on_wayland()
+    os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "0")
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "0")
+    os.environ.setdefault("QT_SCALE_FACTOR", "1")
+    _ensure_opencv_qt_fonts()
+
+
+def _ensure_opencv_qt_fonts() -> None:
+    """OpenCV's Qt build looks for fonts under cv2/qt/fonts; link system DejaVu if missing."""
+    try:
+        import cv2
+    except ImportError:
+        return
+    font_dir = Path(cv2.__file__).resolve().parent / "qt" / "fonts"
+    marker = font_dir / "DejaVuSans.ttf"
+    if marker.exists() or marker.is_symlink():
+        return
+    for source in (
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/TTF/DejaVuSans.ttf"),
+    ):
+        if not source.is_file():
+            continue
+        try:
+            font_dir.mkdir(parents=True, exist_ok=True)
+            if not marker.exists():
+                marker.symlink_to(source)
+        except OSError:
+            return
+        break
 
 from security_monitor.config import AppConfig
 from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
@@ -86,18 +129,24 @@ class MosaicApp:
         self._view_w, self._view_h = self.display.canvas_size
         self._cell_w = self.display.cell_width
         self._cell_h = self.display.cell_height
+        self._grid_x = 0
+        self._grid_y = 0
 
     def run(self) -> int:
         if not self.sources:
             print("No enabled cameras in the current grid. Edit config.yaml.", file=sys.stderr)
             return 1
-        _prefer_x11_on_wayland()
+        _configure_linux_gui()
+        self._apply_screen_rotate()
         for source in self.sources:
             source.start()
             print(f"Started {source.name}")
 
         try:
-            cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
+            flags = cv2.WINDOW_NORMAL
+            keep = getattr(cv2, "WINDOW_KEEPRATIO", 0)
+            flags |= keep
+            cv2.namedWindow(self.window, flags)
         except cv2.error:
             print(
                 "OpenCV could not create a window. Install the GUI build:\n"
@@ -110,6 +159,13 @@ class MosaicApp:
 
         width, height = self.display.canvas_size
         cv2.resizeWindow(self.window, width, height)
+        try:
+            aspect = getattr(cv2, "WND_PROP_ASPECT_RATIO", None)
+            keep = getattr(cv2, "WINDOW_KEEPRATIO", None)
+            if aspect is not None and keep is not None:
+                cv2.setWindowProperty(self.window, aspect, keep)
+        except cv2.error:
+            pass
         cv2.setMouseCallback(self.window, self._on_mouse)
         self._apply_fullscreen()
         print(
@@ -143,28 +199,55 @@ class MosaicApp:
             self._shutdown()
         return 0
 
+    def _apply_screen_rotate(self) -> None:
+        """Optional display.screen_rotate (Linux xrandr) from config."""
+        from security_monitor.display_setup import maybe_apply_config_rotation
+
+        message = maybe_apply_config_rotation(
+            self.display.screen_rotate,
+            output=self.display.screen_output,
+        )
+        if message:
+            print(message)
+
     def _shutdown(self) -> None:
         for source in self.sources:
             source.stop()
         cv2.destroyAllWindows()
 
-    def _window_size(self) -> tuple[int, int]:
+    def _screen_size(self) -> tuple[int, int] | None:
+        from security_monitor.display_setup import screen_size
+
+        return screen_size(self.display.screen_output)
+
+    def _reported_window_size(self) -> tuple[int, int] | None:
         try:
             _x, _y, ww, wh = cv2.getWindowImageRect(self.window)
-            if ww >= 320 and wh >= 180:
-                return int(ww), int(wh)
         except cv2.error:
-            pass
-        return self.display.canvas_size
+            return None
+        if ww < 1 or wh < 1:
+            return None
+        return int(ww), int(wh)
+
+    def _window_size(self) -> tuple[int, int]:
+        from security_monitor.display_setup import sanitize_window_size
+
+        return sanitize_window_size(
+            self._reported_window_size(),
+            fullscreen=self.fullscreen,
+            screen=self._screen_size(),
+            fallback=self.display.canvas_size,
+        )
 
     def _sync_layout(self) -> tuple[int, int, int, int]:
-        """Fit the mosaic to the live window so HUD text is not upscaled."""
+        """Fit the mosaic to a trustworthy window size so HUD text is not upscaled."""
         ww, wh = self._window_size()
         cols, rows = self.display.columns, self.display.rows
         cell_w = max(160, ww // cols)
         cell_h = max(90, wh // rows)
         self._cell_w, self._cell_h = cell_w, cell_h
-        self._view_w, self._view_h = cell_w * cols, cell_h * rows
+        # Paint at the exact window size so HighGUI does not stretch a shorter canvas.
+        self._view_w, self._view_h = ww, wh
         return cell_w, cell_h, self._view_w, self._view_h
 
     def _compose(self) -> np.ndarray:
@@ -181,10 +264,15 @@ class MosaicApp:
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
         canvas[:] = (12, 12, 14)
+        grid_w = cell_w * d.columns
+        grid_h = cell_h * d.rows
+        x_off = max(0, (width - grid_w) // 2)
+        y_off = max(0, (height - grid_h) // 2)
+        self._grid_x, self._grid_y = x_off, y_off
         zoomed = self.view_zoom > 1.001
         for index in range(d.tile_count):
             row, col = divmod(index, d.columns)
-            y, x = row * cell_h, col * cell_w
+            y, x = y_off + row * cell_h, x_off + col * cell_w
             if index < len(self.sources):
                 snap = self.sources[index].snapshot()
                 tile = self._render_cell(
@@ -198,24 +286,32 @@ class MosaicApp:
                 tile = placeholder(cell_w, cell_h, "Empty", "No camera assigned")
             canvas[y : y + cell_h, x : x + cell_w] = tile
         if not zoomed:
-            self._draw_grid_lines(canvas)
+            self._draw_grid_lines(canvas, x_off=x_off, y_off=y_off)
         canvas = magnify(canvas, self.view_zoom, self.pan_x, self.pan_y)
         self._draw_zoom_badge(canvas)
         return self._draw_menu(self._draw_reboot(self._draw_help(canvas)))
 
-    def _draw_grid_lines(self, canvas: np.ndarray) -> None:
+    def _draw_grid_lines(
+        self,
+        canvas: np.ndarray,
+        *,
+        x_off: int = 0,
+        y_off: int = 0,
+    ) -> None:
         cols, rows = self.display.columns, self.display.rows
         cell_w, cell_h = self._cell_w, self._cell_h
         tint = np.array([18, 18, 20], dtype=np.float32)
         alpha = 0.45
         for col in range(1, cols):
-            x = col * cell_w
-            col_pixels = canvas[:, x].astype(np.float32)
-            canvas[:, x] = (col_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
+            x = x_off + col * cell_w
+            if 0 <= x < canvas.shape[1]:
+                col_pixels = canvas[:, x].astype(np.float32)
+                canvas[:, x] = (col_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
         for row in range(1, rows):
-            y = row * cell_h
-            row_pixels = canvas[y, :].astype(np.float32)
-            canvas[y, :] = (row_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
+            y = y_off + row * cell_h
+            if 0 <= y < canvas.shape[0]:
+                row_pixels = canvas[y, :].astype(np.float32)
+                canvas[y, :] = (row_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
 
     def _render_cell(
         self,
@@ -676,7 +772,22 @@ class MosaicApp:
         mode_normal = getattr(cv2, "WINDOW_NORMAL", 0)
         if prop is None:
             return
-        cv2.setWindowProperty(self.window, prop, mode_full if self.fullscreen else mode_normal)
+        if self.fullscreen:
+            screen = self._screen_size()
+            if screen is not None:
+                try:
+                    cv2.resizeWindow(self.window, screen[0], screen[1])
+                    cv2.moveWindow(self.window, 0, 0)
+                except cv2.error:
+                    pass
+            cv2.setWindowProperty(self.window, prop, mode_full)
+        else:
+            cv2.setWindowProperty(self.window, prop, mode_normal)
+            try:
+                width, height = self.display.canvas_size
+                cv2.resizeWindow(self.window, width, height)
+            except cv2.error:
+                pass
 
     def _on_mouse(self, event: int, x: int, y: int, flags: int, _userdata: object) -> None:
         if self._reboot_job is not None:
@@ -700,9 +811,15 @@ class MosaicApp:
         if self.zoom_index is not None:
             self._go_main_layout()
             return
-        nx, ny = self._event_norm(x, y)
-        col = min(self.display.columns - 1, max(0, int(nx * self.display.columns)))
-        row = min(self.display.rows - 1, max(0, int(ny * self.display.rows)))
+        px, py = self._event_to_pixel(x, y)
+        local_x = px - self._grid_x
+        local_y = py - self._grid_y
+        grid_w = self._cell_w * self.display.columns
+        grid_h = self._cell_h * self.display.rows
+        if local_x < 0 or local_y < 0 or local_x >= grid_w or local_y >= grid_h:
+            return
+        col = min(self.display.columns - 1, max(0, int(local_x // max(self._cell_w, 1))))
+        row = min(self.display.rows - 1, max(0, int(local_y // max(self._cell_h, 1))))
         index = row * self.display.columns + col
         if index < len(self.sources):
             self._focus_camera(index)
@@ -733,13 +850,7 @@ class MosaicApp:
         return int(nx * self._view_w), int(ny * self._view_h)
 
     def _event_norm(self, x: int, y: int) -> tuple[float, float]:
-        ww, wh = self.display.canvas_size
-        try:
-            _ox, _oy, rw, rh = cv2.getWindowImageRect(self.window)
-            if rw > 1 and rh > 1:
-                ww, wh = rw, rh
-        except cv2.error:
-            pass
+        ww, wh = self._window_size()
         return (
             min(max(x / max(ww, 1), 0.0), 1.0),
             min(max(y / max(wh, 1), 0.0), 1.0),

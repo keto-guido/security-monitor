@@ -35,6 +35,7 @@ def test_desktop_entry_uses_x11_and_paths(tmp_path: Path) -> None:
     text = build_desktop_entry(AutostartOptions(config=cfg, fullscreen=True, delay=5))
     assert text.startswith("[Desktop Entry]\n")
     assert "QT_QPA_PLATFORM=xcb" in text
+    assert "QT_SCALE_FACTOR=1" in text
     assert "--fullscreen" in text
     assert str(cfg.resolve()) in text
     assert f"Path={tmp_path.resolve()}" in text
@@ -47,6 +48,7 @@ def test_systemd_unit_targets_graphical_session(tmp_path: Path) -> None:
     text = build_systemd_unit(AutostartOptions(config=cfg, delay=10))
     assert "WantedBy=graphical-session.target" in text
     assert "QT_QPA_PLATFORM=xcb" in text
+    assert "QT_ENABLE_HIGHDPI_SCALING=0" in text
     assert "--delay" in text
 
 
