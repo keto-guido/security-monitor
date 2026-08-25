@@ -194,9 +194,11 @@ The options menu also has **Capture** (snapshot, clip length/format, save folder
 
 ### Detection notes
 
+**Stack:** Ultralytics **YOLOv8n** (COCO) is the primary people detector — real-time neural detection. If YOLO can’t load, the app falls back to MobileNet-SSD, then OpenCV HOG. New packages use a **lighting-normalized baseline diff** (CLAHE + adaptive threshold + persistence). YOLO “thing” classes (backpack, suitcase, handbag, …) that overlap a change blob confirm arrivals faster. People are masked out of the change map so walkers don’t look like packages.
+
 - **People** and **new object** detection are off until you opt in globally **and** per camera (`Esc` → Detection).
 - **Set empty-area baseline** while the porch/yard is clear (no packages). New persistent blobs vs that baseline get a `new object` box until they disappear.
-- People boxes use MobileNet-SSD (downloaded once into `~/.cache/security-monitor/models/`) with an OpenCV HOG fallback — works on Windows and Linux. No extra pip packages beyond this project's install.
+- First run downloads `yolov8n.pt` via Ultralytics (cached). OpenCV fallback models (if needed) go under `~/.cache/security-monitor/models/`.
 
 ## Commands
 

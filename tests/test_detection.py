@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from security_monitor.config import parse_config, save_display_settings
-from security_monitor.detection import Box, NewObjectTracker, draw_boxes
+from security_monitor.detection import Box, DetectionEngine, NewObjectTracker, draw_boxes
 
 
 def test_box_iou_and_clip() -> None:
@@ -42,8 +42,8 @@ def test_new_object_appears_against_baseline(tmp_path: Path, monkeypatch: pytest
     assert len(boxes) == 1
     assert boxes[0].label == "new object"
 
-    # Remove package — box clears after grace.
-    time.sleep(1.1)
+    # Remove package — box clears after grace (~1.25s).
+    time.sleep(1.35)
     assert tracker.detect("Porch", baseline.copy(), confirm_seconds=0.2) == []
 
 
@@ -52,6 +52,12 @@ def test_draw_boxes_mutates_frame() -> None:
     before = int(frame.sum())
     draw_boxes(frame, [Box(10, 10, 60, 60, "person", 0.9)])
     assert int(frame.sum()) > before
+
+
+def test_detection_engine_people_backend() -> None:
+    eng = DetectionEngine()
+    backend = eng.ensure_ready()
+    assert backend in {"yolov8n", "mobilenet-ssd", "hog", "unavailable"}
 
 
 def test_detection_config_roundtrip(tmp_path: Path) -> None:
