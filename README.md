@@ -6,33 +6,32 @@ Default layout is **2×2 (4 cameras)**. Streams can be `rtsp://` or `rtp://` (HT
 
 ## Install
 
-Python 3.10+ is required. From the project directory:
+Python 3.10+ and a desktop session (Windows, or Linux X11/Wayland) are required.
+
+One-line install (recommended):
 
 ```bash
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# Linux
-source .venv/bin/activate
-
-pip install -e .
+python -m pip install -U "git+https://github.com/keto-guido/security-monitor.git"
 ```
 
-That installs the `security-monitor` command.
+That installs the `security-monitor` command and all Python dependencies (`opencv-python`, etc.).
 
-### Ubuntu packages
+### Ubuntu system packages
 
-On Ubuntu Desktop, install a few system packages first (venv, fonts for HUD text, and OpenGL for OpenCV):
+On Ubuntu Desktop, install these once before the pip line (venv optional if you use `--user`):
 
 ```bash
-sudo apt update
-sudo apt install -y python3-venv python3-pip \
+sudo apt update && sudo apt install -y python3-pip python3-venv \
   fonts-dejavu-core libgl1 libglib2.0-0
 ```
 
-You need a logged-in graphical session (X11 or Wayland). Headless SSH alone will not show the window.
+### Editable / from a clone
+
+```bash
+git clone https://github.com/keto-guido/security-monitor.git
+cd security-monitor
+python -m pip install -e .
+```
 
 ## Quick start
 
@@ -122,6 +121,15 @@ display:
   # Linux fullscreen uses the real screen size (fixes OpenCV Qt squish)
   # screen_rotate: none
   # screen_output: auto
+  smooth_buffer: false           # delay playback for smoother video
+  smooth_buffer_seconds: 1.0
+  rewind_buffer: false           # rolling history for quick rewind
+  rewind_buffer_seconds: 30
+  # save_directory: ~/security-monitor/captures
+  snapshot_format: jpg           # jpg | png
+  clip_seconds: 15               # default Save clip length
+  people_detection: false        # master switch (also enable per camera)
+  object_detection: false        # packages / left-behind items vs baseline
 
 cameras:
   - name: Front Door
@@ -132,6 +140,8 @@ cameras:
     enabled: true
     transport: tcp
     # rotate: 180           # 0 | 90 | 180 | 270 if the camera hangs upside-down
+    # detect_people: false  # opt this camera into people boxes
+    # detect_objects: false # opt this camera into "new object" boxes
 ```
 
 Config search order:
@@ -169,14 +179,28 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `g` / `0` | Back to the grid |
 | Scroll wheel | Zoom in / out (toward the cursor) |
 | `+` / `-` | Zoom in / out |
-| Arrow keys | Pan / strafe when zoomed; move in the options menu |
+| Arrow keys | Pan / strafe when zoomed; move in the options menu; scrub rewind when rewind buffer is on |
+| `,` / `.` | Rewind back / toward live (when rewind buffer is on) |
+| `l` | Jump to live |
+| `s` | Save a snapshot (focused camera, or full mosaic) |
+| `c` | Save a clip of `clip_seconds` (from recent history, or record live) |
 | `Enter` | Choose the highlighted options-menu item |
 | `Home` | Reset zoom |
 | `r` | Reconnect every stream |
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu also has **Reboot cameras**. That uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu also has **Capture** (snapshot, clip length/format, save folder), **Detection** (people / new-object masters, per-camera includes, set empty-area baseline), **Video settings** (smooth buffer + rewind), and **Reboot cameras**. Settings are saved back into `config.yaml` when changed. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+
+### Detection notes
+
+**Stack:** Ultralytics **YOLOv8n** (COCO) is the primary people detector — real-time neural detection. If YOLO can’t load, the app falls back to MobileNet-SSD, then OpenCV HOG. New packages use a **lighting-normalized baseline diff** (CLAHE + adaptive threshold + persistence). YOLO “thing” classes (backpack, suitcase, handbag, …) that overlap a change blob confirm arrivals faster. People are masked out of the change map so walkers don’t look like packages.
+
+**Seasonal drift:** You seed an empty-area baseline once. After that the baseline **slowly adapts** (hours-scale EMA) to leaves, snow texture, and lawn growth, and is saved back to disk periodically. Pixels under a confirmed package (and under people) are **frozen**, so a box left for days keeps its `new object` flag instead of being absorbed. A whole-scene shift with no packages (e.g. overnight snow) speeds up adaptation after it settles. Manual **Set empty-area baseline** still resets everything when you want a clean slate.
+
+- **People** and **new object** detection are off until you opt in globally **and** per camera (`Esc` → Detection).
+- **Set empty-area baseline** while the porch/yard is clear (no packages). New persistent blobs vs that baseline get a `new object` box until they disappear.
+- First run downloads `yolov8n.pt` via Ultralytics (cached). OpenCV fallback models (if needed) go under `~/.cache/security-monitor/models/`.
 
 ## Commands
 

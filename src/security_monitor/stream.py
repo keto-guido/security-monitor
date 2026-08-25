@@ -11,6 +11,7 @@ from typing import Protocol
 import cv2
 import numpy as np
 
+from security_monitor.buffer import FrameHistory, HistoryView
 from security_monitor.config import CameraConfig, DisplayConfig
 
 Status = str  # live | reconnecting | disconnected | error | demo
@@ -23,39 +24,57 @@ class Snapshot:
     status: Status
     fps: float = 0.0
     detail: str = ""
+    behind: float = 0.0
+    buffered: float = 0.0
+    rewinding: bool = False
 
 
 class FrameSource(Protocol):
     name: str
+    history: FrameHistory
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
     def snapshot(self) -> Snapshot: ...
     def reconnect(self) -> None: ...
+    def apply_buffer_settings(self, display: DisplayConfig) -> None: ...
 
 
-def apply_ffmpeg_defaults(transport: str) -> None:
-    """Low-latency FFmpeg options used by OpenCV's RTSP/RTP backend."""
-    options = [
-        "fflags;nobuffer",
-        "flags;low_delay",
-        "max_delay;500000",
-    ]
+def apply_ffmpeg_defaults(transport: str, *, low_latency: bool = True) -> None:
+    """FFmpeg options used by OpenCV's RTSP/RTP backend."""
+    options: list[str] = []
     if transport == "tcp":
-        options.insert(0, "rtsp_transport;tcp")
+        options.append("rtsp_transport;tcp")
     elif transport == "udp":
-        options.insert(0, "rtsp_transport;udp")
+        options.append("rtsp_transport;udp")
+    if low_latency:
+        options.extend(
+            [
+                "fflags;nobuffer",
+                "flags;low_delay",
+                "max_delay;500000",
+            ]
+        )
+    else:
+        # Allow a little demux delay so smooth buffering has frames to work with.
+        options.extend(
+            [
+                "fflags;+genpts",
+                "max_delay;2000000",
+            ]
+        )
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(options)
 
 
 class CameraWorker(threading.Thread):
-    """Read the newest frame from an RTSP/RTP/file/webcam source."""
+    """Read frames from an RTSP/RTP/file/webcam source into a rolling history."""
 
     def __init__(self, camera: CameraConfig, display: DisplayConfig) -> None:
         super().__init__(name=f"cam-{camera.name}", daemon=True)
         self.camera = camera
         self.display = display
         self.name = camera.name  # type: ignore[assignment]
+        self.history = FrameHistory()
         self._stop = threading.Event()
         self._kick = threading.Event()
         self._wake = threading.Event()
@@ -65,6 +84,17 @@ class CameraWorker(threading.Thread):
         self._detail = "starting"
         self._fps = 0.0
         self._cap: cv2.VideoCapture | None = None
+        self.apply_buffer_settings(display)
+
+    def apply_buffer_settings(self, display: DisplayConfig) -> None:
+        self.display = display
+        self.history.configure(
+            smooth_enabled=display.smooth_buffer,
+            smooth_seconds=display.smooth_buffer_seconds,
+            rewind_enabled=display.rewind_buffer,
+            rewind_seconds=display.rewind_buffer_seconds,
+            clip_seconds=display.clip_seconds,
+        )
 
     def start(self) -> None:  # noqa: A003 - Thread.start
         if not self.is_alive():
@@ -80,11 +110,27 @@ class CameraWorker(threading.Thread):
         self._kick.set()
         self._wake.set()
         self._release()
+        self.history.clear()
 
     def snapshot(self) -> Snapshot:
         with self._lock:
-            frame = None if self._frame is None else self._frame.copy()
-            return Snapshot(frame=frame, status=self._status, fps=self._fps, detail=self._detail)
+            latest = None if self._frame is None else self._frame
+            status = self._status
+            fps = self._fps
+            detail = self._detail
+        view = self._history_view(latest)
+        return Snapshot(
+            frame=view.frame.copy() if view.frame is not None else None,
+            status=status,
+            fps=fps,
+            detail=detail,
+            behind=view.behind,
+            buffered=view.buffered,
+            rewinding=view.rewinding,
+        )
+
+    def _history_view(self, latest: np.ndarray | None) -> HistoryView:
+        return self.history.view(latest=latest)
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -112,6 +158,7 @@ class CameraWorker(threading.Thread):
                 stamps = [t for t in stamps if now - t <= 2.0]
                 fps = (len(stamps) - 1) / (stamps[-1] - stamps[0]) if len(stamps) >= 2 else 0.0
                 frame = rotate_frame(frame, self.camera.rotate)
+                self.history.push(frame, when=now)
                 with self._lock:
                     self._frame = frame
                     if self._fps > 0 and fps > 0:
@@ -131,9 +178,10 @@ class CameraWorker(threading.Thread):
     def _open(self) -> cv2.VideoCapture | None:
         source = self.camera.capture_source()
         transport = self.camera.transport or self.display.default_transport
+        low_latency = not self.display.smooth_buffer
         try:
             with _OPEN_LOCK:
-                apply_ffmpeg_defaults(transport)
+                apply_ffmpeg_defaults(transport, low_latency=low_latency)
                 cap = _create_capture(source)
         except cv2.error:
             return None
@@ -141,7 +189,9 @@ class CameraWorker(threading.Thread):
             if cap is not None:
                 cap.release()
             return None
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Small OpenCV buffer when smoothing; single frame when chasing live.
+        buf_size = 4 if self.display.smooth_buffer else 1
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, buf_size)
         _try_set(cap, "CAP_PROP_OPEN_TIMEOUT_MSEC", self.display.open_timeout_ms)
         _try_set(cap, "CAP_PROP_READ_TIMEOUT_MSEC", self.display.read_timeout_ms)
         return cap
@@ -185,10 +235,23 @@ class DemoWorker(threading.Thread):
         self.display = display
         self.index = index
         self.name = camera.name  # type: ignore[assignment]
+        self.history = FrameHistory()
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._frame: np.ndarray | None = None
         self._fps = float(display.fps)
+        self.apply_buffer_settings(display)
+
+    def apply_buffer_settings(self, display: DisplayConfig) -> None:
+        self.display = display
+        self._fps = float(display.fps)
+        self.history.configure(
+            smooth_enabled=display.smooth_buffer,
+            smooth_seconds=display.smooth_buffer_seconds,
+            rewind_enabled=display.rewind_buffer,
+            rewind_seconds=display.rewind_buffer_seconds,
+            clip_seconds=display.clip_seconds,
+        )
 
     def start(self) -> None:  # noqa: A003
         if not self.is_alive():
@@ -198,12 +261,22 @@ class DemoWorker(threading.Thread):
         self._stop.set()
 
     def reconnect(self) -> None:
+        self.history.clear()
         return
 
     def snapshot(self) -> Snapshot:
         with self._lock:
-            frame = None if self._frame is None else self._frame.copy()
-        return Snapshot(frame=frame, status="demo", fps=self._fps, detail="synthetic")
+            latest = None if self._frame is None else self._frame
+        view = self.history.view(latest=latest)
+        return Snapshot(
+            frame=view.frame.copy() if view.frame is not None else None,
+            status="demo",
+            fps=self._fps,
+            detail="synthetic",
+            behind=view.behind,
+            buffered=view.buffered,
+            rewinding=view.rewinding,
+        )
 
     def run(self) -> None:
         width, height = self.display.cell_width, self.display.cell_height
@@ -234,8 +307,11 @@ class DemoWorker(threading.Thread):
                 2,
                 cv2.LINE_AA,
             )
+            frame = rotate_frame(frame, self.camera.rotate)
+            now = time.monotonic()
+            self.history.push(frame, when=now)
             with self._lock:
-                self._frame = rotate_frame(frame, self.camera.rotate)
+                self._frame = frame
             self._stop.wait(interval)
 
 

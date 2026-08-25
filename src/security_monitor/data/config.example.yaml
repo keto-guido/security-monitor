@@ -29,12 +29,27 @@ display:
   # Linux: optional xrandr orientation (normally leave as none).
   # screen_rotate: none       # none | normal | left | right | inverted
   # screen_output: auto       # auto | HDMI-1 | DP-1 | ...
+  # Smooth playback delay (menu: Esc → Video settings). Off by default.
+  smooth_buffer: false
+  smooth_buffer_seconds: 1.0
+  # Rolling history for quick rewind (, / . keys, L = live). Off by default.
+  rewind_buffer: false
+  rewind_buffer_seconds: 30
+  # Snapshots (s) and clips (c). Menu: Esc → Capture.
+  # save_directory: ~/security-monitor/captures
+  snapshot_format: jpg          # jpg | png
+  clip_seconds: 15
+  # Detection masters (also enable per camera below / in Esc → Detection).
+  people_detection: false
+  object_detection: false
 
 cameras:
   - name: Front Door
     url: rtsp://192.168.1.10:554/Streaming/Channels/101
     enabled: true
     type: ubiquiti
+    # detect_people: false
+    # detect_objects: false
     # rotate: 180             # clockwise degrees if the camera is mounted upside-down
     # username: camera
     # password: secret
