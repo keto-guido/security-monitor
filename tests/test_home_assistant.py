@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -12,11 +13,16 @@ from security_monitor.config import ConfigError, parse_config, save_display_sett
 from security_monitor.home_assistant import (
     DoorState,
     HADoorMapping,
+    HALightControl,
+    HAPopup,
     HASnapshot,
+    call_ha_service,
     cameras_highlighted_by_doors,
     default_trigger_states,
     domain_counts,
     draw_door_hud,
+    draw_ha_light_panel,
+    draw_ha_popups,
     fetch_door_states,
     filter_entities,
     mask_token,
@@ -24,6 +30,8 @@ from security_monitor.home_assistant import (
     normalize_ha_url,
     parse_door_mappings,
     parse_entity_catalog,
+    parse_light_controls,
+    prune_popups,
     suggested_states_for_entity,
     toggle_open_state,
 )
@@ -167,11 +175,18 @@ def test_config_ha_roundtrip(tmp_path) -> None:
                         "camera": "A",
                         "open_states": ["on"],
                         "notify_hud": True,
+                        "notify_popup": True,
                         "notify_highlight": False,
                         "notify_autofocus": True,
                         "notify_sound": False,
                     }
                 ],
+                "ha_lights": [
+                    {"entity_id": "light.kitchen", "label": "Kitchen"},
+                    "switch.porch",
+                ],
+                "ha_popup_seconds": 8,
+                "ha_panel_enabled": True,
             },
             "cameras": [
                 {
@@ -190,14 +205,53 @@ def test_config_ha_roundtrip(tmp_path) -> None:
     assert cfg.display.ha_highlight is False
     assert cfg.display.ha_doors[0].entity_id == "binary_sensor.front_door"
     assert cfg.display.ha_doors[0].notify_highlight is False
+    assert cfg.display.ha_doors[0].notify_popup is True
     assert cfg.display.ha_doors[0].notify_sound is False
+    assert cfg.display.ha_popup_seconds == pytest.approx(8.0)
+    assert cfg.display.ha_panel_enabled is True
+    assert len(cfg.display.ha_lights) == 2
+    assert cfg.display.ha_lights[0].entity_id == "light.kitchen"
+    assert cfg.display.ha_lights[1].entity_id == "switch.porch"
     assert cfg.cameras[0].ha_door_entity == "binary_sensor.side"
     assert save_display_settings(cfg) == path
     text = path.read_text(encoding="utf-8")
     assert "ha_enabled: true" in text
     assert "binary_sensor.front_door" in text
     assert "notify_sound: false" in text
+    assert "notify_popup: true" in text
+    assert "light.kitchen" in text
     assert "ha_door_entity: binary_sensor.side" in text
+
+
+def test_popup_and_panel_draw_smoke() -> None:
+    canvas = np.full((360, 640, 3), 30, dtype=np.uint8)
+    popups = [HAPopup(message="Front door", until=time.monotonic() + 5)]
+    draw_ha_popups(canvas, popups)
+    assert canvas[30, 320].sum() != 30 * 3
+    assert prune_popups(popups, now=time.monotonic() + 10) == []
+    lights = [HALightControl(entity_id="light.kitchen", label="Kitchen")]
+    hits = draw_ha_light_panel(
+        canvas, lights, {"light.kitchen": "on"}, open_amount=1.0, enabled=True
+    )
+    assert any(a == "ha_panel_toggle" for a, *_ in hits)
+    assert any(a.startswith("ha_light:") for a, *_ in hits)
+
+
+def test_call_ha_service_posts(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def _fake_request(base, token, path, *, timeout=4.0, method="GET", payload=None):
+        seen["path"] = path
+        seen["method"] = method
+        seen["payload"] = payload
+        return []
+
+    monkeypatch.setattr("security_monitor.home_assistant._ha_request", _fake_request)
+    err = call_ha_service("http://ha.local:8123", "tok", "light", "toggle", "light.kitchen")
+    assert err == ""
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/api/services/light/toggle"
+    assert seen["payload"] == {"entity_id": "light.kitchen"}
 
 
 def test_entity_catalog_helpers() -> None:

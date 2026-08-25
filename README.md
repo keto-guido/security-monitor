@@ -226,10 +226,15 @@ By default, camera tiles **shrink around** the widget so they never draw under i
 1. Set HA base URL + a [long-lived access token](https://www.home-assistant.io/docs/authentication/)
 2. **Browse HA entities…** — pick a domain, then an entity from the live list
 3. Toggle which **state(s)** should alert (e.g. `on` / `open` / `unlocked`)
-4. Pick a **camera** to link
-5. Choose notification types: **HUD**, **Highlight**, **Autofocus**, **Sound** — then **Save link**
+4. Pick a **camera**, or **No camera** for HUD/popup-only alerts
+5. Choose notification types per link:
+   - **Popup toast** — temporary on-screen notice (not tied to a camera)
+   - **Persistent HUD strip** — stays while the sensor is active
+   - **Highlight / Autofocus** — requires a linked camera
+   - **Alarm sound**
+6. **Save link**
 
-**Linked sensors…** edits or removes existing links. Optional YAML / per-camera `ha_door_entity` shortcuts still work.
+**Light panel buttons…** — pin `light.*` / `switch.*` entities. Press **`]`** (or click the right-edge **HA** tab) to slide out the panel and tap buttons to toggle lights. Esc closes the panel.
 
 Example:
 
@@ -238,15 +243,21 @@ display:
   ha_enabled: true
   ha_url: http://homeassistant.local:8123
   ha_token: YOUR_LONG_LIVED_ACCESS_TOKEN
+  ha_popup_seconds: 5
+  ha_panel_enabled: true
   ha_doors:
     - entity_id: binary_sensor.front_door
       label: Front door
-      camera: Front Door
+      camera: Front Door          # omit for popup/HUD only
       open_states: [on]
+      notify_popup: true
       notify_hud: true
       notify_highlight: true
       notify_autofocus: true
       notify_sound: true
+  ha_lights:
+    - entity_id: light.kitchen
+      label: Kitchen
 ```
 
 ### Video decode (GPU / CPU)

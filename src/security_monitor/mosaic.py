@@ -128,17 +128,23 @@ from security_monitor.events import (
 from security_monitor.home_assistant import (
     HA_HOLD_CHOICES,
     HA_POLL_CHOICES,
+    HA_POPUP_CHOICES,
     HADoorMapping,
     HAEntityInfo,
+    HALightControl,
+    HAPopup,
     HomeAssistantService,
     cameras_highlighted_by_doors,
     default_trigger_states,
     domain_counts,
     draw_door_hud,
+    draw_ha_light_panel,
+    draw_ha_popups,
     filter_entities,
     mask_token,
     merge_camera_door_entities,
     normalize_ha_url,
+    prune_popups,
     suggested_states_for_entity,
     toggle_open_state,
 )
@@ -181,6 +187,7 @@ HELP_LINES = (
     "arrows   pan / strafe",
     ", / .    rewind back / forward",
     "l        jump to live",
+    "]        HA lights panel",
     "s        save snapshot",
     "c        save clip",
     "Home     reset zoom",
@@ -237,6 +244,8 @@ _NESTED_MENU_PAGES = frozenset(
         "ha_event",
         "ha_camera",
         "ha_notify",
+        "ha_lights",
+        "ha_light_pick",
         *_CAMERA_MENU_PAGES,
         *_CAPTURE_BROWSER_PAGES,
         *_EVENT_BROWSER_PAGES,
@@ -349,6 +358,10 @@ class MosaicApp:
         self._ha_browse_domain = "binary_sensor"
         self._ha_pending_entity = ""
         self._ha_pending_camera = ""
+        self._ha_popups: list[HAPopup] = []
+        self._ha_panel_open = False
+        self._ha_panel_anim = 0.0
+        self._ha_panel_hitboxes: list[tuple[str, int, int, int, int]] = []
         self._configure_ha_service()
 
     def _configure_weather_service(self) -> None:
@@ -411,6 +424,7 @@ class MosaicApp:
             camera="",
             open_states=default_trigger_states(entity),
             notify_hud=bool(d.ha_show_hud),
+            notify_popup=True,
             notify_highlight=bool(d.ha_highlight),
             notify_autofocus=bool(d.ha_autofocus),
             notify_sound=bool(d.ha_alarm_sound),
@@ -426,6 +440,7 @@ class MosaicApp:
                     camera=door.camera,
                     open_states=tuple(door.open_states),
                     notify_hud=door.notify_hud,
+                    notify_popup=door.notify_popup,
                     notify_highlight=door.notify_highlight,
                     notify_autofocus=door.notify_autofocus,
                     notify_sound=door.notify_sound,
@@ -447,6 +462,7 @@ class MosaicApp:
             camera=door.camera,
             open_states=tuple(door.open_states),
             notify_hud=door.notify_hud,
+            notify_popup=door.notify_popup,
             notify_highlight=door.notify_highlight,
             notify_autofocus=door.notify_autofocus,
             notify_sound=door.notify_sound,
@@ -464,6 +480,10 @@ class MosaicApp:
             self._menu_page = "ha_event"
             self._menu_index = 0
             return
+        # Camera-free links cannot highlight / autofocus a tile.
+        if not draft.camera:
+            draft.notify_highlight = False
+            draft.notify_autofocus = False
         if self._ha_edit_index is not None and 0 <= self._ha_edit_index < len(self.display.ha_doors):
             self.display.ha_doors[self._ha_edit_index] = draft
         else:
@@ -478,7 +498,7 @@ class MosaicApp:
         self._configure_ha_service()
         self._apply_buffer_settings(persist=True)
         label = draft.display_label
-        cam = draft.camera or "no camera"
+        cam = draft.camera or "HUD only"
         self._reboot_notice = f"Linked {label} → {cam}"
         self._reset_ha_wizard()
         self._menu_page = "ha_doors"
@@ -577,7 +597,7 @@ class MosaicApp:
         self._apply_fullscreen()
         print(
             "Controls: Esc back/options | q quit | f fullscreen | 1-9 focus | "
-            "n/p next/prev | wheel/+/- zoom | arrows pan | h help"
+            "n/p next/prev | ] HA lights | wheel/+/- zoom | arrows pan | h help"
         )
 
         delay = max(1, int(1000 / self.display.fps))
@@ -689,6 +709,7 @@ class MosaicApp:
             self._draw_capture_hud(cell)
             if d.ha_enabled:
                 draw_door_hud(cell, self._ha.snapshot, opacity=d.hud_opacity)
+            self._draw_ha_overlays(cell)
             return self._finalize_ui(cell)
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
@@ -745,7 +766,37 @@ class MosaicApp:
         self._draw_capture_hud(canvas)
         if d.ha_enabled and not zoomed:
             draw_door_hud(canvas, self._ha.snapshot, opacity=d.hud_opacity)
+        self._draw_ha_overlays(canvas)
         return self._finalize_ui(canvas)
+
+    def _draw_ha_overlays(self, canvas: np.ndarray) -> None:
+        """Temporary popups + optional right-side lights panel."""
+        now = time.monotonic()
+        self._ha_popups = prune_popups(self._ha_popups, now=now)
+        if self._ha_popups:
+            draw_ha_popups(canvas, self._ha_popups, opacity=max(0.7, self.display.hud_opacity))
+        # Animate panel open/close.
+        target = 1.0 if self._ha_panel_open and self.display.ha_panel_enabled else 0.0
+        if abs(self._ha_panel_anim - target) > 0.01:
+            step = 0.18 if target > self._ha_panel_anim else -0.22
+            self._ha_panel_anim = max(0.0, min(1.0, self._ha_panel_anim + step))
+        else:
+            self._ha_panel_anim = target
+        if self.display.ha_enabled and self.display.ha_panel_enabled:
+            states = {
+                light.entity_id.lower(): self._ha.entity_state(light.entity_id)
+                for light in self.display.ha_lights
+            }
+            self._ha_panel_hitboxes = draw_ha_light_panel(
+                canvas,
+                self.display.ha_lights,
+                states,
+                open_amount=self._ha_panel_anim,
+                enabled=True,
+            )
+        else:
+            self._ha_panel_hitboxes = []
+
 
     def _resolve_weather_rect(
         self,
@@ -1184,6 +1235,8 @@ class MosaicApp:
             self._nudge_rewind(-(REWIND_STEP_SECONDS if ch == ord(".") else REWIND_STEP_COARSE))
         elif ch in (ord("l"), ord("L")):
             self._go_live()
+        elif ch == ord("]"):
+            self._toggle_ha_panel()
         elif ch in (ord("s"), ord("S")):
             self._save_snapshot()
         elif ch in (ord("c"), ord("C")):
@@ -1243,6 +1296,14 @@ class MosaicApp:
                 self._menu_page = "ha_camera"
                 self._menu_index = 0
                 return
+            if self._menu_page == "ha_lights":
+                self._menu_page = "ha"
+                self._menu_index = 0
+                return
+            if self._menu_page == "ha_light_pick":
+                self._menu_page = "ha_lights"
+                self._menu_index = 0
+                return
             if self._menu_page in {"captures_view", "captures_delete", "captures_delete_all"}:
                 self._close_capture_view()
                 self._menu_page = "captures"
@@ -1286,6 +1347,9 @@ class MosaicApp:
         if self._weather_place_mode:
             self._finish_weather_place_editor(save=False)
             return
+        if self._ha_panel_open and not self._menu_open:
+            self._ha_panel_open = False
+            return
         if self._zone_edit_name is not None or self._line_edit_name is not None:
             self._cancel_zone_edit()
             return
@@ -1324,6 +1388,14 @@ class MosaicApp:
             return
         if self._menu_open and self._menu_page == "ha_notify":
             self._menu_page = "ha_camera"
+            self._menu_index = 0
+            return
+        if self._menu_open and self._menu_page == "ha_lights":
+            self._menu_page = "ha"
+            self._menu_index = 0
+            return
+        if self._menu_open and self._menu_page == "ha_light_pick":
+            self._menu_page = "ha_lights"
             self._menu_index = 0
             return
         if self._menu_open and self._menu_page in {
@@ -1634,7 +1706,10 @@ class MosaicApp:
                 ("ha_token", f"Token: {mask_token(d.ha_token)}"),
                 ("ha_poll", f"Poll interval: {d.ha_poll_seconds:g}s"),
                 ("ha_hold", f"Hold focus: {d.ha_hold_seconds:g}s"),
+                ("ha_popup", f"Popup duration: {d.ha_popup_seconds:g}s"),
+                ("ha_panel", f"Lights panel: {'On' if d.ha_panel_enabled else 'Off'}"),
                 ("ha_doors", f"Linked sensors… ({len(doors)})"),
+                ("ha_lights", f"Light panel buttons… ({len(d.ha_lights)})"),
                 ("ha_browse", "Browse HA entities…"),
                 ("ha_refresh_entities", f"Refresh entity list ({ent_n})" if ent_n else "Refresh entity list"),
                 ("ha_refresh", "Test connection"),
@@ -1645,10 +1720,11 @@ class MosaicApp:
             doors = list(self.display.ha_doors)
             items: list[tuple[str, str]] = []
             for index, door in enumerate(doors):
-                cam = door.camera or "no camera"
                 flags = []
                 if door.notify_hud:
                     flags.append("HUD")
+                if door.notify_popup:
+                    flags.append("POP")
                 if door.notify_highlight:
                     flags.append("HL")
                 if door.notify_autofocus:
@@ -1656,6 +1732,7 @@ class MosaicApp:
                 if door.notify_sound:
                     flags.append("SND")
                 flag_txt = ",".join(flags) if flags else "silent"
+                cam = door.camera or "HUD only"
                 items.append(
                     (
                         f"ha_link:{index}",
@@ -1735,17 +1812,21 @@ class MosaicApp:
             draft = self._ha_draft
             if draft is None:
                 return [("ha_doors_back", "Back")]
-            cam = draft.camera or "no camera"
+            cam = draft.camera or "HUD only (no camera)"
+            has_cam = bool(draft.camera)
             items = [
                 ("ha_notify_info", f"{draft.display_label} → {cam} · {draft.trigger_label()}"),
-                ("ha_notify_hud", f"HUD banner: {'On' if draft.notify_hud else 'Off'}"),
+                ("ha_notify_popup", f"Popup toast: {'On' if draft.notify_popup else 'Off'}"),
+                ("ha_notify_hud", f"Persistent HUD strip: {'On' if draft.notify_hud else 'Off'}"),
                 (
                     "ha_notify_highlight",
-                    f"Highlight camera: {'On' if draft.notify_highlight else 'Off'}",
+                    f"Highlight camera: {'On' if draft.notify_highlight else 'Off'}"
+                    + ("" if has_cam else " (needs camera)"),
                 ),
                 (
                     "ha_notify_autofocus",
-                    f"Autofocus camera: {'On' if draft.notify_autofocus else 'Off'}",
+                    f"Autofocus camera: {'On' if draft.notify_autofocus else 'Off'}"
+                    + ("" if has_cam else " (needs camera)"),
                 ),
                 ("ha_notify_sound", f"Alarm sound: {'On' if draft.notify_sound else 'Off'}"),
                 ("ha_notify_save", "Save link"),
@@ -1753,6 +1834,32 @@ class MosaicApp:
             if self._ha_edit_index is not None:
                 items.append(("ha_notify_delete", "Remove this link"))
             items.append(("ha_notify_back", "Back"))
+            return items
+        if self._menu_page == "ha_lights":
+            items = []
+            for index, light in enumerate(self.display.ha_lights):
+                state = self._ha.entity_state(light.entity_id) or "?"
+                items.append(
+                    (
+                        f"ha_light_edit:{index}",
+                        f"{light.display_label} [{state}] — remove",
+                    )
+                )
+            items.append(("ha_light_add", "Add light from HA…"))
+            items.append(("ha_lights_back", "Back"))
+            return items
+        if self._menu_page == "ha_light_pick":
+            lights = filter_entities(self._ha.entities, domain="light")
+            switches = filter_entities(self._ha.entities, domain="switch")
+            entities = lights + switches
+            pinned = {l.entity_id.lower() for l in self.display.ha_lights}
+            items = []
+            for index, entity in enumerate(entities):
+                mark = " ✓" if entity.entity_id.lower() in pinned else ""
+                items.append((f"ha_light_pick:{index}", f"{entity.menu_label()}{mark}"))
+            if not items:
+                items.append(("ha_light_pick_empty", "No light/switch entities — refresh list"))
+            items.append(("ha_light_pick_back", "Back"))
             return items
         if self._menu_page == "cameras":
             d = self.display
@@ -1941,6 +2048,7 @@ class MosaicApp:
                                 camera=door.camera,
                                 open_states=tuple(door.open_states),
                                 notify_hud=door.notify_hud,
+                                notify_popup=door.notify_popup,
                                 notify_highlight=door.notify_highlight,
                                 notify_autofocus=door.notify_autofocus,
                                 notify_sound=door.notify_sound,
@@ -1973,21 +2081,30 @@ class MosaicApp:
                 draft.camera = action.split(":", 1)[1]
                 self._menu_page = "ha_notify"
                 self._menu_index = 0
-                self._reboot_notice = draft.camera or "No camera"
+                self._reboot_notice = draft.camera or "HUD only (no camera)"
         elif action == "ha_camera_back":
             self._menu_page = "ha_event"
             self._menu_index = 0
         elif action == "ha_notify_info":
             pass
+        elif action == "ha_notify_popup":
+            if self._ha_draft is not None:
+                self._ha_draft.notify_popup = not self._ha_draft.notify_popup
         elif action == "ha_notify_hud":
             if self._ha_draft is not None:
                 self._ha_draft.notify_hud = not self._ha_draft.notify_hud
         elif action == "ha_notify_highlight":
             if self._ha_draft is not None:
-                self._ha_draft.notify_highlight = not self._ha_draft.notify_highlight
+                if not self._ha_draft.camera:
+                    self._reboot_notice = "Pick a camera first (or leave as HUD-only)"
+                else:
+                    self._ha_draft.notify_highlight = not self._ha_draft.notify_highlight
         elif action == "ha_notify_autofocus":
             if self._ha_draft is not None:
-                self._ha_draft.notify_autofocus = not self._ha_draft.notify_autofocus
+                if not self._ha_draft.camera:
+                    self._reboot_notice = "Pick a camera first (or leave as HUD-only)"
+                else:
+                    self._ha_draft.notify_autofocus = not self._ha_draft.notify_autofocus
         elif action == "ha_notify_sound":
             if self._ha_draft is not None:
                 self._ha_draft.notify_sound = not self._ha_draft.notify_sound
@@ -2032,6 +2149,69 @@ class MosaicApp:
             self._adjust_menu_item("ha_poll", 1)
         elif action == "ha_hold":
             self._adjust_menu_item("ha_hold", 1)
+        elif action == "ha_popup":
+            self._adjust_menu_item("ha_popup", 1)
+        elif action == "ha_panel":
+            self.display.ha_panel_enabled = not self.display.ha_panel_enabled
+            if not self.display.ha_panel_enabled:
+                self._ha_panel_open = False
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = (
+                "Lights panel on — press ]" if self.display.ha_panel_enabled else "Lights panel off"
+            )
+        elif action == "ha_lights":
+            self._menu_page = "ha_lights"
+            self._menu_index = 0
+        elif action == "ha_lights_back":
+            self._menu_page = "ha"
+            self._menu_index = 0
+        elif action == "ha_light_add":
+            if not self._ha.entities:
+                self._reboot_notice = "Refreshing entities…"
+                threading.Thread(
+                    target=lambda: self._ha.refresh_entities(),
+                    name="ha-entities",
+                    daemon=True,
+                ).start()
+            self._menu_page = "ha_light_pick"
+            self._menu_index = 0
+        elif action == "ha_light_pick_back":
+            self._menu_page = "ha_lights"
+            self._menu_index = 0
+        elif action == "ha_light_pick_empty":
+            self._reboot_notice = "Refresh entity list from HA menu"
+        elif action.startswith("ha_light_pick:"):
+            try:
+                index = int(action.split(":", 1)[1])
+            except ValueError:
+                index = -1
+            entities = filter_entities(self._ha.entities, domain="light") + filter_entities(
+                self._ha.entities, domain="switch"
+            )
+            if 0 <= index < len(entities):
+                entity = entities[index]
+                if any(l.entity_id.lower() == entity.entity_id.lower() for l in self.display.ha_lights):
+                    self.display.ha_lights = [
+                        l
+                        for l in self.display.ha_lights
+                        if l.entity_id.lower() != entity.entity_id.lower()
+                    ]
+                    self._reboot_notice = f"Removed {entity.display_name}"
+                else:
+                    self.display.ha_lights.append(
+                        HALightControl(entity_id=entity.entity_id, label=entity.display_name)
+                    )
+                    self._reboot_notice = f"Added {entity.display_name}"
+                self._apply_buffer_settings(persist=True)
+        elif action.startswith("ha_light_edit:"):
+            try:
+                index = int(action.split(":", 1)[1])
+            except ValueError:
+                index = -1
+            if 0 <= index < len(self.display.ha_lights):
+                removed = self.display.ha_lights.pop(index)
+                self._apply_buffer_settings(persist=True)
+                self._reboot_notice = f"Removed {removed.display_label}"
         elif action == "ha_refresh":
             self._configure_ha_service()
             snap = self._ha.refresh_now()
@@ -2572,8 +2752,16 @@ class MosaicApp:
             )
             self._apply_buffer_settings(persist=True)
             self._reboot_notice = f"Door hold {self.display.ha_hold_seconds:g}s"
+        elif action == "ha_popup":
+            self.display.ha_popup_seconds = float(
+                next_choice(HA_POPUP_CHOICES, self.display.ha_popup_seconds, step)
+            )
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = f"Popup {self.display.ha_popup_seconds:g}s"
         elif action in {
             "ha_toggle",
+            "ha_panel",
+            "ha_notify_popup",
             "ha_notify_hud",
             "ha_notify_highlight",
             "ha_notify_autofocus",
@@ -2972,6 +3160,8 @@ class MosaicApp:
                 "ha_event",
                 "ha_camera",
                 "ha_notify",
+                "ha_lights",
+                "ha_light_pick",
                 *_CAMERA_MENU_PAGES,
                 *_EVENT_BROWSER_PAGES,
             }:
@@ -3092,15 +3282,24 @@ class MosaicApp:
 
         snap = self._ha.snapshot
         prev = self._door_prev_open
+        now = time.monotonic()
         for door in snap.doors:
             was = prev.get(door.entity_id.lower(), False)
             if door.open and not was:
                 label = door.label
-                cam = door.camera or "—"
-                self._flash_capture(f"DOOR OPEN: {label} → {cam}", seconds=4.0)
-                print(f"Door open: {label} ({door.entity_id}) → camera {cam}")
+                cam = door.camera or "HUD"
+                self._flash_capture(f"HA: {label} → {cam}", seconds=4.0)
+                print(f"HA trigger: {label} ({door.entity_id}) → camera {cam}")
                 if door.notify_sound:
                     play_alert_beep(double=True)
+                if door.notify_popup:
+                    msg = f"{label}" if not door.camera else f"{label} · {door.camera}"
+                    self._ha_popups.append(
+                        HAPopup(
+                            message=msg,
+                            until=now + max(1.0, float(d.ha_popup_seconds)),
+                        )
+                    )
         self._door_prev_open = {door.entity_id.lower(): door.open for door in snap.doors}
 
         hold = float(d.ha_hold_seconds)
@@ -4032,6 +4231,8 @@ class MosaicApp:
             "ha_event",
             "ha_camera",
             "ha_notify",
+            "ha_lights",
+            "ha_light_pick",
             *_CAMERA_MENU_PAGES,
             *_CAPTURE_BROWSER_PAGES,
             *_EVENT_BROWSER_PAGES,
@@ -4081,6 +4282,8 @@ class MosaicApp:
             "ha_event": "Trigger state",
             "ha_camera": "Link camera",
             "ha_notify": "Notifications",
+            "ha_lights": "Light panel",
+            "ha_light_pick": "Add lights",
             "cameras": "Cameras",
             "cameras_arrange": "Arrange tiles",
             "cameras_toggle": "Show / hide",
@@ -4158,6 +4361,10 @@ class MosaicApp:
             footer = "Enter choose camera    Esc back"
         elif self._menu_page == "ha_notify":
             footer = "Toggle notifications    Save link"
+        elif self._menu_page == "ha_lights":
+            footer = "Add lights for the right-side panel    Esc back"
+        elif self._menu_page == "ha_light_pick":
+            footer = "Enter add/remove    Esc back"
         elif self._menu_page == "capture":
             footer = "s snapshot  c clip    ← → length    Esc back"
         elif self._menu_page == "events_play":
@@ -4188,6 +4395,8 @@ class MosaicApp:
             "ha_event",
             "ha_camera",
             "ha_notify",
+            "ha_lights",
+            "ha_light_pick",
         }:
             footer = "Enter select    ← → adjust    Esc back"
         else:
@@ -4302,6 +4511,35 @@ class MosaicApp:
             except cv2.error:
                 pass
 
+    def _toggle_ha_panel(self) -> None:
+        if not self.display.ha_enabled or not self.display.ha_panel_enabled:
+            self._flash_capture("Enable HA + Lights panel in Home Assistant menu", seconds=3.0)
+            return
+        self._ha_panel_open = not self._ha_panel_open
+        if self._ha_panel_open and not self._ha.entities:
+            threading.Thread(
+                target=lambda: self._ha.refresh_entities(),
+                name="ha-entities",
+                daemon=True,
+            ).start()
+
+    def _handle_ha_panel_action(self, action: str) -> None:
+        if action == "ha_panel_toggle":
+            self._toggle_ha_panel()
+            return
+        if action.startswith("ha_light:"):
+            entity_id = action.split(":", 1)[1]
+            light = next(
+                (l for l in self.display.ha_lights if l.entity_id == entity_id),
+                HALightControl(entity_id=entity_id),
+            )
+            error = self._ha.toggle_light(light)
+            if error:
+                self._flash_capture(f"HA light failed: {error}", seconds=3.0)
+            else:
+                state = self._ha.entity_state(entity_id) or "toggled"
+                self._flash_capture(f"{light.display_label}: {state}", seconds=2.0)
+
     def _on_mouse(self, event: int, x: int, y: int, flags: int, _userdata: object) -> None:
         if self._reboot_job is not None:
             if event == cv2.EVENT_LBUTTONUP and self._reboot_job.finished:
@@ -4316,6 +4554,13 @@ class MosaicApp:
         if self._menu_open:
             self._on_menu_mouse(event, x, y, flags)
             return
+        # HA lights panel hits (tab + buttons) take priority over camera focus.
+        if event == cv2.EVENT_LBUTTONUP and self._ha_panel_hitboxes:
+            px, py = self._event_to_pixel(x, y)
+            for action, x0, y0, x1, y1 in self._ha_panel_hitboxes:
+                if x0 <= px <= x1 and y0 <= py <= y1:
+                    self._handle_ha_panel_action(action)
+                    return
         wheel = getattr(cv2, "EVENT_MOUSEWHEEL", None)
         if wheel is not None and event == wheel:
             steps = _wheel_steps(flags)

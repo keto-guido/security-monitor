@@ -18,6 +18,7 @@ from security_monitor.overlay import draw_text, shade_round_rect
 
 HA_POLL_CHOICES: tuple[float, ...] = (1.0, 2.0, 3.0, 5.0, 10.0)
 HA_HOLD_CHOICES: tuple[float, ...] = (5.0, 10.0, 15.0, 20.0, 30.0, 60.0)
+HA_POPUP_CHOICES: tuple[float, ...] = (3.0, 5.0, 8.0, 12.0, 20.0)
 DEFAULT_OPEN_STATES: tuple[str, ...] = ("on", "open", "unlocked")
 # Domains that commonly map to doors / openings / occupancy alerts.
 HA_BROWSE_DOMAINS: tuple[str, ...] = (
@@ -27,6 +28,7 @@ HA_BROWSE_DOMAINS: tuple[str, ...] = (
     "switch",
     "input_boolean",
     "sensor",
+    "light",
 )
 DOMAIN_STATE_HINTS: dict[str, tuple[str, ...]] = {
     "binary_sensor": ("on", "off"),
@@ -34,19 +36,23 @@ DOMAIN_STATE_HINTS: dict[str, tuple[str, ...]] = {
     "lock": ("unlocked", "locked", "locking", "unlocking", "jammed"),
     "switch": ("on", "off"),
     "input_boolean": ("on", "off"),
+    "light": ("on", "off"),
     "sensor": (),
 }
+PANEL_WIDTH = 220
+PANEL_TAB_WIDTH = 28
 
 
 @dataclass
 class HADoorMapping:
-    """Maps a Home Assistant entity to a camera and notification options."""
+    """Maps a Home Assistant entity to optional camera + notification options."""
 
     entity_id: str
     label: str = ""
     camera: str = ""
     open_states: tuple[str, ...] = DEFAULT_OPEN_STATES
     notify_hud: bool = True
+    notify_popup: bool = True
     notify_highlight: bool = True
     notify_autofocus: bool = True
     notify_sound: bool = True
@@ -61,6 +67,31 @@ class HADoorMapping:
 
     def trigger_label(self) -> str:
         return "/".join(self.open_states) if self.open_states else "—"
+
+
+@dataclass
+class HALightControl:
+    """A light (or switch) shown on the HA slide-out panel."""
+
+    entity_id: str
+    label: str = ""
+
+    @property
+    def display_label(self) -> str:
+        return (self.label or self.entity_id.split(".", 1)[-1] or self.entity_id).strip()
+
+    @property
+    def domain(self) -> str:
+        return self.entity_id.split(".", 1)[0].lower() if "." in self.entity_id else "light"
+
+
+@dataclass
+class HAPopup:
+    """Temporary on-mosaic toast (not tied to a camera tile)."""
+
+    message: str
+    until: float
+    accent: tuple[int, int, int] = (40, 120, 255)
 
 
 @dataclass
@@ -96,6 +127,7 @@ class DoorState:
     local_changed_at: float = 0.0  # monotonic of last open/closed flip
     last_opened_at: float = 0.0  # monotonic of most recent closed→open edge
     notify_hud: bool = True
+    notify_popup: bool = True
     notify_highlight: bool = True
     notify_autofocus: bool = True
     notify_sound: bool = True
@@ -157,9 +189,17 @@ def door_mapping_to_dict(door: HADoorMapping) -> dict[str, Any]:
     if door.open_states and tuple(door.open_states) != DEFAULT_OPEN_STATES:
         item["open_states"] = list(door.open_states)
     item["notify_hud"] = bool(door.notify_hud)
+    item["notify_popup"] = bool(door.notify_popup)
     item["notify_highlight"] = bool(door.notify_highlight)
     item["notify_autofocus"] = bool(door.notify_autofocus)
     item["notify_sound"] = bool(door.notify_sound)
+    return item
+
+
+def light_control_to_dict(light: HALightControl) -> dict[str, Any]:
+    item: dict[str, Any] = {"entity_id": light.entity_id}
+    if light.label:
+        item["label"] = light.label
     return item
 
 
@@ -202,11 +242,38 @@ def parse_door_mappings(raw: Any) -> list[HADoorMapping]:
                 camera=camera,
                 open_states=open_states,
                 notify_hud=_mapping_bool(item, "notify_hud", True),
+                notify_popup=_mapping_bool(item, "notify_popup", True),
                 notify_highlight=_mapping_bool(item, "notify_highlight", True),
                 notify_autofocus=_mapping_bool(item, "notify_autofocus", True),
                 notify_sound=_mapping_bool(item, "notify_sound", True),
             )
         )
+    return out
+
+
+def parse_light_controls(raw: Any) -> list[HALightControl]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("ha_lights must be a list")
+    out: list[HALightControl] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if isinstance(item, str):
+            entity = item.strip()
+            label = ""
+        elif isinstance(item, dict):
+            entity = str(item.get("entity_id") or item.get("entity") or "").strip()
+            label = str(item.get("label") or item.get("name") or "").strip()
+        else:
+            raise ValueError(f"ha_lights[{index}] must be a mapping or entity_id string")
+        if not entity:
+            raise ValueError(f"ha_lights[{index}].entity_id is required")
+        key = entity.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(HALightControl(entity_id=entity, label=label))
     return out
 
 
@@ -318,22 +385,67 @@ def _ha_request(
     path: str,
     *,
     timeout: float = 4.0,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
 ) -> Any:
     url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
-    req = Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="GET",
-    )
+    data = None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = Request(url, data=data, headers=headers, method=method.upper())
     with urlopen(req, timeout=timeout) as resp:  # noqa: S310
         body = resp.read().decode("utf-8", errors="replace")
     if not body:
         return None
     return json.loads(body)
+
+
+def call_ha_service(
+    base_url: str,
+    token: str,
+    domain: str,
+    service: str,
+    entity_id: str,
+    *,
+    timeout: float = 4.0,
+) -> str:
+    """
+    Call a Home Assistant service (e.g. light.turn_on).
+
+    Returns empty string on success, or an error message.
+    """
+    base = normalize_ha_url(base_url)
+    token = (token or "").strip()
+    domain = (domain or "").strip().lower()
+    service = (service or "").strip().lower()
+    entity_id = (entity_id or "").strip()
+    if not base:
+        return "Home Assistant URL not set"
+    if not token:
+        return "Long-lived access token not set"
+    if not domain or not service or not entity_id:
+        return "Invalid service call"
+    try:
+        _ha_request(
+            base,
+            token,
+            f"/api/services/{domain}/{service}",
+            timeout=timeout,
+            method="POST",
+            payload={"entity_id": entity_id},
+        )
+        return ""
+    except HTTPError as exc:
+        if exc.code == 401:
+            return "Unauthorized (check token)"
+        return f"HTTP {exc.code}"
+    except (URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+        return str(exc)[:120]
 
 
 def fetch_door_states(
@@ -424,6 +536,7 @@ def fetch_door_states(
                     local_changed_at=local_changed,
                     last_opened_at=last_opened,
                     notify_hud=bool(mapping.notify_hud),
+                    notify_popup=bool(mapping.notify_popup),
                     notify_highlight=bool(mapping.notify_highlight),
                     notify_autofocus=bool(mapping.notify_autofocus),
                     notify_sound=bool(mapping.notify_sound),
@@ -619,6 +732,46 @@ class HomeAssistantService:
             self._entities_updated_at = time.time()
         return entities, error
 
+    def entity_state(self, entity_id: str) -> str:
+        key = (entity_id or "").lower()
+        with self._lock:
+            for entity in self._entities:
+                if entity.entity_id.lower() == key:
+                    return entity.state
+        return ""
+
+    def call_service(self, domain: str, service: str, entity_id: str) -> str:
+        with self._lock:
+            url = self._url
+            token = self._token
+        error = call_ha_service(url, token, domain, service, entity_id)
+        if not error:
+            # Optimistic local state flip for snappy panel UI.
+            desired = ""
+            if service == "turn_on":
+                desired = "on"
+            elif service == "turn_off":
+                desired = "off"
+            elif service == "toggle":
+                current = self.entity_state(entity_id)
+                desired = "off" if current == "on" else "on"
+            if desired:
+                with self._lock:
+                    for entity in self._entities:
+                        if entity.entity_id.lower() == entity_id.lower():
+                            entity.state = desired
+                            break
+            threading.Thread(
+                target=self.refresh_entities, name="ha-entities-after-call", daemon=True
+            ).start()
+        return error
+
+    def toggle_light(self, light: HALightControl) -> str:
+        domain = light.domain or "light"
+        if domain not in {"light", "switch", "input_boolean"}:
+            domain = "light"
+        return self.call_service(domain, "toggle", light.entity_id)
+
     def _refresh_once(self) -> None:
         with self._lock:
             if not self._enabled:
@@ -738,3 +891,201 @@ def draw_door_hud(
     canvas[y0 : y0 + box_h, x0 : x0 + box_w] = (
         base * (1.0 - opacity) + top * opacity
     ).astype(np.uint8)
+
+
+def prune_popups(popups: list[HAPopup], *, now: float | None = None) -> list[HAPopup]:
+    now = time.monotonic() if now is None else float(now)
+    return [p for p in popups if p.until > now]
+
+
+def draw_ha_popups(
+    canvas: np.ndarray,
+    popups: list[HAPopup],
+    *,
+    opacity: float = 0.92,
+) -> None:
+    """Draw temporary toast popups near the top-center (camera-independent)."""
+    if canvas is None or canvas.size == 0 or not popups:
+        return
+    h, w = canvas.shape[:2]
+    opacity = max(0.35, min(1.0, float(opacity)))
+    y = 16
+    for popup in popups[-4:]:
+        text = (popup.message or "").strip()
+        if not text:
+            continue
+        box_w = min(w - 40, max(280, int(w * 0.48)))
+        box_h = 46
+        x0 = max(12, (w - box_w) // 2)
+        y0 = y
+        if y0 + box_h >= h - 8:
+            break
+        layer = canvas[y0 : y0 + box_h, x0 : x0 + box_w].copy()
+        shade_round_rect(
+            layer,
+            (0, 0, box_w, box_h),
+            color=(18, 20, 28),
+            alpha=0.94,
+            radius=12,
+        )
+        cv2.rectangle(layer, (8, 8), (12, box_h - 8), popup.accent, -1)
+        draw_text(
+            layer,
+            "HA",
+            (20, 8),
+            size=12,
+            color=popup.accent,
+            valign="top",
+        )
+        draw_text(
+            layer,
+            text[:58],
+            (20, box_h - 10),
+            size=15,
+            color=(235, 235, 240),
+            valign="bottom",
+        )
+        base = canvas[y0 : y0 + box_h, x0 : x0 + box_w].astype(np.float32)
+        top = layer.astype(np.float32)
+        canvas[y0 : y0 + box_h, x0 : x0 + box_w] = (
+            base * (1.0 - opacity) + top * opacity
+        ).astype(np.uint8)
+        y += box_h + 8
+
+
+def draw_ha_light_panel(
+    canvas: np.ndarray,
+    lights: list[HALightControl],
+    states: dict[str, str],
+    *,
+    open_amount: float,
+    enabled: bool = True,
+) -> list[tuple[str, int, int, int, int]]:
+    """
+    Draw a right-side slide-out panel for HA lights.
+
+    Returns hitboxes as (action, x0, y0, x1, y1). Actions:
+      ha_panel_toggle — edge tab
+      ha_light:<entity_id> — toggle that light
+    """
+    hitboxes: list[tuple[str, int, int, int, int]] = []
+    if canvas is None or canvas.size == 0 or not enabled:
+        return hitboxes
+    h, w = canvas.shape[:2]
+    open_amount = max(0.0, min(1.0, float(open_amount)))
+    panel_w = PANEL_WIDTH
+    slide = int(round(panel_w * open_amount))
+    tab_w = PANEL_TAB_WIDTH
+    # Tab always visible on the right edge.
+    tab_x0 = w - tab_w
+    tab_y0 = max(40, h // 2 - 48)
+    tab_y1 = min(h - 40, tab_y0 + 96)
+    shade_round_rect(
+        canvas,
+        (tab_x0 - 2, tab_y0, w, tab_y1),
+        color=(28, 30, 38),
+        alpha=0.92,
+        radius=10,
+    )
+    draw_text(
+        canvas,
+        "HA",
+        (tab_x0 + tab_w // 2, (tab_y0 + tab_y1) // 2),
+        size=14,
+        color=(210, 215, 230),
+        align="center",
+        valign="center",
+    )
+    hitboxes.append(("ha_panel_toggle", tab_x0 - 2, tab_y0, w, tab_y1))
+
+    if slide <= 2:
+        return hitboxes
+
+    x0 = w - slide
+    shade_round_rect(
+        canvas,
+        (x0, 8, w - 4, h - 8),
+        color=(16, 18, 24),
+        alpha=0.94,
+        radius=14,
+    )
+    draw_text(
+        canvas,
+        "Lights",
+        (x0 + (slide // 2), 20),
+        size=18,
+        color=(230, 230, 235),
+        align="center",
+        valign="top",
+    )
+    draw_text(
+        canvas,
+        "] close",
+        (x0 + (slide // 2), 44),
+        size=12,
+        color=(140, 145, 155),
+        align="center",
+        valign="top",
+    )
+
+    if not lights:
+        draw_text(
+            canvas,
+            "Add lights in",
+            (x0 + (slide // 2), h // 2 - 10),
+            size=14,
+            color=(160, 165, 175),
+            align="center",
+            valign="center",
+        )
+        draw_text(
+            canvas,
+            "HA → Light panel",
+            (x0 + (slide // 2), h // 2 + 14),
+            size=14,
+            color=(160, 165, 175),
+            align="center",
+            valign="center",
+        )
+        return hitboxes
+
+    row_h = 54
+    y = 68
+    for light in lights:
+        if y + row_h > h - 20:
+            break
+        state = (states.get(light.entity_id.lower()) or "").lower()
+        on = state == "on"
+        btn_x0 = x0 + 12
+        btn_x1 = w - 16
+        btn_y0 = y
+        btn_y1 = y + row_h - 8
+        color = (50, 140, 90) if on else (40, 42, 52)
+        shade_round_rect(
+            canvas,
+            (btn_x0, btn_y0, btn_x1, btn_y1),
+            color=color,
+            alpha=0.92,
+            radius=10,
+        )
+        status = "ON" if on else "OFF"
+        status_color = (230, 240, 230) if on else (170, 175, 185)
+        draw_text(
+            canvas,
+            light.display_label[:22],
+            (btn_x0 + 12, btn_y0 + 8),
+            size=15,
+            color=(235, 235, 240),
+            valign="top",
+        )
+        draw_text(
+            canvas,
+            f"Tap to turn {'off' if on else 'on'}  ·  {status}",
+            (btn_x0 + 12, btn_y1 - 8),
+            size=12,
+            color=status_color,
+            valign="bottom",
+        )
+        hitboxes.append((f"ha_light:{light.entity_id}", btn_x0, btn_y0, btn_x1, btn_y1))
+        y += row_h
+    return hitboxes

@@ -16,9 +16,12 @@ import yaml
 from security_monitor.encroachment import EncroachZone
 from security_monitor.home_assistant import (
     HADoorMapping,
+    HALightControl,
     door_mapping_to_dict,
+    light_control_to_dict,
     normalize_ha_url,
     parse_door_mappings,
+    parse_light_controls,
 )
 
 VALID_SCALE_MODES = ("fit", "fill", "stretch")
@@ -198,7 +201,10 @@ class DisplayConfig:
     ha_autofocus: bool = True
     ha_alarm_sound: bool = True
     ha_hold_seconds: float = 20.0
+    ha_popup_seconds: float = 5.0
+    ha_panel_enabled: bool = True
     ha_doors: list[HADoorMapping] = field(default_factory=list)
+    ha_lights: list[HALightControl] = field(default_factory=list)
 
     @property
     def tile_count(self) -> int:
@@ -492,7 +498,10 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["ha_autofocus"] = bool(d.ha_autofocus)
     display["ha_alarm_sound"] = bool(d.ha_alarm_sound)
     display["ha_hold_seconds"] = float(d.ha_hold_seconds)
+    display["ha_popup_seconds"] = float(d.ha_popup_seconds)
+    display["ha_panel_enabled"] = bool(d.ha_panel_enabled)
     display["ha_doors"] = [door_mapping_to_dict(door) for door in d.ha_doors]
+    display["ha_lights"] = [light_control_to_dict(light) for light in d.ha_lights]
 
     raw["cameras"] = [camera_to_dict(cam) for cam in config.cameras]
 
@@ -677,8 +686,18 @@ def _parse_display(raw: Any) -> DisplayConfig:
     data.ha_hold_seconds = float(raw.get("ha_hold_seconds", data.ha_hold_seconds) or data.ha_hold_seconds)
     if not (0.0 <= data.ha_hold_seconds <= 300.0):
         raise ConfigError("display.ha_hold_seconds must be between 0 and 300")
+    data.ha_popup_seconds = float(
+        raw.get("ha_popup_seconds", data.ha_popup_seconds) or data.ha_popup_seconds
+    )
+    if not (1.0 <= data.ha_popup_seconds <= 60.0):
+        raise ConfigError("display.ha_popup_seconds must be between 1 and 60")
+    data.ha_panel_enabled = _bool(raw, "ha_panel_enabled", data.ha_panel_enabled)
     try:
         data.ha_doors = parse_door_mappings(raw.get("ha_doors", data.ha_doors))
+    except ValueError as exc:
+        raise ConfigError(f"display.{exc}") from exc
+    try:
+        data.ha_lights = parse_light_controls(raw.get("ha_lights", data.ha_lights))
     except ValueError as exc:
         raise ConfigError(f"display.{exc}") from exc
     return data

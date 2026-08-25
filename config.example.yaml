@@ -91,15 +91,21 @@ display:
   ha_autofocus: true
   ha_alarm_sound: true
   ha_hold_seconds: 20
+  ha_popup_seconds: 5
+  ha_panel_enabled: true
   # ha_doors:
   #   - entity_id: binary_sensor.front_door
   #     label: Front door
-  #     camera: Front Door
+  #     camera: Front Door          # blank = HUD/popup only (no camera)
   #     open_states: [on]
-  #     notify_hud: true
+  #     notify_popup: true          # temporary toast
+  #     notify_hud: true            # persistent open strip
   #     notify_highlight: true
   #     notify_autofocus: true
   #     notify_sound: true
+  # ha_lights:                      # right-side slide-out panel (press ])
+  #   - entity_id: light.kitchen
+  #     label: Kitchen
 
 cameras:
   - name: Front Door
