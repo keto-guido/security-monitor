@@ -31,19 +31,19 @@ Python 3.10+ and a desktop session (Windows, or Linux X11/Wayland) are required.
 
 ### Ubuntu / Debian (one line, install or update)
 
-Ubuntu 23.04+ and Debian 12 block `pip install` into the system Python (`externally-managed-environment` / PEP 668). Use **pipx** instead — same command both times:
+Ubuntu 23.04+ and Debian 12 block `pip install` into the system Python (`externally-managed-environment`). Install into a **venv** instead — same command both times:
 
 ```bash
-sudo apt install -y pipx fonts-dejavu-core libgl1 libglib2.0-0 && pipx ensurepath && pipx install --force "git+https://github.com/keto-guido/security-monitor.git"
+sudo apt install -y python3-venv fonts-dejavu-core libgl1 libglib2.0-0 && python3 -m venv ~/.venvs/security-monitor && ~/.venvs/security-monitor/bin/pip install -U "git+https://github.com/keto-guido/security-monitor.git" && mkdir -p ~/.local/bin && ln -sfn ~/.venvs/security-monitor/bin/security-monitor ~/.local/bin/security-monitor
 ```
 
-If `security-monitor` is not found, open a new terminal (or run `source ~/.bashrc`), then:
+Then (new terminal if `~/.local/bin` is not on PATH yet):
 
 ```bash
 security-monitor
 ```
 
-`--force` reinstalls from GitHub `main`, so rerun that one line whenever you want the latest.
+Rerun that one line whenever you want the latest from GitHub `main`.
 
 ### Windows (one line, install or update)
 
@@ -410,8 +410,8 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 ## Troubleshooting
 
 - **NO SIGNAL / connect failed** — verify the URL in VLC first, then try `transport: tcp`.
-- **`externally-managed-environment`** — do not use `python3 -m pip install` on Ubuntu/Debian. Use the pipx one-liner in [Install](#ubuntu--debian-one-line-install-or-update).
-- **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python` (inside the pipx/venv environment, not system pip).
+- **`externally-managed-environment`** — do not use `python3 -m pip install` on Ubuntu/Debian. Use the venv one-liner in [Install](#ubuntu--debian-one-line-install-or-update).
+- **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python` (inside the venv, not system pip).
 - **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost. Try `decode_mode: cpu` if a bad GPU path stalls opens.
 - **Want GPU decode** — set `decode_mode: gpu` (or `auto`) and pick a backend under Video settings. Confirm with **Decode status…** or `security-monitor check`. Pip wheels frequently lack working CUDA/VAAPI decode; a custom OpenCV/FFmpeg build may be required.
 - **Linux display** — needs an X11/Wayland session. SSH needs X forwarding or a desktop.
