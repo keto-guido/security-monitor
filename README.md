@@ -119,6 +119,9 @@ display:
   default_transport: tcp   # tcp | udp | auto
   open_timeout_ms: 8000
   read_timeout_ms: 5000
+  # Linux fullscreen uses the real screen size (fixes OpenCV Qt squish)
+  # screen_rotate: none
+  # screen_output: auto
 
 cameras:
   - name: Front Door
@@ -128,6 +131,7 @@ cameras:
     type: ubiquiti          # ubiquiti | reolink | amcrest | dahua
     enabled: true
     transport: tcp
+    # rotate: 180           # 0 | 90 | 180 | 270 if the camera hangs upside-down
 ```
 
 Config search order:
@@ -187,6 +191,8 @@ security-monitor check
 security-monitor reboot
 security-monitor init
 security-monitor init --user     # ~/.config/security-monitor/config.yaml
+security-monitor display         # show active screen size used for layout
+security-monitor display --rotate left   # optional xrandr orientation tweak
 security-monitor autostart install --fullscreen
 security-monitor autostart status
 security-monitor autostart uninstall
@@ -205,6 +211,13 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 - **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python`.
 - **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost.
 - **Linux display** — needs an X11/Wayland session. SSH needs X forwarding or a desktop.
+- **Squished / stretched mosaic on Linux** — OpenCV’s Qt window backend often reports the wrong window size (especially fullscreen). This build ignores bad rects and paints at the real screen size from `xrandr`. Update to the latest package, then:
+  ```bash
+  security-monitor display          # confirm detected screen size
+  security-monitor --fullscreen
+  ```
+  Also disable fractional scaling for the session, or log into “Ubuntu on Xorg”, if the whole desktop (not just this app) looks distorted.
+- **Camera feed upside-down** — set `rotate: 180` (or `90` / `270`) on that camera in `config.yaml`.
 - **Autostart did nothing** — confirm you log into a desktop user session (not only SSH). Run `security-monitor autostart status` and check `~/.config/autostart/security-monitor.desktop`. Increase `--delay` if cameras are offline at boot.
 - **Wayland blank window** — the app sets `QT_QPA_PLATFORM=xcb`; also try logging into an “Ubuntu on Xorg” session.
 - **Passwords with `@` or `:`** — use the `username` and `password` fields so they are escaped.

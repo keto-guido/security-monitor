@@ -132,6 +132,28 @@ def build_parser() -> argparse.ArgumentParser:
     status = autostart_sub.add_parser("status", help="Show whether autostart is installed")
     status.set_defaults(handler=cmd_autostart_status)
 
+    display = sub.add_parser(
+        "display",
+        help="Show Linux screen size / orientation (helps debug squished mosaic layout)",
+    )
+    display.add_argument(
+        "--rotate",
+        choices=("normal", "left", "right", "inverted"),
+        default=None,
+        help="Apply an xrandr rotation to the active output",
+    )
+    display.add_argument(
+        "--output",
+        default="auto",
+        help="xrandr output name (default: auto = primary connected)",
+    )
+    display.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the xrandr command without applying it",
+    )
+    display.set_defaults(handler=cmd_display)
+
     # Top-level flags so `security-monitor --config x.yaml` works without `run`.
     _add_run_flags(parser)
     return parser
@@ -203,7 +225,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     d = config.display
     print(
         f"Display: {d.columns}x{d.rows}  cell={d.cell_width}x{d.cell_height}  "
-        f"scale={d.scale_mode}  transport={d.default_transport}"
+        f"scale={d.scale_mode}  transport={d.default_transport}  "
+        f"screen_rotate={d.screen_rotate}"
     )
     visible = config.visible_cameras()
     print(f"Cameras: {len(visible)} shown / {len(config.cameras)} configured")
@@ -311,6 +334,34 @@ def cmd_autostart_status(args: argparse.Namespace) -> int:
     if not any_installed:
         print("Tip: security-monitor autostart install --fullscreen")
         return 1
+    return 0
+
+
+def cmd_display(args: argparse.Namespace) -> int:
+    from security_monitor.display_setup import (
+        DisplaySetupError,
+        apply_screen_rotate,
+        describe_outputs,
+    )
+
+    print(describe_outputs())
+    if args.rotate is None:
+        return 0
+    try:
+        message = apply_screen_rotate(
+            args.rotate,
+            output=args.output,
+            dry_run=bool(args.dry_run),
+        )
+    except DisplaySetupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(message)
+    if not args.dry_run:
+        print(
+            "To make this permanent, set in config.yaml:\n"
+            f"  display:\n    screen_rotate: {args.rotate}"
+        )
     return 0
 
 

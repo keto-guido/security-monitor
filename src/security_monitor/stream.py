@@ -111,6 +111,7 @@ class CameraWorker(threading.Thread):
                 stamps.append(now)
                 stamps = [t for t in stamps if now - t <= 2.0]
                 fps = (len(stamps) - 1) / (stamps[-1] - stamps[0]) if len(stamps) >= 2 else 0.0
+                frame = rotate_frame(frame, self.camera.rotate)
                 with self._lock:
                     self._frame = frame
                     if self._fps > 0 and fps > 0:
@@ -234,8 +235,22 @@ class DemoWorker(threading.Thread):
                 cv2.LINE_AA,
             )
             with self._lock:
-                self._frame = frame
+                self._frame = rotate_frame(frame, self.camera.rotate)
             self._stop.wait(interval)
+
+
+def rotate_frame(frame: np.ndarray, degrees: int) -> np.ndarray:
+    """Rotate a BGR frame clockwise by 0/90/180/270 degrees."""
+    degrees = int(degrees) % 360
+    if degrees == 0:
+        return frame
+    if degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if degrees == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if degrees == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
 
 
 def build_sources(cameras: list[CameraConfig], display: DisplayConfig) -> list[FrameSource]:

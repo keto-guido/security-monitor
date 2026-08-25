@@ -12,6 +12,7 @@ from security_monitor.mosaic import (
     zoom_toward,
 )
 from security_monitor.overlay import draw_text
+from security_monitor.stream import rotate_frame
 
 
 def test_scale_modes_output_cell_size() -> None:
@@ -73,3 +74,15 @@ def test_escape_on_main_opens_menu() -> None:
 
 def test_escape_in_menu_closes_menu() -> None:
     assert escape_action(menu_open=True, on_main_layout=True) == "close_menu"
+
+
+def test_rotate_frame_swaps_dimensions_for_90() -> None:
+    frame = np.zeros((40, 80, 3), dtype=np.uint8)
+    frame[0, 0] = (1, 2, 3)
+    out = rotate_frame(frame, 90)
+    assert out.shape == (80, 40, 3)
+    assert tuple(out[0, 39]) == (1, 2, 3)
+    assert rotate_frame(frame, 0) is frame
+    upside = rotate_frame(frame, 180)
+    assert upside.shape == frame.shape
+    assert tuple(upside[-1, -1]) == (1, 2, 3)

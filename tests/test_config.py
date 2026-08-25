@@ -134,3 +134,32 @@ def test_example_config_is_packaged() -> None:
     text = example_config_text()
     assert "display:" in text
     assert "cameras:" in text
+
+
+def test_screen_rotate_and_camera_rotate_parse() -> None:
+    cfg = parse_config(
+        {
+            "display": {"screen_rotate": "left", "screen_output": "HDMI-1"},
+            "cameras": [
+                {"name": "A", "url": "rtsp://192.168.1.10/live", "rotate": 180},
+            ],
+        }
+    )
+    assert cfg.display.screen_rotate == "left"
+    assert cfg.display.screen_output == "HDMI-1"
+    assert cfg.cameras[0].rotate == 180
+
+
+def test_invalid_screen_rotate_rejected() -> None:
+    with pytest.raises(ConfigError, match="screen_rotate"):
+        parse_config(
+            {
+                "display": {"screen_rotate": "diagonal"},
+                "cameras": [{"name": "A", "url": "rtsp://192.168.1.10/live"}],
+            }
+        )
+
+
+def test_invalid_camera_rotate_rejected() -> None:
+    with pytest.raises(ConfigError, match="rotate"):
+        parse_config({"cameras": [{"name": "A", "url": "rtsp://192.168.1.10/live", "rotate": 45}]})

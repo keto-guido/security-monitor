@@ -111,9 +111,17 @@ def _quote_desktop_exec(argv: list[str]) -> str:
 
 def build_desktop_entry(options: AutostartOptions) -> str:
     argv = build_run_argv(options)
-    # Prefer X11 (XWayland) for OpenCV windows on Ubuntu Wayland sessions.
+    # Prefer X11 (XWayland) for OpenCV windows on Ubuntu Wayland sessions,
+    # and disable Qt HiDPI scaling so the mosaic is not stretched.
     if argv and argv[0] != "env":
-        argv = ["env", "QT_QPA_PLATFORM=xcb", *argv]
+        argv = [
+            "env",
+            "QT_QPA_PLATFORM=xcb",
+            "QT_AUTO_SCREEN_SCALE_FACTOR=0",
+            "QT_ENABLE_HIGHDPI_SCALING=0",
+            "QT_SCALE_FACTOR=1",
+            *argv,
+        ]
     exec_line = _quote_desktop_exec(argv)
     workdir = options.working_directory
     if workdir is None and options.config is not None:
@@ -160,8 +168,11 @@ def build_systemd_unit(options: AutostartOptions) -> str:
         f"ExecStart={exec_line}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
-        # OpenCV GUI backends are more reliable on XWayland.
+        # OpenCV GUI backends are more reliable on XWayland; disable HiDPI stretch.
         "Environment=QT_QPA_PLATFORM=xcb\n"
+        "Environment=QT_AUTO_SCREEN_SCALE_FACTOR=0\n"
+        "Environment=QT_ENABLE_HIGHDPI_SCALING=0\n"
+        "Environment=QT_SCALE_FACTOR=1\n"
         "\n"
         "[Install]\n"
         "WantedBy=graphical-session.target\n"

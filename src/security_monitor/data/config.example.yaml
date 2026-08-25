@@ -26,12 +26,16 @@ display:
   # Open/read timeouts for FFmpeg-backed streams (milliseconds).
   open_timeout_ms: 8000
   read_timeout_ms: 5000
+  # Linux: optional xrandr orientation (normally leave as none).
+  # screen_rotate: none       # none | normal | left | right | inverted
+  # screen_output: auto       # auto | HDMI-1 | DP-1 | ...
 
 cameras:
   - name: Front Door
     url: rtsp://192.168.1.10:554/Streaming/Channels/101
     enabled: true
     type: ubiquiti
+    # rotate: 180             # clockwise degrees if the camera is mounted upside-down
     # username: camera
     # password: secret
     # ssh_port: 22

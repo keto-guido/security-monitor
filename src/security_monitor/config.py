@@ -16,6 +16,8 @@ import yaml
 VALID_SCALE_MODES = ("fit", "fill", "stretch")
 VALID_TRANSPORTS = ("tcp", "udp", "auto")
 VALID_CAMERA_KINDS = ("ubiquiti", "reolink", "amcrest", "dahua")
+VALID_SCREEN_ROTATIONS = ("none", "normal", "left", "right", "inverted")
+VALID_CAMERA_ROTATIONS = (0, 90, 180, 270)
 URL_SCHEMES = ("rtsp", "rtp", "http", "https", "file", "rtmp")
 
 _CREDENTIALS_RE = re.compile(r"://([^:/?#]+):([^@/?#]+)@")
@@ -38,6 +40,7 @@ class CameraConfig:
     reboot: bool = True
     ssh_port: int = 22
     http_port: int = 80
+    rotate: int = 0  # clockwise degrees: 0 | 90 | 180 | 270
 
     @property
     def is_device(self) -> bool:
@@ -78,6 +81,11 @@ class DisplayConfig:
     default_transport: str = "tcp"
     open_timeout_ms: int = 8000
     read_timeout_ms: int = 5000
+    # Linux X11/XWayland: rotate the active output before opening the window.
+    # Use left/right when a panel is mounted portrait but the desktop is landscape
+    # (classic "squished" / sideways look).
+    screen_rotate: str = "none"  # none | normal | left | right | inverted
+    screen_output: str = "auto"  # auto | HDMI-1 | DP-1 | ...
 
     @property
     def tile_count(self) -> int:
@@ -226,6 +234,12 @@ def _parse_display(raw: Any) -> DisplayConfig:
         raise ConfigError(f"display.default_transport must be one of {VALID_TRANSPORTS}")
     data.open_timeout_ms = _positive_int(raw, "open_timeout_ms", data.open_timeout_ms, minimum=500)
     data.read_timeout_ms = _positive_int(raw, "read_timeout_ms", data.read_timeout_ms, minimum=500)
+    data.screen_rotate = str(raw.get("screen_rotate", data.screen_rotate)).strip().lower()
+    if data.screen_rotate not in VALID_SCREEN_ROTATIONS:
+        raise ConfigError(
+            f"display.screen_rotate must be one of {VALID_SCREEN_ROTATIONS}"
+        )
+    data.screen_output = str(raw.get("screen_output", data.screen_output)).strip() or "auto"
     return data
 
 
@@ -288,6 +302,16 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
             raise ConfigError(f"cameras[{index}].http_port must be an integer") from exc
         if http_port < 1:
             raise ConfigError(f"cameras[{index}].http_port must be >= 1")
+    rotate = 0
+    if "rotate" in raw:
+        try:
+            rotate = int(raw["rotate"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"cameras[{index}].rotate must be an integer") from exc
+        if rotate not in VALID_CAMERA_ROTATIONS:
+            raise ConfigError(
+                f"cameras[{index}].rotate must be one of {VALID_CAMERA_ROTATIONS}"
+            )
     return CameraConfig(
         name=name,
         url=url,
@@ -300,6 +324,7 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
         reboot=_bool(raw, "reboot", True),
         ssh_port=ssh_port,
         http_port=http_port,
+        rotate=rotate,
     )
 
 
