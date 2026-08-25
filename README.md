@@ -176,6 +176,7 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `q` | Quit (or Exit from the options menu) |
 | `f` | Toggle fullscreen |
 | `1`–`9` | Focus that camera |
+| `n` / `p` | Next / previous camera (focus) |
 | `g` / `0` | Back to the grid |
 | Scroll wheel | Zoom in / out (toward the cursor) |
 | `+` / `-` | Zoom in / out |
@@ -190,7 +191,18 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu also has **Capture** (snapshot, clip length/format, save folder), **Detection** (people / new-object masters, per-camera includes, set empty-area baseline), **Video settings** (smooth buffer + rewind), and **Reboot cameras**. Settings are saved back into `config.yaml` when changed. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu also has **Cameras** (layout, show/hide, arrange, add/remove, focus cycling), **Capture**, **Detection**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+
+### Cameras menu
+
+`Esc` → **Cameras…** updates `config.yaml` without hand-editing:
+
+- **Layout** — cycle grid size (1×1 … 4×4); empty slots show placeholders
+- **Cycle focus** — Off / 5s / 10s / 30s / 60s auto-advance (`n` / `p` also step manually)
+- **Arrange tiles** — ← → moves a camera earlier/later in the mosaic order
+- **Show / hide** — toggle `enabled` (hidden cameras stay in the file)
+- **Add camera** — RTSP/URL (on-screen text entry), webcam device 0/1, or a demo tile
+- **Remove camera** — delete from the running mosaic and from `config.yaml`
 
 ### Detection notes
 

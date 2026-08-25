@@ -20,6 +20,23 @@ VALID_SCREEN_ROTATIONS = ("none", "normal", "left", "right", "inverted")
 VALID_CAMERA_ROTATIONS = (0, 90, 180, 270)
 URL_SCHEMES = ("rtsp", "rtp", "http", "https", "file", "rtmp")
 
+# Esc → Cameras → Layout presets (columns, rows).
+LAYOUT_PRESETS: tuple[tuple[int, int], ...] = (
+    (1, 1),
+    (1, 2),
+    (2, 1),
+    (2, 2),
+    (2, 3),
+    (3, 2),
+    (3, 3),
+    (4, 2),
+    (3, 4),
+    (4, 3),
+    (4, 4),
+)
+# 0 = cycle focus off; otherwise seconds between auto focus advances.
+CYCLE_FOCUS_CHOICES: tuple[float, ...] = (0.0, 5.0, 10.0, 30.0, 60.0)
+
 _CREDENTIALS_RE = re.compile(r"://([^:/?#]+):([^@/?#]+)@")
 
 
@@ -101,6 +118,9 @@ class DisplayConfig:
     # Detection masters (still requires per-camera opt-in).
     people_detection: bool = False
     object_detection: bool = False
+    # Auto-advance focused camera (0 / False = off). Menu: Esc → Cameras.
+    cycle_focus: bool = False
+    cycle_focus_seconds: float = 10.0
 
     @property
     def tile_count(self) -> int:
@@ -109,6 +129,12 @@ class DisplayConfig:
     @property
     def canvas_size(self) -> tuple[int, int]:
         return self.columns * self.cell_width, self.rows * self.cell_height
+
+    @property
+    def cycle_focus_label(self) -> str:
+        if not self.cycle_focus or self.cycle_focus_seconds <= 0:
+            return "Off"
+        return f"{self.cycle_focus_seconds:g}s"
 
 
 @dataclass
@@ -218,12 +244,92 @@ def example_config_text() -> str:
     return files("security_monitor").joinpath("data/config.example.yaml").read_text(encoding="utf-8")
 
 
+def camera_to_dict(cam: CameraConfig) -> dict[str, Any]:
+    """Serialize a camera for YAML (only meaningful fields)."""
+    item: dict[str, Any] = {"name": cam.name}
+    if cam.device is not None:
+        item["device"] = int(cam.device)
+    if cam.url:
+        item["url"] = cam.url
+    item["enabled"] = bool(cam.enabled)
+    if cam.transport:
+        item["transport"] = cam.transport
+    if cam.username:
+        item["username"] = cam.username
+    if cam.password:
+        item["password"] = cam.password
+    if cam.kind:
+        item["type"] = cam.kind
+    if not cam.reboot:
+        item["reboot"] = False
+    if cam.ssh_port != 22:
+        item["ssh_port"] = int(cam.ssh_port)
+    if cam.http_port != 80:
+        item["http_port"] = int(cam.http_port)
+    if cam.rotate:
+        item["rotate"] = int(cam.rotate)
+    if cam.detect_people:
+        item["detect_people"] = True
+    if cam.detect_objects:
+        item["detect_objects"] = True
+    return item
+
+
+def unique_camera_name(cameras: list[CameraConfig], base: str) -> str:
+    base = (base or "Camera").strip() or "Camera"
+    taken = {cam.name.strip().lower() for cam in cameras}
+    if base.lower() not in taken:
+        return base
+    for n in range(2, 10000):
+        candidate = f"{base} {n}"
+        if candidate.lower() not in taken:
+            return candidate
+    return f"{base} copy"
+
+
+def next_layout_preset(columns: int, rows: int, step: int = 1) -> tuple[int, int]:
+    current = (int(columns), int(rows))
+    presets = list(LAYOUT_PRESETS)
+    if current not in presets:
+        presets.append(current)
+        presets.sort(key=lambda p: (p[0] * p[1], p[0], p[1]))
+    index = presets.index(current)
+    return presets[(index + int(step)) % len(presets)]
+
+
+def move_camera(cameras: list[CameraConfig], index: int, direction: int) -> int:
+    """Swap camera at index with neighbor (direction -1 earlier, +1 later)."""
+    if index < 0 or index >= len(cameras):
+        return index
+    target = index + (1 if direction > 0 else -1)
+    if target < 0 or target >= len(cameras):
+        return index
+    cameras[index], cameras[target] = cameras[target], cameras[index]
+    return target
+
+
+def ensure_layout_fits(display: DisplayConfig, enabled_count: int) -> bool:
+    """Grow columns/rows to the next preset that fits enabled_count. Return True if changed."""
+    if enabled_count <= display.tile_count:
+        return False
+    for cols, rows in LAYOUT_PRESETS:
+        if cols * rows >= enabled_count:
+            display.columns = cols
+            display.rows = rows
+            return True
+    # Fall back to a wide strip.
+    display.columns = max(1, enabled_count)
+    display.rows = 1
+    return True
+
+
 def save_display_settings(config: AppConfig) -> Path | None:
     """
-    Persist buffer/rewind/capture/detection toggles back into config.yaml.
+    Persist display + camera list settings back into config.yaml.
 
-    Returns the path written, or None if there is no config file to update
-    (e.g. pure demo mode).
+    Writes layout, buffers, capture, detection, focus cycling, and the full
+    cameras list (order, enabled, urls, …). Returns the path written, or None
+    if there is no config file (e.g. pure demo mode).
     """
     path = config.path
     if path is None:
@@ -239,6 +345,8 @@ def save_display_settings(config: AppConfig) -> Path | None:
         display = {}
         raw["display"] = display
     d = config.display
+    display["columns"] = int(d.columns)
+    display["rows"] = int(d.rows)
     display["smooth_buffer"] = bool(d.smooth_buffer)
     display["smooth_buffer_seconds"] = float(d.smooth_buffer_seconds)
     display["rewind_buffer"] = bool(d.rewind_buffer)
@@ -248,19 +356,10 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["clip_seconds"] = float(d.clip_seconds)
     display["people_detection"] = bool(d.people_detection)
     display["object_detection"] = bool(d.object_detection)
+    display["cycle_focus"] = bool(d.cycle_focus)
+    display["cycle_focus_seconds"] = float(d.cycle_focus_seconds)
 
-    cameras_raw = raw.get("cameras")
-    if isinstance(cameras_raw, list):
-        by_name = {cam.name: cam for cam in config.cameras}
-        for item in cameras_raw:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").strip()
-            cam = by_name.get(name)
-            if cam is None:
-                continue
-            item["detect_people"] = bool(cam.detect_people)
-            item["detect_objects"] = bool(cam.detect_objects)
+    raw["cameras"] = [camera_to_dict(cam) for cam in config.cameras]
 
     path.write_text(
         yaml.safe_dump(raw, sort_keys=False, default_flow_style=False),
@@ -329,6 +428,12 @@ def _parse_display(raw: Any) -> DisplayConfig:
         raise ConfigError("display.clip_seconds must be <= 300")
     data.people_detection = _bool(raw, "people_detection", data.people_detection)
     data.object_detection = _bool(raw, "object_detection", data.object_detection)
+    data.cycle_focus = _bool(raw, "cycle_focus", data.cycle_focus)
+    data.cycle_focus_seconds = _positive_float(
+        raw, "cycle_focus_seconds", data.cycle_focus_seconds
+    )
+    if data.cycle_focus_seconds > 600:
+        raise ConfigError("display.cycle_focus_seconds must be <= 600")
     return data
 
 

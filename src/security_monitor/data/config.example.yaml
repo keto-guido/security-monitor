@@ -42,6 +42,9 @@ display:
   # Detection masters (also enable per camera below / in Esc → Detection).
   people_detection: false
   object_detection: false
+  # Auto-advance focused camera (Esc → Cameras → Cycle focus). Off by default.
+  cycle_focus: false
+  cycle_focus_seconds: 10
 
 cameras:
   - name: Front Door

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -74,7 +75,16 @@ from security_monitor.capture import (
     save_snapshot,
     write_clip,
 )
-from security_monitor.config import AppConfig, CameraConfig, save_display_settings
+from security_monitor.config import (
+    AppConfig,
+    CYCLE_FOCUS_CHOICES,
+    CameraConfig,
+    ensure_layout_fits,
+    move_camera,
+    next_layout_preset,
+    save_display_settings,
+    unique_camera_name,
+)
 from security_monitor.detection import DetectionEngine, draw_boxes
 from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
 from security_monitor.reboot import RebootJob, reboot_targets
@@ -86,6 +96,7 @@ HELP_LINES = (
     "f        fullscreen",
     "g / 0    grid view",
     "1-9      focus camera",
+    "n / p    next / prev camera",
     "wheel    zoom in/out",
     "+ / -    zoom in/out",
     "arrows   pan / strafe",
@@ -104,6 +115,37 @@ ZOOM_FACTOR = 1.2
 PAN_VIEW_FRACTION = 0.18
 REWIND_STEP_SECONDS = 1.0
 REWIND_STEP_COARSE = 5.0
+
+_CAMERA_MENU_PAGES = frozenset(
+    {
+        "cameras",
+        "cameras_arrange",
+        "cameras_toggle",
+        "cameras_add",
+        "cameras_remove",
+    }
+)
+_NESTED_MENU_PAGES = frozenset(
+    {
+        "reboot_confirm",
+        "video",
+        "capture",
+        "detection",
+        "detection_cams",
+        *_CAMERA_MENU_PAGES,
+    }
+)
+
+
+@dataclass
+class TextPrompt:
+    """Simple on-screen text entry (OpenCV has no native input box)."""
+
+    title: str
+    value: str = ""
+    kind: str = "add_name"  # add_name | add_url
+    pending_name: str = ""
+
 
 # waitKeyEx codes differ by GUI backend (Win32 / GTK / Qt).
 KEY_LEFT = frozenset({2424832, 65361, 16777234})
@@ -157,6 +199,8 @@ class MosaicApp:
         self._cell_h = self.display.cell_height
         self._grid_x = 0
         self._grid_y = 0
+        self._prompt: TextPrompt | None = None
+        self._cycle_deadline = 0.0
 
     def run(self) -> int:
         if not self.sources:
@@ -196,13 +240,14 @@ class MosaicApp:
         self._apply_fullscreen()
         print(
             "Controls: Esc back/options | q quit | f fullscreen | 1-9 focus | "
-            "wheel/+/- zoom | arrows pan | h help"
+            "n/p next/prev | wheel/+/- zoom | arrows pan | h help"
         )
 
         delay = max(1, int(1000 / self.display.fps))
         stamps: list[float] = []
         try:
             while self._running:
+                self._tick_cycle_focus()
                 canvas = self._compose()
                 cv2.imshow(self.window, canvas)
                 now = time.monotonic()
@@ -289,7 +334,7 @@ class MosaicApp:
             self._draw_buffer_badge(cell, snap)
             self._feed_clip_job(cell)
             self._draw_capture_hud(cell)
-            return self._draw_menu(self._draw_reboot(self._draw_help(cell)))
+            return self._draw_prompt(self._draw_menu(self._draw_reboot(self._draw_help(cell))))
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
         canvas[:] = (12, 12, 14)
@@ -327,7 +372,7 @@ class MosaicApp:
                 self._draw_buffer_badge(canvas, sample)
         self._feed_clip_job(canvas)
         self._draw_capture_hud(canvas)
-        return self._draw_menu(self._draw_reboot(self._draw_help(canvas)))
+        return self._draw_prompt(self._draw_menu(self._draw_reboot(self._draw_help(canvas))))
 
     def _draw_grid_lines(
         self,
@@ -425,6 +470,9 @@ class MosaicApp:
 
     def _handle_key(self, key: int) -> None:
         ch = key if 0 <= key < 256 else key & 0xFF
+        if self._prompt is not None:
+            self._handle_prompt_key(key, ch)
+            return
         if self._reboot_job is not None:
             self._handle_reboot_key(key, ch)
             return
@@ -473,6 +521,10 @@ class MosaicApp:
             self._apply_fullscreen()
         elif ch in (ord("g"), ord("G"), ord("0")):
             self._go_main_layout()
+        elif ch in (ord("n"), ord("N")):
+            self._cycle_focus(1)
+        elif ch in (ord("p"), ord("P")):
+            self._cycle_focus(-1)
         elif ch in (ord("r"), ord("R")):
             self._reconnect_all()
         elif ch in (ord("h"), ord("H"), ord("?")):
@@ -511,8 +563,16 @@ class MosaicApp:
             self._activate_menu(items[self._menu_index][0])
             return
         if ch in (ord("q"), ord("Q")):
-            if self._menu_page in {"reboot_confirm", "video", "capture", "detection", "detection_cams"}:
-                self._menu_page = "root" if self._menu_page != "detection_cams" else "detection"
+            if self._menu_page == "detection_cams":
+                self._menu_page = "detection"
+                self._menu_index = 0
+                return
+            if self._menu_page in _CAMERA_MENU_PAGES and self._menu_page != "cameras":
+                self._menu_page = "cameras"
+                self._menu_index = 0
+                return
+            if self._menu_page in _NESTED_MENU_PAGES:
+                self._menu_page = "root"
                 self._menu_index = 0
                 return
             self._activate_menu("exit")
@@ -524,8 +584,15 @@ class MosaicApp:
                 self._activate_menu(items[index][0])
 
     def _on_escape(self) -> None:
+        if self._prompt is not None:
+            self._prompt = None
+            return
         if self._menu_open and self._menu_page == "detection_cams":
             self._menu_page = "detection"
+            self._menu_index = 0
+            return
+        if self._menu_open and self._menu_page in _CAMERA_MENU_PAGES and self._menu_page != "cameras":
+            self._menu_page = "cameras"
             self._menu_index = 0
             return
         if self._menu_open and self._menu_page in {
@@ -533,6 +600,7 @@ class MosaicApp:
             "video",
             "capture",
             "detection",
+            "cameras",
         }:
             self._menu_page = "root"
             self._menu_index = 0
@@ -609,10 +677,56 @@ class MosaicApp:
                 items.append((f"cam_objects:{index}", f"{cam.name} — objects: {o}"))
             items.append(("detection_cams_back", "Back"))
             return items
+        if self._menu_page == "cameras":
+            d = self.display
+            enabled = sum(1 for cam in self.config.cameras if cam.enabled)
+            return [
+                ("layout", f"Layout: {d.columns}×{d.rows}  ({enabled} shown / {d.tile_count} slots)"),
+                ("cycle_focus", f"Cycle focus: {d.cycle_focus_label}"),
+                ("cameras_arrange", "Arrange tiles…"),
+                ("cameras_toggle", "Show / hide cameras…"),
+                ("cameras_add", "Add camera…"),
+                ("cameras_remove", "Remove camera…"),
+                ("cameras_back", "Back"),
+            ]
+        if self._menu_page == "cameras_arrange":
+            items = []
+            for index, cam in enumerate(self.config.cameras):
+                flag = "" if cam.enabled else " (hidden)"
+                items.append(
+                    (
+                        f"arrange:{index}",
+                        f"{index + 1}. {cam.name}{flag}",
+                    )
+                )
+            items.append(("cameras_arrange_back", "Back"))
+            return items
+        if self._menu_page == "cameras_toggle":
+            items = []
+            for index, cam in enumerate(self.config.cameras):
+                state = "On" if cam.enabled else "Off"
+                items.append((f"toggle:{index}", f"{cam.name} — {state}"))
+            items.append(("cameras_toggle_back", "Back"))
+            return items
+        if self._menu_page == "cameras_add":
+            return [
+                ("add_rtsp", "Add RTSP / URL camera…"),
+                ("add_webcam0", "Add webcam (device 0)"),
+                ("add_webcam1", "Add webcam (device 1)"),
+                ("add_demo", "Add demo camera"),
+                ("cameras_add_back", "Back"),
+            ]
+        if self._menu_page == "cameras_remove":
+            items = []
+            for index, cam in enumerate(self.config.cameras):
+                items.append((f"remove:{index}", f"Remove {cam.name}"))
+            items.append(("cameras_remove_back", "Back"))
+            return items
         fullscreen = "Windowed mode" if self.fullscreen else "Fullscreen"
         return [
             ("resume", "Resume"),
             ("fullscreen", fullscreen),
+            ("cameras", "Cameras…"),
             ("capture", "Capture"),
             ("detection", "Detection"),
             ("video", "Video settings"),
@@ -696,6 +810,62 @@ class MosaicApp:
             self._set_rewind_buffer(not self.display.rewind_buffer)
         elif action == "rewind_length":
             self._adjust_menu_item("rewind_length", 1)
+        elif action == "cameras":
+            self._menu_page = "cameras"
+            self._menu_index = 0
+            self._reboot_notice = ""
+        elif action == "cameras_back":
+            self._menu_page = "root"
+            self._menu_index = 0
+        elif action == "layout":
+            self._adjust_menu_item("layout", 1)
+        elif action == "cycle_focus":
+            self._adjust_menu_item("cycle_focus", 1)
+        elif action == "cameras_arrange":
+            self._menu_page = "cameras_arrange"
+            self._menu_index = 0
+            self._reboot_notice = "← → move camera in grid order"
+        elif action == "cameras_arrange_back":
+            self._menu_page = "cameras"
+            self._menu_index = 0
+        elif action.startswith("arrange:"):
+            # Enter focuses; ← → in adjust moves.
+            self._reboot_notice = "Use ← → to move this camera"
+        elif action == "cameras_toggle":
+            self._menu_page = "cameras_toggle"
+            self._menu_index = 0
+            self._reboot_notice = ""
+        elif action == "cameras_toggle_back":
+            self._menu_page = "cameras"
+            self._menu_index = 0
+        elif action.startswith("toggle:"):
+            index = int(action.split(":", 1)[1])
+            self._toggle_camera_enabled(index)
+        elif action == "cameras_add":
+            self._menu_page = "cameras_add"
+            self._menu_index = 0
+            self._reboot_notice = ""
+        elif action == "cameras_add_back":
+            self._menu_page = "cameras"
+            self._menu_index = 0
+        elif action == "add_rtsp":
+            self._prompt = TextPrompt(title="Camera name", kind="add_name")
+        elif action == "add_webcam0":
+            self._add_webcam(0)
+        elif action == "add_webcam1":
+            self._add_webcam(1)
+        elif action == "add_demo":
+            self._add_demo_camera()
+        elif action == "cameras_remove":
+            self._menu_page = "cameras_remove"
+            self._menu_index = 0
+            self._reboot_notice = "Enter removes permanently from config"
+        elif action == "cameras_remove_back":
+            self._menu_page = "cameras"
+            self._menu_index = 0
+        elif action.startswith("remove:"):
+            index = int(action.split(":", 1)[1])
+            self._remove_camera(index)
         elif action == "reconnect":
             self._reconnect_all()
             self._menu_open = False
@@ -746,6 +916,34 @@ class MosaicApp:
         elif action.startswith("cam_people:"):
             self._activate_menu(action)
         elif action.startswith("cam_objects:"):
+            self._activate_menu(action)
+        elif action == "layout":
+            cols, rows = next_layout_preset(self.display.columns, self.display.rows, step)
+            self.display.columns = cols
+            self.display.rows = rows
+            self._rebuild_sources(persist=True)
+            self._reboot_notice = f"Layout {cols}×{rows}"
+        elif action == "cycle_focus":
+            current = (
+                float(self.display.cycle_focus_seconds)
+                if self.display.cycle_focus
+                else 0.0
+            )
+            value = next_choice(CYCLE_FOCUS_CHOICES, current, step)
+            if float(value) <= 0:
+                self.display.cycle_focus = False
+            else:
+                self.display.cycle_focus = True
+                self.display.cycle_focus_seconds = float(value)
+            self._cycle_deadline = 0.0
+            self._apply_buffer_settings(persist=True)
+        elif action.startswith("arrange:"):
+            index = int(action.split(":", 1)[1])
+            new_index = move_camera(self.config.cameras, index, step)
+            self._menu_index = new_index
+            self._rebuild_sources(persist=True)
+            self._reboot_notice = "Tile order saved"
+        elif action.startswith("toggle:"):
             self._activate_menu(action)
 
     def _set_people_detection(self, enabled: bool) -> None:
@@ -849,8 +1047,212 @@ class MosaicApp:
             path = save_display_settings(self.config)
             if path is not None:
                 self._reboot_notice = f"Saved to {path.name}"
-            elif self._menu_page in {"video", "detection", "detection_cams"}:
+            elif self._menu_page in {
+                "video",
+                "detection",
+                "detection_cams",
+                *_CAMERA_MENU_PAGES,
+            }:
                 self._reboot_notice = "Settings applied (demo — not saved)"
+
+    def _rebuild_sources(self, *, persist: bool = False) -> None:
+        """Stop/start workers to match config.visible_cameras() and layout."""
+        previous_focus_name = None
+        if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
+            previous_focus_name = self.sources[self.zoom_index].name
+        for source in self.sources:
+            source.stop()
+        self.cameras = self.config.visible_cameras()
+        self._camera_by_name = {cam.name: cam for cam in self.cameras}
+        self.sources = build_sources(self.cameras, self.display)
+        for source in self.sources:
+            source.start()
+            source.apply_buffer_settings(self.display)
+            print(f"Started {source.name}")
+        if previous_focus_name:
+            for i, source in enumerate(self.sources):
+                if source.name == previous_focus_name:
+                    self.zoom_index = i
+                    break
+            else:
+                self.zoom_index = None
+                self._reset_view()
+        elif self.zoom_index is not None and self.zoom_index >= len(self.sources):
+            self.zoom_index = None
+            self._reset_view()
+        self._cycle_deadline = 0.0
+        if persist:
+            path = save_display_settings(self.config)
+            if path is not None:
+                self._reboot_notice = f"Saved to {path.name}"
+            else:
+                self._reboot_notice = "Applied (demo — not saved)"
+
+    def _toggle_camera_enabled(self, index: int) -> None:
+        if index < 0 or index >= len(self.config.cameras):
+            return
+        cam = self.config.cameras[index]
+        cam.enabled = not cam.enabled
+        if cam.enabled:
+            enabled = sum(1 for c in self.config.cameras if c.enabled)
+            if ensure_layout_fits(self.display, enabled):
+                self._reboot_notice = (
+                    f"Enabled {cam.name}; layout → "
+                    f"{self.display.columns}×{self.display.rows}"
+                )
+            else:
+                self._reboot_notice = f"Enabled {cam.name}"
+        else:
+            self._reboot_notice = f"Hidden {cam.name}"
+        self._rebuild_sources(persist=True)
+
+    def _add_camera(self, cam: CameraConfig) -> None:
+        self.config.cameras.append(cam)
+        enabled = sum(1 for c in self.config.cameras if c.enabled)
+        ensure_layout_fits(self.display, enabled)
+        self._rebuild_sources(persist=True)
+        self._menu_page = "cameras"
+        self._menu_index = 0
+        self._reboot_notice = f"Added {cam.name}"
+        print(f"Added camera {cam.name} ({cam.redacted_source()})")
+
+    def _add_webcam(self, device: int) -> None:
+        name = unique_camera_name(self.config.cameras, f"Webcam {device}")
+        self._add_camera(CameraConfig(name=name, device=int(device), enabled=True))
+
+    def _add_demo_camera(self) -> None:
+        n = sum(1 for c in self.config.cameras if (c.url or "").startswith("demo://"))
+        name = unique_camera_name(self.config.cameras, f"Demo Cam {n + 1}")
+        self._add_camera(CameraConfig(name=name, url=f"demo://{n}", enabled=True))
+
+    def _remove_camera(self, index: int) -> None:
+        if index < 0 or index >= len(self.config.cameras):
+            return
+        cam = self.config.cameras.pop(index)
+        self._rebuild_sources(persist=True)
+        self._menu_index = min(self._menu_index, max(0, len(self._menu_items()) - 1))
+        self._reboot_notice = f"Removed {cam.name}"
+        print(f"Removed camera {cam.name}")
+
+    def _cycle_focus(self, step: int = 1) -> None:
+        if not self.sources:
+            return
+        if self.zoom_index is None:
+            index = 0 if step >= 0 else len(self.sources) - 1
+        else:
+            index = (self.zoom_index + int(step)) % len(self.sources)
+        self._focus_camera(index)
+        self._cycle_deadline = time.monotonic() + max(1.0, self.display.cycle_focus_seconds)
+
+    def _tick_cycle_focus(self) -> None:
+        if not self.display.cycle_focus or self.display.cycle_focus_seconds <= 0:
+            return
+        if self._menu_open or self._prompt is not None or self._reboot_job is not None:
+            return
+        if not self.sources:
+            return
+        now = time.monotonic()
+        if self._cycle_deadline <= 0:
+            self._cycle_deadline = now + self.display.cycle_focus_seconds
+            return
+        if now < self._cycle_deadline:
+            return
+        self._cycle_focus(1)
+
+    def _handle_prompt_key(self, key: int, ch: int) -> None:
+        prompt = self._prompt
+        if prompt is None:
+            return
+        if key in KEY_ESC or ch == 27:
+            self._prompt = None
+            self._reboot_notice = "Add cancelled"
+            return
+        if key in KEY_ENTER or ch in (13, 10):
+            self._finish_prompt()
+            return
+        if ch in (8, 127):  # backspace / delete
+            prompt.value = prompt.value[:-1]
+            return
+        # Printable ASCII (skip control chars). Qt sometimes sends full key codes.
+        if 32 <= ch <= 126:
+            if len(prompt.value) < 240:
+                prompt.value += chr(ch)
+
+    def _finish_prompt(self) -> None:
+        prompt = self._prompt
+        if prompt is None:
+            return
+        text = prompt.value.strip()
+        if prompt.kind == "add_name":
+            if not text:
+                self._reboot_notice = "Name required"
+                return
+            self._prompt = TextPrompt(
+                title="RTSP / HTTP / file URL",
+                kind="add_url",
+                pending_name=text,
+            )
+            return
+        if prompt.kind == "add_url":
+            self._prompt = None
+            if not text:
+                self._reboot_notice = "URL required"
+                return
+            name = unique_camera_name(self.config.cameras, prompt.pending_name)
+            self._add_camera(CameraConfig(name=name, url=text, enabled=True))
+            return
+        self._prompt = None
+
+    def _draw_prompt(self, canvas: np.ndarray) -> np.ndarray:
+        prompt = self._prompt
+        if prompt is None:
+            return canvas
+        h, w = canvas.shape[:2]
+        card_w, card_h = min(720, w - 24), 160
+        x0 = max(12, (w - card_w) // 2)
+        y0 = max(12, (h - card_h) // 2)
+        shade_round_rect(
+            canvas,
+            (x0, y0, x0 + card_w, y0 + card_h),
+            color=(18, 18, 22),
+            alpha=0.94,
+            radius=16,
+        )
+        draw_text(
+            canvas,
+            prompt.title,
+            (x0 + card_w // 2, y0 + 18),
+            size=20,
+            align="center",
+            valign="top",
+        )
+        shown = prompt.value if prompt.value else " "
+        cursor = shown + ("▌" if int(time.monotonic() * 2) % 2 == 0 else " ")
+        shade_round_rect(
+            canvas,
+            (x0 + 20, y0 + 58, x0 + card_w - 20, y0 + 100),
+            color=(40, 40, 48),
+            alpha=0.9,
+            radius=8,
+        )
+        draw_text(
+            canvas,
+            cursor[-72:],
+            (x0 + 32, y0 + 68),
+            size=16,
+            color=(236, 236, 236),
+            valign="top",
+        )
+        draw_text(
+            canvas,
+            "Enter confirm    Esc cancel    type to edit",
+            (x0 + card_w // 2, y0 + card_h - 28),
+            size=13,
+            color=(150, 150, 150),
+            align="center",
+            valign="top",
+        )
+        return canvas
 
     def _nudge_rewind(self, delta_seconds: float) -> None:
         if not self.display.rewind_buffer:
@@ -1136,17 +1538,31 @@ class MosaicApp:
 
     def _draw_menu(self, canvas: np.ndarray) -> np.ndarray:
         self._menu_hitboxes = []
-        if not self._menu_open or self._reboot_job is not None:
+        if not self._menu_open or self._reboot_job is not None or self._prompt is not None:
             return canvas
         canvas[:] = (canvas.astype(np.float32) * 0.38).astype(np.uint8)
         items = self._menu_items()
-        card_w, row_h, pad = (
-            560 if self._menu_page in {"video", "capture", "detection", "detection_cams"} else 480
-        ), 46, 20
+        wide = self._menu_page in {
+            "video",
+            "capture",
+            "detection",
+            "detection_cams",
+            *_CAMERA_MENU_PAGES,
+        }
+        card_w, row_h, pad = (600 if wide else 480), 46, 20
         title_h = 56
         footer_h = 36
         notice_h = 28 if self._reboot_notice else 0
-        card_h = title_h + notice_h + row_h * len(items) + footer_h
+        # Cap visible rows so huge camera lists still fit; scroll via menu index.
+        max_rows = max(4, min(len(items), max(4, (canvas.shape[0] - 120) // row_h)))
+        start = 0
+        if len(items) > max_rows:
+            start = min(
+                max(0, self._menu_index - max_rows // 2),
+                len(items) - max_rows,
+            )
+        visible = items[start : start + max_rows]
+        card_h = title_h + notice_h + row_h * len(visible) + footer_h
         h, w = canvas.shape[:2]
         x0 = max(12, (w - card_w) // 2)
         y0 = max(12, (h - card_h) // 2)
@@ -1163,6 +1579,11 @@ class MosaicApp:
             "capture": "Capture",
             "detection": "Detection",
             "detection_cams": "Cameras for detection",
+            "cameras": "Cameras",
+            "cameras_arrange": "Arrange tiles",
+            "cameras_toggle": "Show / hide",
+            "cameras_add": "Add camera",
+            "cameras_remove": "Remove camera",
         }.get(self._menu_page, "Options")
         draw_text(
             canvas,
@@ -1182,14 +1603,15 @@ class MosaicApp:
                 align="center",
                 valign="top",
             )
-        for i, (action, label) in enumerate(items):
+        for i, (action, label) in enumerate(visible):
+            absolute = start + i
             ry = y0 + title_h + notice_h + i * row_h
             box = (x0 + pad, ry, x0 + card_w - pad, ry + row_h - 8)
-            if i == self._menu_index:
+            if absolute == self._menu_index:
                 shade_round_rect(canvas, box, color=(56, 120, 78), alpha=0.7, radius=8)
             draw_text(
                 canvas,
-                f"{i + 1}",
+                f"{absolute + 1}",
                 (box[0] + 14, ry + 8),
                 size=15,
                 color=(180, 180, 180),
@@ -1210,8 +1632,13 @@ class MosaicApp:
             footer = "Enter toggle/cycle    ← → adjust    Esc back"
         elif self._menu_page == "capture":
             footer = "s snapshot  c clip    ← → length    Esc back"
-        elif self._menu_page in {"detection", "detection_cams"}:
-            footer = "Baseline adapts to seasons; packages stay frozen    Esc back"
+        elif self._menu_page == "cameras_arrange":
+            footer = "← → move in grid order    Esc back"
+        elif self._menu_page in _CAMERA_MENU_PAGES or self._menu_page in {
+            "detection",
+            "detection_cams",
+        }:
+            footer = "Enter select    ← → adjust    Esc back"
         else:
             footer = "Enter to select    Esc to close"
         draw_text(
@@ -1230,6 +1657,7 @@ class MosaicApp:
         self._reset_view()
         self._menu_open = False
         self._menu_page = "root"
+        self._cycle_deadline = time.monotonic() + max(1.0, self.display.cycle_focus_seconds)
 
     def _reset_view(self) -> None:
         self.view_zoom = 1.0
