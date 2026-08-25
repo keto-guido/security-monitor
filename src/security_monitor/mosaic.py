@@ -92,6 +92,14 @@ from security_monitor.config import (
     unique_camera_name,
 )
 from security_monitor.detection import DetectionEngine, draw_boxes
+from security_monitor.events import (
+    PERSON_POST_ROLL_CHOICES,
+    PERSON_PRE_ROLL_CHOICES,
+    PersonEventItem,
+    PersonEventRecorder,
+    delete_person_event,
+    list_person_events,
+)
 from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
 from security_monitor.reboot import RebootJob, reboot_targets
 from security_monitor.stream import Snapshot, build_sources
@@ -139,6 +147,14 @@ _CAPTURE_BROWSER_PAGES = frozenset(
         "captures_delete_all",
     }
 )
+_EVENT_BROWSER_PAGES = frozenset(
+    {
+        "events",
+        "events_view",
+        "events_delete",
+        "events_play",
+    }
+)
 _NESTED_MENU_PAGES = frozenset(
     {
         "reboot_confirm",
@@ -148,6 +164,7 @@ _NESTED_MENU_PAGES = frozenset(
         "detection_cams",
         *_CAMERA_MENU_PAGES,
         *_CAPTURE_BROWSER_PAGES,
+        *_EVENT_BROWSER_PAGES,
     }
 )
 
@@ -220,6 +237,15 @@ class MosaicApp:
         self._captures_origin = "capture"  # capture | root
         self._capture_view_index: int | None = None
         self._capture_preview: np.ndarray | None = None
+        self._person_seen: dict[str, bool] = {}
+        self._person_recorders: dict[str, PersonEventRecorder] = {}
+        self._person_cooldown_until: dict[str, float] = {}
+        self._events: list[PersonEventItem] = []
+        self._events_origin = "detection"
+        self._event_view_index: int | None = None
+        self._event_preview: np.ndarray | None = None
+        self._event_playback: cv2.VideoCapture | None = None
+        self._event_playback_label = ""
 
     def run(self) -> int:
         if not self.sources:
@@ -301,6 +327,12 @@ class MosaicApp:
             print(message)
 
     def _shutdown(self) -> None:
+        self._stop_event_playback()
+        for name, recorder in list(self._person_recorders.items()):
+            # Force-complete any open person event so the clip is written.
+            recorder.lost_at = time.monotonic() - recorder.post_roll - 1.0
+            recorder.feed(None, person_present=False)
+            self._person_recorders.pop(name, None)
         for source in self.sources:
             source.stop()
         cv2.destroyAllWindows()
@@ -341,8 +373,11 @@ class MosaicApp:
         return cell_w, cell_h, self._view_w, self._view_h
 
     def _compose(self) -> np.ndarray:
+        self._tick_person_events()
         d = self.display
         cell_w, cell_h, width, height = self._sync_layout()
+        if self._event_playback is not None:
+            return self._finalize_ui(self._paint_event_playback(width, height))
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
             snap = self.sources[self.zoom_index].snapshot()
             name = self.sources[self.zoom_index].name
@@ -394,14 +429,19 @@ class MosaicApp:
         return self._finalize_ui(canvas)
 
     def _finalize_ui(self, canvas: np.ndarray) -> np.ndarray:
-        if (
-            self._menu_open
-            and self._menu_page in {"captures_view", "captures_delete"}
-            and self._capture_preview is not None
-        ):
-            canvas = self._paint_capture_preview(
-                canvas.shape[1], canvas.shape[0], self._capture_preview
-            )
+        if self._menu_open and self._menu_page in {"captures_view", "captures_delete"}:
+            if self._capture_preview is not None:
+                canvas = self._paint_capture_preview(
+                    canvas.shape[1], canvas.shape[0], self._capture_preview
+                )
+        if self._menu_open and self._menu_page in {"events_view", "events_delete"}:
+            if self._event_preview is not None:
+                canvas = self._paint_capture_preview(
+                    canvas.shape[1], canvas.shape[0], self._event_preview
+                )
+        if self._event_playback is not None and self._menu_page == "events_play":
+            # Playback canvas already painted; keep menu card on top.
+            pass
         return self._draw_prompt(self._draw_menu(self._draw_reboot(self._draw_help(canvas))))
 
     def _paint_capture_preview(
@@ -415,6 +455,34 @@ class MosaicApp:
         canvas[y : y + fitted.shape[0], x : x + fitted.shape[1]] = fitted
         # Dim slightly so the action card stays readable.
         canvas[:] = (canvas.astype(np.float32) * 0.72).astype(np.uint8)
+        return canvas
+
+    def _paint_event_playback(self, width: int, height: int) -> np.ndarray:
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        canvas[:] = (8, 8, 10)
+        cap = self._event_playback
+        if cap is None:
+            return canvas
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            # Loop the clip.
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = cap.read()
+        if ok and frame is not None:
+            fitted = scale_frame(frame, width, height, "fit")
+            y = max(0, (height - fitted.shape[0]) // 2)
+            x = max(0, (width - fitted.shape[1]) // 2)
+            canvas[y : y + fitted.shape[0], x : x + fitted.shape[1]] = fitted
+            shade_bottom_bar(canvas, height=36, alpha=0.55)
+            draw_text(
+                canvas,
+                f"Playing  {self._event_playback_label}   Esc stop",
+                (width // 2, height - 12),
+                size=15,
+                align="center",
+                valign="bottom",
+                color=(230, 230, 230),
+            )
         return canvas
 
     def _draw_grid_lines(
@@ -619,6 +687,20 @@ class MosaicApp:
                 self._menu_page = self._captures_origin
                 self._menu_index = 0
                 return
+            if self._menu_page == "events_play":
+                self._stop_event_playback()
+                self._menu_page = "events_view"
+                self._menu_index = 0
+                return
+            if self._menu_page in {"events_view", "events_delete"}:
+                self._close_event_view()
+                self._menu_page = "events"
+                self._menu_index = 0
+                return
+            if self._menu_page == "events":
+                self._menu_page = self._events_origin
+                self._menu_index = 0
+                return
             if self._menu_page in _CAMERA_MENU_PAGES and self._menu_page != "cameras":
                 self._menu_page = "cameras"
                 self._menu_index = 0
@@ -656,6 +738,20 @@ class MosaicApp:
             self._menu_page = self._captures_origin
             self._menu_index = 0
             return
+        if self._menu_open and self._menu_page == "events_play":
+            self._stop_event_playback()
+            self._menu_page = "events_view"
+            self._menu_index = 0
+            return
+        if self._menu_open and self._menu_page in {"events_view", "events_delete"}:
+            self._close_event_view()
+            self._menu_page = "events"
+            self._menu_index = 0
+            return
+        if self._menu_open and self._menu_page == "events":
+            self._menu_page = self._events_origin
+            self._menu_index = 0
+            return
         if self._menu_open and self._menu_page in _CAMERA_MENU_PAGES and self._menu_page != "cameras":
             self._menu_page = "cameras"
             self._menu_index = 0
@@ -675,6 +771,8 @@ class MosaicApp:
             self._menu_open = False
             self._menu_page = "root"
             self._close_capture_view()
+            self._stop_event_playback()
+            self._close_event_view()
         elif action == "main_layout":
             self._go_main_layout()
         else:
@@ -763,14 +861,53 @@ class MosaicApp:
             d = self.display
             people = "On" if d.people_detection else "Off"
             objects = "On" if d.object_detection else "Off"
+            auto = "On" if d.auto_person_capture else "Off"
             cam = self._target_camera()
             baseline_label = cam.name if cam else "(focus a camera)"
             return [
                 ("people_master", f"People detection: {people}"),
                 ("object_master", f"Object detection: {objects}"),
+                ("auto_person", f"Auto person capture: {auto}"),
+                ("person_pre", f"Pre-roll: {d.person_pre_roll_seconds:g}s"),
+                ("person_post", f"Post-roll: {d.person_post_roll_seconds:g}s"),
+                ("events_browse", "Person events…"),
                 ("detection_cams", "Cameras included…"),
                 ("set_baseline", f"Set empty-area baseline: {baseline_label}"),
                 ("detection_back", "Back"),
+            ]
+        if self._menu_page == "events":
+            items: list[tuple[str, str]] = [
+                ("events_refresh", f"Refresh list ({len(self._events)} events)"),
+            ]
+            for index, item in enumerate(self._events):
+                items.append((f"event:{index}", item.label))
+            if not self._events:
+                items.append(("events_empty", "(no person events yet)"))
+            items.append(("events_back", "Back"))
+            return items
+        if self._menu_page == "events_view":
+            item = self._selected_event()
+            title = item.label if item else "(missing)"
+            play = "Play recording" if item and item.has_clip else "Play recording (unavailable)"
+            return [
+                ("events_info", title),
+                ("events_play", play),
+                ("events_prev", "◀ Previous"),
+                ("events_next", "Next ▶"),
+                ("events_delete", "Delete event…"),
+                ("events_view_back", "Back to list"),
+            ]
+        if self._menu_page == "events_play":
+            return [
+                ("events_play_stop", "Stop playback"),
+                ("events_play_back", "Back to event"),
+            ]
+        if self._menu_page == "events_delete":
+            item = self._selected_event()
+            name = item.when.strftime("%Y-%m-%d %H:%M:%S") if item else "event"
+            return [
+                ("events_delete_yes", f"Yes, delete {name}"),
+                ("events_delete_no", "Cancel"),
             ]
         if self._menu_page == "detection_cams":
             items: list[tuple[str, str]] = []
@@ -833,6 +970,7 @@ class MosaicApp:
             ("cameras", "Cameras…"),
             ("capture", "Capture"),
             ("captures_root", "Saved captures…"),
+            ("events_root", "Person events…"),
             ("detection", "Detection"),
             ("video", "Video settings"),
             ("reconnect", "Reconnect streams"),
@@ -878,6 +1016,57 @@ class MosaicApp:
             self._set_people_detection(not self.display.people_detection)
         elif action == "object_master":
             self._set_object_detection(not self.display.object_detection)
+        elif action == "auto_person":
+            self._set_auto_person_capture(not self.display.auto_person_capture)
+        elif action == "person_pre":
+            self._adjust_menu_item("person_pre", 1)
+        elif action == "person_post":
+            self._adjust_menu_item("person_post", 1)
+        elif action == "events_browse" or action == "events_root":
+            self._events_origin = "root" if action == "events_root" else "detection"
+            self._open_events_browser()
+        elif action == "events_back":
+            self._close_event_view()
+            self._stop_event_playback()
+            self._menu_page = self._events_origin
+            self._menu_index = 0
+        elif action == "events_refresh":
+            self._refresh_events()
+            self._reboot_notice = f"{len(self._events)} event(s)"
+        elif action == "events_empty":
+            self._reboot_notice = "Enable Auto person capture + people on a camera"
+        elif action.startswith("event:"):
+            index = int(action.split(":", 1)[1])
+            self._open_event_view(index)
+        elif action == "events_info":
+            item = self._selected_event()
+            if item is not None and item.has_clip:
+                self._start_event_playback()
+            elif item is not None:
+                self._reboot_notice = str(item.path)
+        elif action == "events_prev":
+            self._nudge_event_view(-1)
+        elif action == "events_next":
+            self._nudge_event_view(1)
+        elif action == "events_play":
+            self._start_event_playback()
+        elif action == "events_play_stop" or action == "events_play_back":
+            self._stop_event_playback()
+            self._menu_page = "events_view"
+            self._menu_index = 0
+        elif action == "events_delete":
+            self._menu_page = "events_delete"
+            self._menu_index = 1
+        elif action == "events_delete_yes":
+            self._delete_selected_event()
+        elif action == "events_delete_no" or action == "events_view_back":
+            if action == "events_view_back":
+                self._close_event_view()
+                self._menu_page = "events"
+                self._menu_index = 0
+            else:
+                self._menu_page = "events_view"
+                self._menu_index = 0
         elif action == "set_baseline":
             self._set_baseline_for_target()
         elif action.startswith("cam_people:"):
@@ -1064,6 +1253,20 @@ class MosaicApp:
             self._set_people_detection(not self.display.people_detection)
         elif action == "object_master":
             self._set_object_detection(not self.display.object_detection)
+        elif action == "auto_person":
+            self._set_auto_person_capture(not self.display.auto_person_capture)
+        elif action == "person_pre":
+            value = next_choice(
+                PERSON_PRE_ROLL_CHOICES, self.display.person_pre_roll_seconds, step
+            )
+            self.display.person_pre_roll_seconds = float(value)
+            self._apply_buffer_settings(persist=True)
+        elif action == "person_post":
+            value = next_choice(
+                PERSON_POST_ROLL_CHOICES, self.display.person_post_roll_seconds, step
+            )
+            self.display.person_post_roll_seconds = float(value)
+            self._apply_buffer_settings(persist=True)
         elif action.startswith("cam_people:"):
             self._activate_menu(action)
         elif action.startswith("cam_objects:"):
@@ -1096,6 +1299,17 @@ class MosaicApp:
             self._reboot_notice = "Tile order saved"
         elif action.startswith("toggle:"):
             self._activate_menu(action)
+        elif self._menu_page == "events_view":
+            self._nudge_event_view(step)
+        elif action.startswith("event:"):
+            index = int(action.split(":", 1)[1])
+            target = index + (1 if step > 0 else -1)
+            if 0 <= target < len(self._events):
+                items = self._menu_items()
+                for i, (act, _) in enumerate(items):
+                    if act == f"event:{target}":
+                        self._menu_index = i
+                        break
         elif self._menu_page == "captures_view":
             self._nudge_capture_view(step)
         elif action.startswith("cap:"):
@@ -1126,6 +1340,24 @@ class MosaicApp:
         self.display.object_detection = bool(enabled)
         self._apply_buffer_settings(persist=True)
         print(f"Object detection {'on' if enabled else 'off'}")
+
+    def _set_auto_person_capture(self, enabled: bool) -> None:
+        self.display.auto_person_capture = bool(enabled)
+        if enabled:
+            self.display.people_detection = True
+            backend = self._detection.ensure_ready()
+            self._reboot_notice = (
+                "Auto capture on — enable cameras under Cameras included"
+                if backend != "unavailable"
+                else "People detector unavailable"
+            )
+            if backend != "unavailable":
+                self._reboot_notice = f"Auto capture on ({backend}) — include cameras"
+        else:
+            # Let active recorders finish with post-roll by marking absent.
+            self._reboot_notice = "Auto person capture off"
+        self._apply_buffer_settings(persist=True)
+        print(f"Auto person capture {'on' if enabled else 'off'}")
 
     def _toggle_camera_detection(self, index: int, *, people: bool) -> None:
         if index < 0 or index >= len(self.cameras):
@@ -1205,8 +1437,20 @@ class MosaicApp:
         )
 
     def _apply_buffer_settings(self, *, persist: bool = False) -> None:
+        history_clip = float(self.display.clip_seconds)
+        if self.display.auto_person_capture:
+            history_clip = max(history_clip, float(self.display.person_pre_roll_seconds))
         for source in self.sources:
+            source.history.configure(
+                smooth_enabled=self.display.smooth_buffer,
+                smooth_seconds=self.display.smooth_buffer_seconds,
+                rewind_enabled=self.display.rewind_buffer,
+                rewind_seconds=self.display.rewind_buffer_seconds,
+                clip_seconds=history_clip,
+            )
             source.apply_buffer_settings(self.display)
+            # Re-apply history clip after apply_buffer_settings overwrote it.
+            source.history.configure(clip_seconds=history_clip)
         if persist:
             path = save_display_settings(self.config)
             if path is not None:
@@ -1216,8 +1460,100 @@ class MosaicApp:
                 "detection",
                 "detection_cams",
                 *_CAMERA_MENU_PAGES,
+                *_EVENT_BROWSER_PAGES,
             }:
                 self._reboot_notice = "Settings applied (demo — not saved)"
+
+    def _tick_person_events(self) -> None:
+        """Rising-edge person capture: snapshot + pre/during/post clip per camera."""
+        active = dict(self._person_recorders)
+        if not self.display.auto_person_capture or not self.display.people_detection:
+            for name, recorder in active.items():
+                source = next((s for s in self.sources if s.name == name), None)
+                frame = source.snapshot().frame if source is not None else None
+                if recorder.feed(frame, person_present=False):
+                    self._finish_person_recorder(name, recorder)
+            return
+
+        now = time.monotonic()
+        for source in self.sources:
+            cam = self._camera_by_name.get(source.name)
+            if cam is None or not cam.detect_people:
+                continue
+            snap = source.snapshot()
+            frame = snap.frame
+            if frame is None:
+                continue
+            boxes = self._detection.process(
+                source.name,
+                frame,
+                detect_people=True,
+                detect_objects=False,
+            )
+            people = [b for b in boxes if b.label == "person"]
+            present = bool(people)
+            annotated = frame
+            if people:
+                annotated = frame.copy()
+                draw_boxes(annotated, people)
+            self._handle_person_presence(source, frame, annotated, present, now)
+
+    def _handle_person_presence(
+        self,
+        source,
+        frame: np.ndarray,
+        annotated: np.ndarray,
+        present: bool,
+        now: float,
+    ) -> None:
+        name = source.name
+        was = self._person_seen.get(name, False)
+        recorder = self._person_recorders.get(name)
+
+        if recorder is not None:
+            if recorder.feed(frame, person_present=present):
+                self._finish_person_recorder(name, recorder)
+            self._person_seen[name] = present
+            return
+
+        if present and not was:
+            cooldown = self._person_cooldown_until.get(name, 0.0)
+            if now >= cooldown:
+                self._start_person_recorder(source, frame, annotated)
+        self._person_seen[name] = present
+
+    def _start_person_recorder(self, source, frame: np.ndarray, annotated: np.ndarray) -> None:
+        d = self.display
+        pre_frames, fps = source.history.export_frames(float(d.person_pre_roll_seconds))
+        try:
+            recorder = PersonEventRecorder.start(
+                camera=source.name,
+                save_directory=self._save_dir(),
+                pre_frames=pre_frames,
+                snapshot_frame=annotated,
+                fps=fps or float(d.fps) or 12.0,
+                post_roll=float(d.person_post_roll_seconds),
+                max_seconds=float(d.person_max_event_seconds),
+                snapshot_format=d.snapshot_format,
+            )
+        except CaptureError as exc:
+            self._flash_capture(f"Person event failed: {exc}")
+            return
+        recorder.feed(frame, person_present=True)
+        self._person_recorders[source.name] = recorder
+        self._flash_capture(f"Person event: {source.name}", seconds=2.5)
+        print(f"Person event started → {recorder.event_dir}")
+
+    def _finish_person_recorder(self, name: str, recorder: PersonEventRecorder) -> None:
+        self._person_recorders.pop(name, None)
+        self._person_cooldown_until[name] = time.monotonic() + 2.0
+        if recorder.error:
+            self._flash_capture(f"Person event error: {recorder.error}")
+            print(f"Person event error ({name}): {recorder.error}")
+            return
+        clip = recorder.clip_path.name if recorder.clip_path else "no clip"
+        self._flash_capture(f"Saved person event ({clip})")
+        print(f"Person event finished → {recorder.event_dir}")
 
     def _rebuild_sources(self, *, persist: bool = False) -> None:
         """Stop/start workers to match config.visible_cameras() and layout."""
@@ -1233,6 +1569,7 @@ class MosaicApp:
             source.start()
             source.apply_buffer_settings(self.display)
             print(f"Started {source.name}")
+        self._apply_buffer_settings(persist=False)
         if previous_focus_name:
             for i, source in enumerate(self.sources):
                 if source.name == previous_focus_name:
@@ -1518,6 +1855,95 @@ class MosaicApp:
         self._reboot_notice = f"Deleted {deleted} file(s)"
         print(f"Deleted {deleted} capture(s)")
 
+    def _refresh_events(self) -> None:
+        self._events = list_person_events(self._save_dir())
+
+    def _open_events_browser(self) -> None:
+        self._refresh_events()
+        self._close_event_view()
+        self._stop_event_playback()
+        self._menu_page = "events"
+        self._menu_index = 0
+        self._reboot_notice = "Person detection snapshots + clips"
+
+    def _selected_event(self) -> PersonEventItem | None:
+        index = self._event_view_index
+        if index is None or index < 0 or index >= len(self._events):
+            return None
+        return self._events[index]
+
+    def _close_event_view(self) -> None:
+        self._event_view_index = None
+        self._event_preview = None
+
+    def _open_event_view(self, index: int) -> None:
+        if index < 0 or index >= len(self._events):
+            self._reboot_notice = "Event not found"
+            return
+        self._stop_event_playback()
+        self._event_view_index = index
+        item = self._events[index]
+        self._event_preview = load_capture_preview(item.snapshot)
+        self._menu_page = "events_view"
+        self._menu_index = 1 if item.has_clip else 0
+        self._reboot_notice = item.label
+
+    def _nudge_event_view(self, step: int) -> None:
+        if not self._events:
+            return
+        if self._event_view_index is None:
+            self._open_event_view(0 if step >= 0 else len(self._events) - 1)
+            return
+        index = (self._event_view_index + int(step)) % len(self._events)
+        self._open_event_view(index)
+
+    def _start_event_playback(self) -> None:
+        item = self._selected_event()
+        if item is None or not item.has_clip or item.clip is None:
+            self._reboot_notice = "No recording for this event yet"
+            return
+        self._stop_event_playback()
+        cap = cv2.VideoCapture(str(item.clip))
+        if not cap.isOpened():
+            self._reboot_notice = f"Could not open {item.clip.name}"
+            return
+        self._event_playback = cap
+        self._event_playback_label = item.label
+        self._menu_page = "events_play"
+        self._menu_index = 0
+        self._reboot_notice = "Playing clip — Esc to stop"
+
+    def _stop_event_playback(self) -> None:
+        if self._event_playback is not None:
+            self._event_playback.release()
+        self._event_playback = None
+        self._event_playback_label = ""
+
+    def _delete_selected_event(self) -> None:
+        item = self._selected_event()
+        if item is None:
+            self._menu_page = "events"
+            return
+        self._stop_event_playback()
+        try:
+            delete_person_event(item.path)
+        except CaptureError as exc:
+            self._reboot_notice = str(exc)
+            self._menu_page = "events_view"
+            return
+        label = item.label
+        self._refresh_events()
+        if self._events:
+            index = min(self._event_view_index or 0, len(self._events) - 1)
+            self._open_event_view(index)
+            self._reboot_notice = f"Deleted {label}"
+        else:
+            self._close_event_view()
+            self._menu_page = "events"
+            self._menu_index = 0
+            self._reboot_notice = f"Deleted {label}"
+        print(f"Deleted person event {label}")
+
     def _capture_label(self) -> str:
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
             return self.sources[self.zoom_index].name
@@ -1791,7 +2217,13 @@ class MosaicApp:
         self._menu_hitboxes = []
         if not self._menu_open or self._reboot_job is not None or self._prompt is not None:
             return canvas
-        preview_pages = {"captures_view", "captures_delete"}
+        preview_pages = {
+            "captures_view",
+            "captures_delete",
+            "events_view",
+            "events_delete",
+            "events_play",
+        }
         if self._menu_page not in preview_pages:
             canvas[:] = (canvas.astype(np.float32) * 0.38).astype(np.uint8)
         items = self._menu_items()
@@ -1802,6 +2234,7 @@ class MosaicApp:
             "detection_cams",
             *_CAMERA_MENU_PAGES,
             *_CAPTURE_BROWSER_PAGES,
+            *_EVENT_BROWSER_PAGES,
         }
         card_w, row_h, pad = (600 if wide else 480), 46, 20
         title_h = 56
@@ -1842,6 +2275,10 @@ class MosaicApp:
             "captures_view": "View capture",
             "captures_delete": "Delete capture",
             "captures_delete_all": "Delete all captures",
+            "events": "Person events",
+            "events_view": "Person event",
+            "events_delete": "Delete event",
+            "events_play": "Playing recording",
         }.get(self._menu_page, "Options")
         draw_text(
             canvas,
@@ -1890,6 +2327,14 @@ class MosaicApp:
             footer = "Enter toggle/cycle    ← → adjust    Esc back"
         elif self._menu_page == "capture":
             footer = "s snapshot  c clip    ← → length    Esc back"
+        elif self._menu_page == "events_play":
+            footer = "Esc stop playback"
+        elif self._menu_page == "events_view":
+            footer = "Enter play recording    ← → browse    Esc back"
+        elif self._menu_page == "events_delete":
+            footer = "Enter confirm    Esc cancel"
+        elif self._menu_page == "events":
+            footer = "Enter open snapshot    Esc back"
         elif self._menu_page == "captures_view":
             footer = "← → browse files    Enter select    Esc back"
         elif self._menu_page in {"captures_delete", "captures_delete_all"}:

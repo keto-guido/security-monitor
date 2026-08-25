@@ -118,6 +118,11 @@ class DisplayConfig:
     # Detection masters (still requires per-camera opt-in).
     people_detection: bool = False
     object_detection: bool = False
+    # Auto person events: snapshot + pre/during/post clip (Esc → Detection).
+    auto_person_capture: bool = False
+    person_pre_roll_seconds: float = 5.0
+    person_post_roll_seconds: float = 5.0
+    person_max_event_seconds: float = 120.0
     # Auto-advance focused camera (0 / False = off). Menu: Esc → Cameras.
     cycle_focus: bool = False
     cycle_focus_seconds: float = 10.0
@@ -356,6 +361,10 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["clip_seconds"] = float(d.clip_seconds)
     display["people_detection"] = bool(d.people_detection)
     display["object_detection"] = bool(d.object_detection)
+    display["auto_person_capture"] = bool(d.auto_person_capture)
+    display["person_pre_roll_seconds"] = float(d.person_pre_roll_seconds)
+    display["person_post_roll_seconds"] = float(d.person_post_roll_seconds)
+    display["person_max_event_seconds"] = float(d.person_max_event_seconds)
     display["cycle_focus"] = bool(d.cycle_focus)
     display["cycle_focus_seconds"] = float(d.cycle_focus_seconds)
 
@@ -428,6 +437,22 @@ def _parse_display(raw: Any) -> DisplayConfig:
         raise ConfigError("display.clip_seconds must be <= 300")
     data.people_detection = _bool(raw, "people_detection", data.people_detection)
     data.object_detection = _bool(raw, "object_detection", data.object_detection)
+    data.auto_person_capture = _bool(raw, "auto_person_capture", data.auto_person_capture)
+    data.person_pre_roll_seconds = _positive_float(
+        raw, "person_pre_roll_seconds", data.person_pre_roll_seconds
+    )
+    if data.person_pre_roll_seconds > 60:
+        raise ConfigError("display.person_pre_roll_seconds must be <= 60")
+    data.person_post_roll_seconds = _positive_float(
+        raw, "person_post_roll_seconds", data.person_post_roll_seconds
+    )
+    if data.person_post_roll_seconds > 60:
+        raise ConfigError("display.person_post_roll_seconds must be <= 60")
+    data.person_max_event_seconds = _positive_float(
+        raw, "person_max_event_seconds", data.person_max_event_seconds
+    )
+    if data.person_max_event_seconds > 600:
+        raise ConfigError("display.person_max_event_seconds must be <= 600")
     data.cycle_focus = _bool(raw, "cycle_focus", data.cycle_focus)
     data.cycle_focus_seconds = _positive_float(
         raw, "cycle_focus_seconds", data.cycle_focus_seconds

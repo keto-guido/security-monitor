@@ -195,6 +195,17 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 
 The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detection**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
 
+### Person events (auto capture)
+
+`Esc` → **Detection** → **Auto person capture** (also **Person events…** on the root menu):
+
+- On rising edge (person appears), saves a **snapshot** with person boxes + date/time overlay
+- Records a clip with configurable **pre-roll** (from the rolling buffer), the time the person is present, and **post-roll** after they leave
+- Requires people detection master + per-camera include (`Cameras included…`)
+- Browse events as stamped snapshots; Enter opens the recording playback (Esc stops)
+
+Files land under `~/security-monitor/captures/events/<timestamp>_<camera>/` (`snapshot.jpg` + `clip.mp4`).
+
 ### Saved captures
 
 `Esc` → **Saved captures…** (or **Capture** → **Browse saved captures…**):
