@@ -35,6 +35,10 @@ display:
   # Rolling history for quick rewind (, / . keys, L = live). Off by default.
   rewind_buffer: false
   rewind_buffer_seconds: 30
+  # Snapshots (s) and clips (c). Menu: Esc → Capture.
+  # save_directory: ~/security-monitor/captures
+  snapshot_format: jpg          # jpg | png
+  clip_seconds: 15
 
 cameras:
   - name: Front Door

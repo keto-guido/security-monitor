@@ -92,6 +92,10 @@ class DisplayConfig:
     # Rolling history for quick rewind (comma/period or menu).
     rewind_buffer: bool = False
     rewind_buffer_seconds: float = 30.0
+    # Snapshots / clips
+    save_directory: str = ""  # empty → ~/security-monitor/captures
+    snapshot_format: str = "jpg"  # jpg | png
+    clip_seconds: float = 15.0
 
     @property
     def tile_count(self) -> int:
@@ -234,6 +238,9 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["smooth_buffer_seconds"] = float(d.smooth_buffer_seconds)
     display["rewind_buffer"] = bool(d.rewind_buffer)
     display["rewind_buffer_seconds"] = float(d.rewind_buffer_seconds)
+    display["save_directory"] = str(d.save_directory or "")
+    display["snapshot_format"] = str(d.snapshot_format)
+    display["clip_seconds"] = float(d.clip_seconds)
     path.write_text(
         yaml.safe_dump(raw, sort_keys=False, default_flow_style=False),
         encoding="utf-8",
@@ -290,6 +297,15 @@ def _parse_display(raw: Any) -> DisplayConfig:
     )
     if data.rewind_buffer_seconds > 300:
         raise ConfigError("display.rewind_buffer_seconds must be <= 300")
+    data.save_directory = str(raw.get("save_directory", data.save_directory) or "").strip()
+    data.snapshot_format = str(raw.get("snapshot_format", data.snapshot_format)).strip().lower()
+    if data.snapshot_format == "jpeg":
+        data.snapshot_format = "jpg"
+    if data.snapshot_format not in {"jpg", "png"}:
+        raise ConfigError("display.snapshot_format must be jpg or png")
+    data.clip_seconds = _positive_float(raw, "clip_seconds", data.clip_seconds)
+    if data.clip_seconds > 300:
+        raise ConfigError("display.clip_seconds must be <= 300")
     return data
 
 

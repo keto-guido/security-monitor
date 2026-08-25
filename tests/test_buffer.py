@@ -56,12 +56,15 @@ def test_rewind_offset_scrub() -> None:
     assert hist.view().rewinding is False
 
 
-def test_inactive_history_does_not_store() -> None:
+def test_history_always_retains_clip_window() -> None:
     hist = FrameHistory()
-    hist.push(_frame(1))
-    assert hist.span_seconds() == 0.0
-    assert hist.view(latest=_frame(9)).frame is not None
-    assert int(hist.view(latest=_frame(9)).frame[0, 0, 0]) == 9
+    hist.configure(clip_seconds=2)
+    t0 = time.monotonic()
+    for i in range(5):
+        hist.push(_frame(i * 20), when=t0 + i * 0.4)
+    frames, fps = hist.export_frames(2)
+    assert len(frames) >= 3
+    assert fps > 0
 
 
 def test_config_parses_buffer_flags() -> None:

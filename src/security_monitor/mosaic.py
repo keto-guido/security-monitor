@@ -65,6 +65,15 @@ from security_monitor.buffer import (
     SMOOTH_BUFFER_CHOICES,
     next_choice,
 )
+from security_monitor.capture import (
+    CLIP_LENGTH_CHOICES,
+    CaptureError,
+    LiveClipJob,
+    default_save_directory,
+    resolve_save_directory,
+    save_snapshot,
+    write_clip,
+)
 from security_monitor.config import AppConfig, save_display_settings
 from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
 from security_monitor.reboot import RebootJob, reboot_targets
@@ -81,6 +90,8 @@ HELP_LINES = (
     "arrows   pan / strafe",
     ", / .    rewind back / forward",
     "l        jump to live",
+    "s        save snapshot",
+    "c        save clip",
     "Home     reset zoom",
     "r        reconnect all",
     "click    focus tile",
@@ -135,6 +146,9 @@ class MosaicApp:
         self._menu_hitboxes: list[tuple[str, int, int, int, int]] = []
         self._reboot_job: RebootJob | None = None
         self._reboot_notice = ""
+        self._clip_job: LiveClipJob | None = None
+        self._capture_flash = ""
+        self._capture_flash_until = 0.0
         self._view_w, self._view_h = self.display.canvas_size
         self._cell_w = self.display.cell_width
         self._cell_h = self.display.cell_height
@@ -270,6 +284,8 @@ class MosaicApp:
             self._draw_cell_overlay(cell, snap, name)
             self._draw_zoom_badge(cell)
             self._draw_buffer_badge(cell, snap)
+            self._feed_clip_job(cell)
+            self._draw_capture_hud(cell)
             return self._draw_menu(self._draw_reboot(self._draw_help(cell)))
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
@@ -306,6 +322,8 @@ class MosaicApp:
             sample = self.sources[0].snapshot() if self.sources else None
             if sample is not None:
                 self._draw_buffer_badge(canvas, sample)
+        self._feed_clip_job(canvas)
+        self._draw_capture_hud(canvas)
         return self._draw_menu(self._draw_reboot(self._draw_help(canvas)))
 
     def _draw_grid_lines(
@@ -448,6 +466,10 @@ class MosaicApp:
             self._nudge_rewind(-(REWIND_STEP_SECONDS if ch == ord(".") else REWIND_STEP_COARSE))
         elif ch in (ord("l"), ord("L")):
             self._go_live()
+        elif ch in (ord("s"), ord("S")):
+            self._save_snapshot()
+        elif ch in (ord("c"), ord("C")):
+            self._save_clip()
         elif ord("1") <= ch <= ord("9"):
             index = ch - ord("1")
             if index < len(self.sources):
@@ -471,7 +493,7 @@ class MosaicApp:
             self._activate_menu(items[self._menu_index][0])
             return
         if ch in (ord("q"), ord("Q")):
-            if self._menu_page in {"reboot_confirm", "video"}:
+            if self._menu_page in {"reboot_confirm", "video", "capture"}:
                 self._menu_page = "root"
                 self._menu_index = 0
                 return
@@ -484,7 +506,7 @@ class MosaicApp:
                 self._activate_menu(items[index][0])
 
     def _on_escape(self) -> None:
-        if self._menu_open and self._menu_page in {"reboot_confirm", "video"}:
+        if self._menu_open and self._menu_page in {"reboot_confirm", "video", "capture"}:
             self._menu_page = "root"
             self._menu_index = 0
             return
@@ -527,10 +549,22 @@ class MosaicApp:
                 ("rewind_length", f"Rewind length: {d.rewind_buffer_seconds:g}s"),
                 ("video_back", "Back"),
             ]
+        if self._menu_page == "capture":
+            d = self.display
+            folder = self._save_dir()
+            return [
+                ("snap_now", "Save snapshot"),
+                ("clip_now", f"Save clip ({d.clip_seconds:g}s)"),
+                ("clip_length", f"Clip length: {d.clip_seconds:g}s"),
+                ("snap_format", f"Snapshot format: {d.snapshot_format.upper()}"),
+                ("capture_folder", f"Folder: {folder}"),
+                ("capture_back", "Back"),
+            ]
         fullscreen = "Windowed mode" if self.fullscreen else "Fullscreen"
         return [
             ("resume", "Resume"),
             ("fullscreen", fullscreen),
+            ("capture", "Capture"),
             ("video", "Video settings"),
             ("reconnect", "Reconnect streams"),
             ("reboot", "Reboot cameras"),
@@ -544,6 +578,27 @@ class MosaicApp:
         elif action == "fullscreen":
             self.fullscreen = not self.fullscreen
             self._apply_fullscreen()
+        elif action == "capture":
+            self._menu_page = "capture"
+            self._menu_index = 0
+            self._reboot_notice = ""
+        elif action == "capture_back":
+            self._menu_page = "root"
+            self._menu_index = 0
+        elif action == "snap_now":
+            self._save_snapshot()
+            self._menu_open = False
+            self._menu_page = "root"
+        elif action == "clip_now":
+            self._save_clip()
+            self._menu_open = False
+            self._menu_page = "root"
+        elif action == "clip_length":
+            self._adjust_menu_item("clip_length", 1)
+        elif action == "snap_format":
+            self._toggle_snapshot_format()
+        elif action == "capture_folder":
+            self._reboot_notice = str(self._save_dir())
         elif action == "video":
             self._menu_page = "video"
             self._menu_index = 0
@@ -596,6 +651,12 @@ class MosaicApp:
             self.display.rewind_buffer_seconds = float(value)
             self.display.rewind_buffer = True
             self._apply_buffer_settings(persist=True)
+        elif action == "clip_length":
+            value = next_choice(CLIP_LENGTH_CHOICES, self.display.clip_seconds, step)
+            self.display.clip_seconds = float(value)
+            self._apply_buffer_settings(persist=True)
+        elif action == "snap_format":
+            self._toggle_snapshot_format()
 
     def _set_smooth_buffer(self, enabled: bool) -> None:
         previous = self.display.smooth_buffer
@@ -638,6 +699,150 @@ class MosaicApp:
     def _go_live(self) -> None:
         for source in self.sources:
             source.history.go_live()
+
+    def _save_dir(self) -> Path:
+        return resolve_save_directory(self.display.save_directory or str(default_save_directory()))
+
+    def _capture_label(self) -> str:
+        if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
+            return self.sources[self.zoom_index].name
+        return "mosaic"
+
+    def _current_capture_frame(self) -> np.ndarray | None:
+        """Best frame for snapshot: focused camera if any, else live mosaic compose."""
+        if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
+            return self.sources[self.zoom_index].snapshot().frame
+        # Build a clean grid without menus/help for the saved image.
+        d = self.display
+        cell_w, cell_h, width, height = self._sync_layout()
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        canvas[:] = (12, 12, 14)
+        grid_w = cell_w * d.columns
+        grid_h = cell_h * d.rows
+        x_off = max(0, (width - grid_w) // 2)
+        y_off = max(0, (height - grid_h) // 2)
+        for index in range(d.tile_count):
+            row, col = divmod(index, d.columns)
+            y, x = y_off + row * cell_h, x_off + col * cell_w
+            if index < len(self.sources):
+                snap = self.sources[index].snapshot()
+                tile = self._render_cell(
+                    snap,
+                    self.sources[index].name,
+                    cell_w,
+                    cell_h,
+                    overlay=True,
+                )
+            else:
+                tile = placeholder(cell_w, cell_h, "Empty", "No camera assigned")
+            canvas[y : y + cell_h, x : x + cell_w] = tile
+        return canvas
+
+    def _flash_capture(self, message: str, *, seconds: float = 3.0) -> None:
+        self._capture_flash = message
+        self._capture_flash_until = time.monotonic() + seconds
+        self._reboot_notice = message
+        print(message)
+
+    def _toggle_snapshot_format(self) -> None:
+        self.display.snapshot_format = "png" if self.display.snapshot_format == "jpg" else "jpg"
+        self._apply_buffer_settings(persist=True)
+
+    def _save_snapshot(self) -> None:
+        frame = self._current_capture_frame()
+        if frame is None:
+            self._flash_capture("Snapshot failed: no frame")
+            return
+        try:
+            path = save_snapshot(
+                frame,
+                self._save_dir(),
+                self._capture_label(),
+                fmt=self.display.snapshot_format,
+            )
+        except CaptureError as exc:
+            self._flash_capture(f"Snapshot failed: {exc}")
+            return
+        self._flash_capture(f"Saved snapshot {path.name}")
+
+    def _save_clip(self) -> None:
+        if self._clip_job is not None and not self._clip_job.finished:
+            self._flash_capture("Clip already recording…")
+            return
+        seconds = float(self.display.clip_seconds)
+        label = self._capture_label()
+        source = None
+        if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
+            source = self.sources[self.zoom_index]
+        elif len(self.sources) == 1:
+            source = self.sources[0]
+
+        # Prefer exporting recent history when we have enough samples.
+        if source is not None:
+            frames, fps = source.history.export_frames(seconds)
+            if len(frames) >= max(3, int(seconds)):
+                try:
+                    path = write_clip(
+                        frames,
+                        self._save_dir(),
+                        label,
+                        fps=fps or float(self.display.fps),
+                    )
+                except CaptureError as exc:
+                    self._flash_capture(f"Clip failed: {exc}")
+                    return
+                self._flash_capture(f"Saved clip {path.name}")
+                return
+
+        # Fall back to recording the next N seconds of the live view.
+        self._clip_job = LiveClipJob.start(
+            label=label,
+            directory=self._save_dir(),
+            duration=seconds,
+            fps=float(self.display.fps),
+        )
+        self._flash_capture(f"Recording clip {seconds:g}s…", seconds=seconds + 1.0)
+
+    def _feed_clip_job(self, frame: np.ndarray) -> None:
+        job = self._clip_job
+        if job is None or job.finished:
+            return
+        # Prefer the focused camera's native frame while recording a single cam.
+        feed = frame
+        if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
+            cam = self.sources[self.zoom_index].snapshot().frame
+            if cam is not None:
+                feed = cam
+        if job.feed(feed):
+            if job.path is not None:
+                self._flash_capture(f"Saved clip {job.path.name}")
+            else:
+                self._flash_capture(f"Clip failed: {job.error or 'unknown error'}")
+            self._clip_job = None
+
+    def _draw_capture_hud(self, canvas: np.ndarray) -> None:
+        job = self._clip_job
+        if job is not None and not job.finished:
+            label = f"REC {job.remaining:0.1f}s"
+            draw_text(
+                canvas,
+                label,
+                (canvas.shape[1] // 2, 14),
+                size=18,
+                color=(60, 60, 230),
+                align="center",
+                valign="top",
+            )
+        if self._capture_flash and time.monotonic() <= self._capture_flash_until:
+            draw_text(
+                canvas,
+                self._capture_flash,
+                (canvas.shape[1] // 2, canvas.shape[0] - 18),
+                size=15,
+                color=(220, 220, 220),
+                align="center",
+                valign="bottom",
+            )
 
     def _start_reboot(self) -> None:
         devices = reboot_targets(self.config.cameras)
@@ -773,7 +978,7 @@ class MosaicApp:
             return canvas
         canvas[:] = (canvas.astype(np.float32) * 0.38).astype(np.uint8)
         items = self._menu_items()
-        card_w, row_h, pad = (560 if self._menu_page == "video" else 480), 46, 20
+        card_w, row_h, pad = (560 if self._menu_page in {"video", "capture"} else 480), 46, 20
         title_h = 56
         footer_h = 36
         notice_h = 28 if self._reboot_notice else 0
@@ -791,6 +996,7 @@ class MosaicApp:
         heading = {
             "reboot_confirm": "Confirm reboot",
             "video": "Video settings",
+            "capture": "Capture",
         }.get(self._menu_page, "Options")
         draw_text(
             canvas,
@@ -836,6 +1042,8 @@ class MosaicApp:
             footer = "This will restart every camera"
         elif self._menu_page == "video":
             footer = "Enter toggle/cycle    ← → adjust    Esc back"
+        elif self._menu_page == "capture":
+            footer = "s snapshot  c clip    ← → length    Esc back"
         else:
             footer = "Enter to select    Esc to close"
         draw_text(

@@ -85,12 +85,14 @@ class FrameHistory:
         self.smooth_seconds = 1.0
         self.rewind_enabled = False
         self.rewind_seconds = 30.0
+        self.clip_seconds = 15.0  # always retain this much for Save clip
         self.rewind_offset = 0.0  # 0 = live (or smooth-delay point)
         self._last_store_t = 0.0
 
     @property
     def retention_seconds(self) -> float:
-        hold = 0.0
+        # Always keep enough history to export a clip, plus optional smooth/rewind.
+        hold = max(1.0, float(self.clip_seconds) + 0.5)
         if self.smooth_enabled:
             hold = max(hold, float(self.smooth_seconds) + 0.5)
         if self.rewind_enabled:
@@ -99,7 +101,8 @@ class FrameHistory:
 
     @property
     def active(self) -> bool:
-        return self.smooth_enabled or self.rewind_enabled
+        # Always store frames so Save clip has recent history even with rewind off.
+        return True
 
     def configure(
         self,
@@ -108,6 +111,7 @@ class FrameHistory:
         smooth_seconds: float | None = None,
         rewind_enabled: bool | None = None,
         rewind_seconds: float | None = None,
+        clip_seconds: float | None = None,
     ) -> None:
         with self._lock:
             if smooth_enabled is not None:
@@ -118,6 +122,8 @@ class FrameHistory:
                 self.rewind_enabled = bool(rewind_enabled)
             if rewind_seconds is not None:
                 self.rewind_seconds = max(1.0, float(rewind_seconds))
+            if clip_seconds is not None:
+                self.clip_seconds = max(1.0, float(clip_seconds))
             if not self.rewind_enabled:
                 self.rewind_offset = 0.0
             else:
@@ -131,14 +137,13 @@ class FrameHistory:
             self._last_store_t = 0.0
 
     def push(self, frame: np.ndarray, when: float | None = None) -> None:
-        if frame is None or not self.active:
+        if frame is None:
             return
         now = time.monotonic() if when is None else float(when)
         with self._lock:
-            # When only rewind is on, sample at a capped rate to save memory.
-            # Smooth playback needs denser samples, so skip the cap then.
+            # Cap sample rate unless smooth playback needs denser frames.
             min_gap = 0.0
-            if self.rewind_enabled and not self.smooth_enabled:
+            if not self.smooth_enabled:
                 min_gap = 1.0 / _REWIND_MAX_FPS
             if min_gap > 0 and self._items and (now - self._last_store_t) < min_gap:
                 # Refresh the tip so live viewers still see a current end frame.
@@ -176,8 +181,13 @@ class FrameHistory:
         back to the live capture without an extra copy when buffering is off.
         """
         with self._lock:
-            if not self.active or not self._items:
-                return HistoryView(frame=None if latest is None else latest, behind=0.0, buffered=0.0)
+            # Without smooth/rewind, show live; history is only for clip export.
+            if not (self.smooth_enabled or self.rewind_enabled) or not self._items:
+                return HistoryView(
+                    frame=None if latest is None else latest,
+                    behind=0.0,
+                    buffered=max(0.0, self._items[-1][0] - self._items[0][0]) if len(self._items) >= 2 else 0.0,
+                )
 
             newest_t = self._items[-1][0]
             oldest_t = self._items[0][0]
@@ -201,6 +211,37 @@ class FrameHistory:
                 buffered=buffered,
                 rewinding=self.rewind_offset > 0.05,
             )
+
+    def export_frames(self, seconds: float) -> tuple[list[np.ndarray], float]:
+        """
+        Decode frames covering the last ``seconds`` of history.
+
+        Returns (frames, estimated_fps). Frames are oldest→newest.
+        """
+        seconds = max(0.5, float(seconds))
+        with self._lock:
+            if not self._items:
+                return [], 0.0
+            newest_t = self._items[-1][0]
+            cutoff = newest_t - seconds
+            selected = [item for item in self._items if item[0] >= cutoff]
+            if not selected:
+                selected = [self._items[-1]]
+            payloads = list(selected)
+        frames: list[np.ndarray] = []
+        times: list[float] = []
+        for when, payload in payloads:
+            frame = _decode(payload)
+            if frame is None:
+                continue
+            frames.append(frame)
+            times.append(when)
+        fps = 0.0
+        if len(times) >= 2:
+            span = times[-1] - times[0]
+            if span > 0:
+                fps = (len(times) - 1) / span
+        return frames, fps
 
     def span_seconds(self) -> float:
         with self._lock:

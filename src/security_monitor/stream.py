@@ -93,9 +93,8 @@ class CameraWorker(threading.Thread):
             smooth_seconds=display.smooth_buffer_seconds,
             rewind_enabled=display.rewind_buffer,
             rewind_seconds=display.rewind_buffer_seconds,
+            clip_seconds=display.clip_seconds,
         )
-        if not self.history.active:
-            self.history.clear()
 
     def start(self) -> None:  # noqa: A003 - Thread.start
         if not self.is_alive():
@@ -131,8 +130,6 @@ class CameraWorker(threading.Thread):
         )
 
     def _history_view(self, latest: np.ndarray | None) -> HistoryView:
-        if not self.history.active:
-            return HistoryView(frame=latest, behind=0.0, buffered=0.0)
         return self.history.view(latest=latest)
 
     def run(self) -> None:
@@ -253,9 +250,8 @@ class DemoWorker(threading.Thread):
             smooth_seconds=display.smooth_buffer_seconds,
             rewind_enabled=display.rewind_buffer,
             rewind_seconds=display.rewind_buffer_seconds,
+            clip_seconds=display.clip_seconds,
         )
-        if not self.history.active:
-            self.history.clear()
 
     def start(self) -> None:  # noqa: A003
         if not self.is_alive():
@@ -271,7 +267,7 @@ class DemoWorker(threading.Thread):
     def snapshot(self) -> Snapshot:
         with self._lock:
             latest = None if self._frame is None else self._frame
-        view = self.history.view(latest=latest) if self.history.active else HistoryView(frame=latest)
+        view = self.history.view(latest=latest)
         return Snapshot(
             frame=view.frame.copy() if view.frame is not None else None,
             status="demo",

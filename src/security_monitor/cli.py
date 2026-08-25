@@ -232,6 +232,13 @@ def cmd_check(args: argparse.Namespace) -> int:
         f"Buffer: smooth={'on' if d.smooth_buffer else 'off'} ({d.smooth_buffer_seconds:g}s)  "
         f"rewind={'on' if d.rewind_buffer else 'off'} ({d.rewind_buffer_seconds:g}s)"
     )
+    from security_monitor.capture import default_save_directory, resolve_save_directory
+
+    save_dir = resolve_save_directory(d.save_directory or str(default_save_directory()))
+    print(
+        f"Capture: dir={save_dir}  snapshot={d.snapshot_format}  "
+        f"clip={d.clip_seconds:g}s"
+    )
     visible = config.visible_cameras()
     print(f"Cameras: {len(visible)} shown / {len(config.cameras)} configured")
     for i, cam in enumerate(config.cameras, start=1):
