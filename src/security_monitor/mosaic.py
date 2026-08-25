@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 
 import cv2
 import numpy as np
+
+
+def _prefer_x11_on_wayland() -> None:
+    """OpenCV window backends are more reliable on XWayland than native Wayland."""
+    if not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 from security_monitor.config import AppConfig
 from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
@@ -82,6 +91,7 @@ class MosaicApp:
         if not self.sources:
             print("No enabled cameras in the current grid. Edit config.yaml.", file=sys.stderr)
             return 1
+        _prefer_x11_on_wayland()
         for source in self.sources:
             source.start()
             print(f"Started {source.name}")

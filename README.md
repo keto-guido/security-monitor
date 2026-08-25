@@ -22,12 +22,30 @@ pip install -e .
 
 That installs the `security-monitor` command.
 
+### Ubuntu packages
+
+On Ubuntu Desktop, install a few system packages first (venv, fonts for HUD text, and OpenGL for OpenCV):
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv python3-pip \
+  fonts-dejavu-core libgl1 libglib2.0-0
+```
+
+You need a logged-in graphical session (X11 or Wayland). Headless SSH alone will not show the window.
+
 ## Quick start
 
 1. Create a local config (it is gitignored so credentials stay off git):
 
 ```bash
 security-monitor init
+```
+
+On Ubuntu, prefer the per-user path so login autostart finds it regardless of working directory:
+
+```bash
+security-monitor init --user
 ```
 
 2. Edit `config.yaml` with your camera URLs, usernames, and the grid size you want.
@@ -49,6 +67,37 @@ No cameras yet? Try synthetic panes:
 ```bash
 security-monitor --demo
 ```
+
+## Run on Ubuntu startup
+
+After the app works from a terminal on Ubuntu Desktop:
+
+```bash
+# Optional: keep config in ~/.config/security-monitor/config.yaml
+security-monitor init --user
+# edit that file, then:
+
+security-monitor check
+security-monitor autostart install --fullscreen
+```
+
+That writes `~/.config/autostart/security-monitor.desktop` so the mosaic launches after you log into the desktop. A short delay (default 15s) waits for the network and session to settle. Useful flags:
+
+```bash
+security-monitor autostart install --fullscreen --delay 20
+security-monitor autostart install --config /path/to/config.yaml --fullscreen
+security-monitor autostart status
+security-monitor autostart uninstall
+```
+
+Linux notes:
+
+- Default method is an XDG `.desktop` autostart entry (best for GNOME / Ubuntu Desktop).
+- Optional: `security-monitor autostart install --method systemd` installs a systemd user unit under `graphical-session.target`.
+- OpenCV windows prefer X11 (`QT_QPA_PLATFORM=xcb`) on Wayland so the GUI opens reliably.
+- Autostart embeds an absolute path to your config when one is found, so it does not depend on the project folder being the current directory at login.
+
+On Windows, the same commands install a Startup-folder `.bat` instead.
 
 ## Config
 
@@ -131,11 +180,16 @@ The options menu also has **Reboot cameras**. That uses each camera's `type`, ho
 security-monitor                 # mosaic from config.yaml
 security-monitor -c other.yaml
 security-monitor --fullscreen
+security-monitor --delay 15      # wait before opening (login / network)
 security-monitor --columns 3 --rows 2
 security-monitor demo
 security-monitor check
 security-monitor reboot
 security-monitor init
+security-monitor init --user     # ~/.config/security-monitor/config.yaml
+security-monitor autostart install --fullscreen
+security-monitor autostart status
+security-monitor autostart uninstall
 python -m security_monitor       # same as security-monitor
 ```
 
@@ -151,6 +205,8 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 - **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python`.
 - **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost.
 - **Linux display** — needs an X11/Wayland session. SSH needs X forwarding or a desktop.
+- **Autostart did nothing** — confirm you log into a desktop user session (not only SSH). Run `security-monitor autostart status` and check `~/.config/autostart/security-monitor.desktop`. Increase `--delay` if cameras are offline at boot.
+- **Wayland blank window** — the app sets `QT_QPA_PLATFORM=xcb`; also try logging into an “Ubuntu on Xorg” session.
 - **Passwords with `@` or `:`** — use the `username` and `password` fields so they are escaped.
 
 ## Development

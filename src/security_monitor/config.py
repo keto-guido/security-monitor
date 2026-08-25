@@ -121,15 +121,23 @@ def inject_credentials(url: str, username: str | None, password: str | None) -> 
     )
 
 
-def default_config_paths() -> list[Path]:
-    paths = [Path.cwd() / "config.yaml"]
+def xdg_user_config_path() -> Path:
+    """Per-user config.yaml location (Linux/macOS XDG, or %APPDATA% on Windows)."""
     if os.name == "nt":
         appdata = os.environ.get("APPDATA")
-        if appdata:
-            paths.append(Path(appdata) / "security-monitor" / "config.yaml")
-    else:
-        xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-        paths.append(Path(xdg) / "security-monitor" / "config.yaml")
+        if not appdata:
+            raise ConfigError("APPDATA is not set; cannot resolve the user config path")
+        return Path(appdata) / "security-monitor" / "config.yaml"
+    xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    return Path(xdg) / "security-monitor" / "config.yaml"
+
+
+def default_config_paths() -> list[Path]:
+    paths = [Path.cwd() / "config.yaml"]
+    try:
+        paths.append(xdg_user_config_path())
+    except ConfigError:
+        pass
     env_path = os.environ.get("SECURITY_MONITOR_CONFIG")
     if env_path:
         paths.insert(0, Path(env_path))
