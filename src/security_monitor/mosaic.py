@@ -136,6 +136,16 @@ from security_monitor.retention import (
     set_event_locked,
 )
 from security_monitor.stream import Snapshot, build_sources
+from security_monitor.weather import (
+    WeatherRect,
+    WeatherService,
+    compute_tile_rects,
+    draw_weather_widget,
+    next_weather_slot,
+    nudge_norm,
+    resolve_weather_rect,
+    slot_label,
+)
 
 HELP_LINES = (
     "Esc      back / options",
@@ -196,6 +206,8 @@ _NESTED_MENU_PAGES = frozenset(
         "detection",
         "detection_cams",
         "decode_status",
+        "weather",
+        "weather_place",
         *_CAMERA_MENU_PAGES,
         *_CAPTURE_BROWSER_PAGES,
         *_EVENT_BROWSER_PAGES,
@@ -292,6 +304,77 @@ class MosaicApp:
         self._event_playback: cv2.VideoCapture | None = None
         self._event_playback_label = ""
         self._last_purge_at = 0.0
+        self._weather = WeatherService()
+        self._weather_rect: WeatherRect | None = None
+        self._weather_place_mode = False
+        self._weather_place_still: np.ndarray | None = None
+        self._weather_drag_offset: tuple[int, int] | None = None
+        self._configure_weather_service()
+
+    def _configure_weather_service(self) -> None:
+        d = self.display
+        self._weather.configure(
+            enabled=bool(d.weather_enabled),
+            latitude=d.weather_latitude,
+            longitude=d.weather_longitude,
+            place=d.weather_place or "",
+            refresh_seconds=float(d.weather_refresh_seconds or 300),
+        )
+
+    def _start_weather_place_editor(self) -> None:
+        # Freeze a clean grid still; drag the widget on top.
+        still = self._current_capture_frame(include_weather=False)
+        if still is None:
+            self._reboot_notice = "Could not capture layout still"
+            return
+        self._weather_place_still = still
+        self._weather_place_mode = True
+        self._weather_drag_offset = None
+        self.display.weather_enabled = True
+        self.display.weather_slot = "custom"
+        self._configure_weather_service()
+        self._menu_open = False
+        self._menu_page = "root"
+        self._flash_capture("Drag the weather widget — Enter saves, Esc cancels", seconds=4.0)
+
+    def _finish_weather_place_editor(self, *, save: bool) -> None:
+        if not self._weather_place_mode:
+            return
+        self._weather_place_mode = False
+        self._weather_place_still = None
+        self._weather_drag_offset = None
+        if save:
+            self.display.weather_enabled = True
+            self._apply_buffer_settings(persist=True)
+            self._flash_capture("Weather placement saved")
+            self._menu_open = True
+            self._menu_page = "weather"
+            self._menu_index = 0
+        else:
+            self._flash_capture("Weather placement cancelled")
+            self._menu_open = True
+            self._menu_page = "weather"
+            self._menu_index = 0
+
+    def _nudge_weather_place(self, dx: int, dy: int) -> None:
+        step = 0.02
+        self.display.weather_slot = "custom"
+        self.display.weather_x = nudge_norm(self.display.weather_x, step * dx, lo=0.0, hi=0.88)
+        self.display.weather_y = nudge_norm(self.display.weather_y, step * dy, lo=0.0, hi=0.88)
+
+    def _set_weather_norm_from_pixel(self, px: int, py: int) -> None:
+        """Set custom top-left from canvas pixel (accounting for drag grab offset)."""
+        d = self.display
+        grid_w = max(1, self._cell_w * d.columns)
+        grid_h = max(1, self._cell_h * d.rows)
+        ox, oy = self._weather_drag_offset or (0, 0)
+        left = px - ox
+        top = py - oy
+        nx = (left - self._grid_x) / grid_w
+        ny = (top - self._grid_y) / grid_h
+        d.weather_slot = "custom"
+        d.weather_x = max(0.0, min(1.0 - d.weather_w, nx))
+        d.weather_y = max(0.0, min(1.0 - d.weather_h, ny))
 
     def run(self) -> int:
         if not self.sources:
@@ -375,6 +458,7 @@ class MosaicApp:
 
     def _shutdown(self) -> None:
         self._stop_event_playback()
+        self._weather.stop()
         for name, recorder in list(self._person_recorders.items()):
             # Force-complete any open person event so the clip is written.
             recorder.lost_at = time.monotonic() - recorder.post_roll - 1.0
@@ -424,6 +508,8 @@ class MosaicApp:
         self._update_encroachment_state()
         d = self.display
         cell_w, cell_h, width, height = self._sync_layout()
+        if self._weather_place_mode and self._weather_place_still is not None:
+            return self._finalize_ui(self._paint_weather_place_editor(width, height))
         if self._event_playback is not None:
             return self._finalize_ui(self._paint_event_playback(width, height))
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
@@ -445,24 +531,38 @@ class MosaicApp:
         x_off = max(0, (width - grid_w) // 2)
         y_off = max(0, (height - grid_h) // 2)
         self._grid_x, self._grid_y = x_off, y_off
+        reserved = self._resolve_weather_rect(width, height, x_off, y_off, grid_w, grid_h)
+        self._weather_rect = reserved
+        tile_rects = compute_tile_rects(
+            columns=d.columns,
+            rows=d.rows,
+            cell_w=cell_w,
+            cell_h=cell_h,
+            grid_x=x_off,
+            grid_y=y_off,
+            reserved=reserved,
+        )
         zoomed = self.view_zoom > 1.001
         any_rewind = False
         for index in range(d.tile_count):
-            row, col = divmod(index, d.columns)
-            y, x = y_off + row * cell_h, x_off + col * cell_w
+            tx, ty, tw, th = tile_rects[index]
+            if tw < 2 or th < 2:
+                continue
             if index < len(self.sources):
                 snap = self.sources[index].snapshot()
                 any_rewind = any_rewind or snap.rewinding
                 tile = self._render_cell(
                     snap,
                     self.sources[index].name,
-                    cell_w,
-                    cell_h,
+                    tw,
+                    th,
                     overlay=not zoomed,
                 )
             else:
-                tile = placeholder(cell_w, cell_h, "Empty", "No camera assigned")
-            canvas[y : y + cell_h, x : x + cell_w] = tile
+                tile = placeholder(tw, th, "Empty", "No camera assigned")
+            canvas[ty : ty + th, tx : tx + tw] = tile
+        if reserved is not None and not zoomed:
+            self._paint_weather_widget(canvas, reserved, editing=False)
         if not zoomed:
             self._draw_grid_lines(canvas, x_off=x_off, y_off=y_off)
         canvas = magnify(canvas, self.view_zoom, self.pan_x, self.pan_y)
@@ -475,6 +575,97 @@ class MosaicApp:
         self._feed_clip_job(canvas)
         self._draw_capture_hud(canvas)
         return self._finalize_ui(canvas)
+
+    def _resolve_weather_rect(
+        self,
+        width: int,
+        height: int,
+        grid_x: int,
+        grid_y: int,
+        grid_w: int,
+        grid_h: int,
+    ) -> WeatherRect | None:
+        d = self.display
+        if not d.weather_enabled and not self._weather_place_mode:
+            return None
+        return resolve_weather_rect(
+            slot=d.weather_slot,
+            norm_x=d.weather_x,
+            norm_y=d.weather_y,
+            norm_w=d.weather_w,
+            norm_h=d.weather_h,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_w=grid_w,
+            grid_h=grid_h,
+            columns=d.columns,
+            rows=d.rows,
+            canvas_w=width,
+            canvas_h=height,
+        )
+
+    def _paint_weather_widget(
+        self,
+        canvas: np.ndarray,
+        rect: WeatherRect,
+        *,
+        editing: bool = False,
+    ) -> None:
+        d = self.display
+        draw_weather_widget(
+            canvas,
+            rect,
+            self._weather.snapshot,
+            units=d.weather_units,
+            show_temp=d.weather_show_temp,
+            show_conditions=d.weather_show_conditions,
+            show_storm=d.weather_show_storm,
+            show_lightning=d.weather_show_lightning,
+            editing=editing,
+        )
+
+    def _paint_weather_place_editor(self, width: int, height: int) -> np.ndarray:
+        still = self._weather_place_still
+        if still is None:
+            canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        else:
+            canvas = still.copy()
+            if canvas.shape[0] != height or canvas.shape[1] != width:
+                canvas = cv2.resize(canvas, (width, height), interpolation=cv2.INTER_AREA)
+        # Dim slightly so the draggable widget reads clearly.
+        canvas[:] = (canvas.astype(np.float32) * 0.72).astype(np.uint8)
+        d = self.display
+        grid_w = self._cell_w * d.columns
+        grid_h = self._cell_h * d.rows
+        reserved = self._resolve_weather_rect(
+            width, height, self._grid_x, self._grid_y, grid_w, grid_h
+        )
+        self._weather_rect = reserved
+        if reserved is not None:
+            # Show how cameras would shrink around the widget.
+            tile_rects = compute_tile_rects(
+                columns=d.columns,
+                rows=d.rows,
+                cell_w=self._cell_w,
+                cell_h=self._cell_h,
+                grid_x=self._grid_x,
+                grid_y=self._grid_y,
+                reserved=reserved,
+            )
+            for tx, ty, tw, th in tile_rects:
+                if tw > 2 and th > 2:
+                    cv2.rectangle(canvas, (tx, ty), (tx + tw - 1, ty + th - 1), (70, 90, 70), 1)
+            self._paint_weather_widget(canvas, reserved, editing=True)
+        draw_text(
+            canvas,
+            "Drag widget  ·  ←→↑↓ nudge  ·  Enter save  ·  Esc cancel",
+            (width // 2, height - 18),
+            size=14,
+            color=(220, 220, 230),
+            align="center",
+            valign="bottom",
+        )
+        return canvas
 
     def _finalize_ui(self, canvas: np.ndarray) -> np.ndarray:
         if self.display.encroachment_alarm and (
@@ -708,6 +899,26 @@ class MosaicApp:
 
     def _handle_key(self, key: int) -> None:
         ch = key if 0 <= key < 256 else key & 0xFF
+        if self._weather_place_mode:
+            if key in KEY_ESC or ch == 27:
+                self._finish_weather_place_editor(save=False)
+                return
+            if key in KEY_ENTER or ch in (13, 10):
+                self._finish_weather_place_editor(save=True)
+                return
+            if key in KEY_LEFT:
+                self._nudge_weather_place(-1, 0)
+                return
+            if key in KEY_RIGHT:
+                self._nudge_weather_place(1, 0)
+                return
+            if key in KEY_UP:
+                self._nudge_weather_place(0, -1)
+                return
+            if key in KEY_DOWN:
+                self._nudge_weather_place(0, 1)
+                return
+            return
         editing = self._zone_edit_name is not None or self._line_edit_name is not None
         if editing:
             if key in KEY_ESC or ch == 27 or ch in (ord("q"), ord("Q")):
@@ -860,6 +1071,9 @@ class MosaicApp:
                 self._activate_menu(items[index][0])
 
     def _on_escape(self) -> None:
+        if self._weather_place_mode:
+            self._finish_weather_place_editor(save=False)
+            return
         if self._zone_edit_name is not None or self._line_edit_name is not None:
             self._cancel_zone_edit()
             return
@@ -910,6 +1124,7 @@ class MosaicApp:
             "video",
             "capture",
             "detection",
+            "weather",
             "cameras",
         }:
             self._menu_page = "root"
@@ -1127,6 +1342,39 @@ class MosaicApp:
                 items.append((f"cam_encroach:{index}", f"{cam.name} — encroach: {e}"))
             items.append(("detection_cams_back", "Back"))
             return items
+        if self._menu_page == "weather":
+            d = self.display
+            enabled = "On" if d.weather_enabled else "Off"
+            units = "°F" if d.weather_units == "f" else "°C"
+            snap = self._weather.snapshot
+            loc = snap.place or d.weather_place or (
+                f"{d.weather_latitude:.2f},{d.weather_longitude:.2f}"
+                if d.weather_latitude is not None and d.weather_longitude is not None
+                else "Auto (IP)"
+            )
+            return [
+                ("weather_toggle", f"Weather HUD: {enabled}"),
+                ("weather_slot", f"Placement: {slot_label(d.weather_slot)}"),
+                ("weather_place", "Place widget on layout…"),
+                ("weather_nudge_x", f"Fine X: {d.weather_x:+.2f}  (← →)"),
+                ("weather_nudge_y", f"Fine Y: {d.weather_y:+.2f}  (← →)"),
+                ("weather_size_w", f"Width: {d.weather_w:.2f}"),
+                ("weather_size_h", f"Height: {d.weather_h:.2f}"),
+                ("weather_units", f"Temperature units: {units}"),
+                ("weather_temp", f"Show temperature: {'On' if d.weather_show_temp else 'Off'}"),
+                (
+                    "weather_conditions",
+                    f"Show conditions: {'On' if d.weather_show_conditions else 'Off'}",
+                ),
+                ("weather_storm", f"Show storm warnings: {'On' if d.weather_show_storm else 'Off'}"),
+                (
+                    "weather_lightning",
+                    f"Show lightning tracker: {'On' if d.weather_show_lightning else 'Off'}",
+                ),
+                ("weather_refresh", "Refresh weather now"),
+                ("weather_loc", f"Location: {loc[:42]}"),
+                ("weather_back", "Back"),
+            ]
         if self._menu_page == "cameras":
             d = self.display
             enabled = sum(1 for cam in self.config.cameras if cam.enabled)
@@ -1181,6 +1429,7 @@ class MosaicApp:
             ("captures_root", "Saved captures…"),
             ("events_root", "Person events…"),
             ("detection", "Detection"),
+            ("weather", "Weather HUD…"),
             ("video", "Video settings"),
             ("reconnect", "Reconnect streams"),
             ("reboot", "Reboot cameras"),
@@ -1214,6 +1463,59 @@ class MosaicApp:
         elif action == "detection_back":
             self._menu_page = "root"
             self._menu_index = 0
+        elif action == "weather":
+            self._menu_page = "weather"
+            self._menu_index = 0
+            self._configure_weather_service()
+            snap = self._weather.snapshot
+            self._reboot_notice = (
+                snap.error
+                if snap.error and not snap.ok
+                else f"{snap.place or 'Local'}: {snap.temp_label(self.display.weather_units)} {snap.condition}"
+            )
+        elif action == "weather_back":
+            self._menu_page = "root"
+            self._menu_index = 0
+        elif action == "weather_toggle":
+            self.display.weather_enabled = not self.display.weather_enabled
+            self._configure_weather_service()
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = (
+                "Weather HUD on" if self.display.weather_enabled else "Weather HUD off"
+            )
+        elif action == "weather_slot":
+            self._adjust_menu_item("weather_slot", 1)
+        elif action == "weather_place":
+            self._start_weather_place_editor()
+        elif action in {
+            "weather_nudge_x",
+            "weather_nudge_y",
+            "weather_size_w",
+            "weather_size_h",
+        }:
+            self._adjust_menu_item(action, 1)
+        elif action == "weather_units":
+            self.display.weather_units = "c" if self.display.weather_units == "f" else "f"
+            self._apply_buffer_settings(persist=True)
+        elif action == "weather_temp":
+            self.display.weather_show_temp = not self.display.weather_show_temp
+            self._apply_buffer_settings(persist=True)
+        elif action == "weather_conditions":
+            self.display.weather_show_conditions = not self.display.weather_show_conditions
+            self._apply_buffer_settings(persist=True)
+        elif action == "weather_storm":
+            self.display.weather_show_storm = not self.display.weather_show_storm
+            self._apply_buffer_settings(persist=True)
+        elif action == "weather_lightning":
+            self.display.weather_show_lightning = not self.display.weather_show_lightning
+            self._apply_buffer_settings(persist=True)
+        elif action == "weather_refresh":
+            self._configure_weather_service()
+            self._reboot_notice = "Refreshing weather…"
+        elif action == "weather_loc":
+            self._reboot_notice = (
+                "Set weather_latitude / weather_longitude in config.yaml (blank = auto)"
+            )
         elif action == "detection_cams":
             self._menu_page = "detection_cams"
             self._menu_index = 0
@@ -1645,6 +1947,38 @@ class MosaicApp:
             self._activate_menu(action)
         elif action.startswith("cam_encroach:"):
             self._activate_menu(action)
+        elif action == "weather_slot":
+            self.display.weather_slot = next_weather_slot(self.display.weather_slot, step)
+            # Preset placements reset fine offsets for a clean jump.
+            if self.display.weather_slot != "custom":
+                self.display.weather_x = 0.0
+                self.display.weather_y = 0.0
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = slot_label(self.display.weather_slot)
+        elif action == "weather_nudge_x":
+            self.display.weather_x = nudge_norm(self.display.weather_x, 0.02 * step)
+            if self.display.weather_slot != "custom":
+                # Fine-tuning a preset keeps the slot but records offsets.
+                pass
+            self._apply_buffer_settings(persist=True)
+        elif action == "weather_nudge_y":
+            self.display.weather_y = nudge_norm(self.display.weather_y, 0.02 * step)
+            self._apply_buffer_settings(persist=True)
+        elif action == "weather_size_w":
+            self.display.weather_w = max(0.12, min(0.55, self.display.weather_w + 0.02 * step))
+            self._apply_buffer_settings(persist=True)
+        elif action == "weather_size_h":
+            self.display.weather_h = max(0.10, min(0.45, self.display.weather_h + 0.02 * step))
+            self._apply_buffer_settings(persist=True)
+        elif action in {
+            "weather_toggle",
+            "weather_units",
+            "weather_temp",
+            "weather_conditions",
+            "weather_storm",
+            "weather_lightning",
+        }:
+            self._activate_menu(action)
         elif action == "layout":
             cols, rows = next_layout_preset(self.display.columns, self.display.rows, step)
             self.display.columns = cols
@@ -2009,6 +2343,7 @@ class MosaicApp:
             source.apply_buffer_settings(self.display)
             # Re-apply history clip after apply_buffer_settings overwrote it.
             source.history.configure(clip_seconds=history_clip)
+        self._configure_weather_service()
         if persist:
             path = save_display_settings(self.config)
             if path is not None:
@@ -2017,6 +2352,7 @@ class MosaicApp:
                 "video",
                 "detection",
                 "detection_cams",
+                "weather",
                 *_CAMERA_MENU_PAGES,
                 *_EVENT_BROWSER_PAGES,
             }:
@@ -2677,7 +3013,7 @@ class MosaicApp:
             return self.sources[self.zoom_index].name
         return "mosaic"
 
-    def _current_capture_frame(self) -> np.ndarray | None:
+    def _current_capture_frame(self, *, include_weather: bool = True) -> np.ndarray | None:
         """Best frame for snapshot: focused camera if any, else live mosaic compose."""
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
             return self.sources[self.zoom_index].snapshot().frame
@@ -2690,21 +3026,37 @@ class MosaicApp:
         grid_h = cell_h * d.rows
         x_off = max(0, (width - grid_w) // 2)
         y_off = max(0, (height - grid_h) // 2)
+        self._grid_x, self._grid_y = x_off, y_off
+        reserved = None
+        if include_weather and d.weather_enabled:
+            reserved = self._resolve_weather_rect(width, height, x_off, y_off, grid_w, grid_h)
+        tile_rects = compute_tile_rects(
+            columns=d.columns,
+            rows=d.rows,
+            cell_w=cell_w,
+            cell_h=cell_h,
+            grid_x=x_off,
+            grid_y=y_off,
+            reserved=reserved,
+        )
         for index in range(d.tile_count):
-            row, col = divmod(index, d.columns)
-            y, x = y_off + row * cell_h, x_off + col * cell_w
+            tx, ty, tw, th = tile_rects[index]
+            if tw < 2 or th < 2:
+                continue
             if index < len(self.sources):
                 snap = self.sources[index].snapshot()
                 tile = self._render_cell(
                     snap,
                     self.sources[index].name,
-                    cell_w,
-                    cell_h,
+                    tw,
+                    th,
                     overlay=True,
                 )
             else:
-                tile = placeholder(cell_w, cell_h, "Empty", "No camera assigned")
-            canvas[y : y + cell_h, x : x + cell_w] = tile
+                tile = placeholder(tw, th, "Empty", "No camera assigned")
+            canvas[ty : ty + th, tx : tx + tw] = tile
+        if reserved is not None:
+            self._paint_weather_widget(canvas, reserved, editing=False)
         return canvas
 
     def _flash_capture(self, message: str, *, seconds: float = 3.0) -> None:
@@ -2961,6 +3313,7 @@ class MosaicApp:
             "capture",
             "detection",
             "detection_cams",
+            "weather",
             *_CAMERA_MENU_PAGES,
             *_CAPTURE_BROWSER_PAGES,
             *_EVENT_BROWSER_PAGES,
@@ -2996,6 +3349,7 @@ class MosaicApp:
             "capture": "Capture",
             "detection": "Detection",
             "detection_cams": "Cameras for detection",
+            "weather": "Weather HUD",
             "cameras": "Cameras",
             "cameras_arrange": "Arrange tiles",
             "cameras_toggle": "Show / hide",
@@ -3057,6 +3411,8 @@ class MosaicApp:
             footer = "Enter toggle/cycle    ← → adjust    Esc back"
         elif self._menu_page == "decode_status":
             footer = "Per-camera decode path    Esc back"
+        elif self._menu_page == "weather":
+            footer = "Place on layout…    ← → adjust    Esc back"
         elif self._menu_page == "capture":
             footer = "s snapshot  c clip    ← → length    Esc back"
         elif self._menu_page == "events_play":
@@ -3079,6 +3435,7 @@ class MosaicApp:
             "detection",
             "detection_cams",
             "capture",
+            "weather",
         }:
             footer = "Enter select    ← → adjust    Esc back"
         else:
@@ -3198,6 +3555,9 @@ class MosaicApp:
             if event == cv2.EVENT_LBUTTONUP and self._reboot_job.finished:
                 self._finish_reboot()
             return
+        if self._weather_place_mode:
+            self._on_weather_place_mouse(event, x, y)
+            return
         if self._line_edit_name is not None or self._zone_edit_name is not None:
             self._on_zone_edit_mouse(event, x, y)
             return
@@ -3212,6 +3572,12 @@ class MosaicApp:
             return
         if event != cv2.EVENT_LBUTTONUP:
             return
+        # Clicks on the weather widget should not focus a camera underneath.
+        if self._weather_rect is not None and self.display.weather_enabled:
+            px, py = self._event_to_pixel(x, y)
+            rx, ry, rw, rh = self._weather_rect.as_tuple
+            if rx <= px <= rx + rw and ry <= py <= ry + rh:
+                return
         if self.view_zoom > 1.001:
             self._reset_view()
             return
@@ -3230,6 +3596,30 @@ class MosaicApp:
         index = row * self.display.columns + col
         if index < len(self.sources):
             self._focus_camera(index)
+
+    def _on_weather_place_mouse(self, event: int, x: int, y: int) -> None:
+        px, py = self._event_to_pixel(x, y)
+        rect = self._weather_rect
+        down = getattr(cv2, "EVENT_LBUTTONDOWN", 1)
+        up = getattr(cv2, "EVENT_LBUTTONUP", 4)
+        move = getattr(cv2, "EVENT_MOUSEMOVE", 0)
+        if event == down and rect is not None:
+            rx, ry, rw, rh = rect.as_tuple
+            if rx <= px <= rx + rw and ry <= py <= ry + rh:
+                self._weather_drag_offset = (px - rx, py - ry)
+            else:
+                # Click outside: jump widget top-left to cursor.
+                self._weather_drag_offset = (0, 0)
+                self._set_weather_norm_from_pixel(px, py)
+            return
+        if event == move and self._weather_drag_offset is not None:
+            self._set_weather_norm_from_pixel(px, py)
+            return
+        if event == up:
+            if self._weather_drag_offset is not None:
+                self._set_weather_norm_from_pixel(px, py)
+            self._weather_drag_offset = None
+            return
 
     def _on_zone_edit_mouse(self, event: int, x: int, y: int) -> None:
         if event != cv2.EVENT_LBUTTONUP:

@@ -23,6 +23,14 @@ VALID_CAMERA_ROTATIONS = (0, 90, 180, 270)
 VALID_DECODE_MODES = ("auto", "cpu", "gpu")
 VALID_HWACCELS = ("auto", "none", "cuda", "qsv", "vaapi", "d3d11va", "videotoolbox")
 VALID_ENCROACH_SIDES = ("positive", "negative")
+VALID_WEATHER_SLOTS = (
+    "bottom_left",
+    "bottom_right",
+    "between_h",
+    "between_v",
+    "custom",
+)
+VALID_WEATHER_UNITS = ("f", "c")
 URL_SCHEMES = ("rtsp", "rtp", "http", "https", "file", "rtmp")
 
 # Esc → Cameras → Layout presets (columns, rows).
@@ -149,6 +157,22 @@ class DisplayConfig:
     # Auto-advance focused camera (0 / False = off). Menu: Esc → Cameras.
     cycle_focus: bool = False
     cycle_focus_seconds: float = 10.0
+    # Local weather HUD widget (Esc → Weather).
+    weather_enabled: bool = False
+    weather_slot: str = "bottom_right"  # bottom_left|bottom_right|between_h|between_v|custom
+    weather_x: float = 0.0  # custom top-left or fine-tune offset (grid-normalized)
+    weather_y: float = 0.0
+    weather_w: float = 0.24
+    weather_h: float = 0.20
+    weather_units: str = "f"  # f | c
+    weather_show_temp: bool = True
+    weather_show_conditions: bool = True
+    weather_show_storm: bool = True
+    weather_show_lightning: bool = True
+    weather_latitude: float | None = None
+    weather_longitude: float | None = None
+    weather_place: str = ""
+    weather_refresh_seconds: float = 300.0
 
     @property
     def tile_count(self) -> int:
@@ -409,6 +433,23 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["hwaccel_device"] = str(d.hwaccel_device or "")
     display["cycle_focus"] = bool(d.cycle_focus)
     display["cycle_focus_seconds"] = float(d.cycle_focus_seconds)
+    display["weather_enabled"] = bool(d.weather_enabled)
+    display["weather_slot"] = str(d.weather_slot)
+    display["weather_x"] = float(d.weather_x)
+    display["weather_y"] = float(d.weather_y)
+    display["weather_w"] = float(d.weather_w)
+    display["weather_h"] = float(d.weather_h)
+    display["weather_units"] = str(d.weather_units)
+    display["weather_show_temp"] = bool(d.weather_show_temp)
+    display["weather_show_conditions"] = bool(d.weather_show_conditions)
+    display["weather_show_storm"] = bool(d.weather_show_storm)
+    display["weather_show_lightning"] = bool(d.weather_show_lightning)
+    if d.weather_latitude is not None:
+        display["weather_latitude"] = float(d.weather_latitude)
+    if d.weather_longitude is not None:
+        display["weather_longitude"] = float(d.weather_longitude)
+    display["weather_place"] = str(d.weather_place or "")
+    display["weather_refresh_seconds"] = float(d.weather_refresh_seconds)
 
     raw["cameras"] = [camera_to_dict(cam) for cam in config.cameras]
 
@@ -526,6 +567,49 @@ def _parse_display(raw: Any) -> DisplayConfig:
     )
     if data.cycle_focus_seconds > 600:
         raise ConfigError("display.cycle_focus_seconds must be <= 600")
+    data.weather_enabled = _bool(raw, "weather_enabled", data.weather_enabled)
+    data.weather_slot = str(raw.get("weather_slot", data.weather_slot)).strip().lower() or "bottom_right"
+    if data.weather_slot not in VALID_WEATHER_SLOTS:
+        raise ConfigError(f"display.weather_slot must be one of {VALID_WEATHER_SLOTS}")
+    data.weather_x = float(raw.get("weather_x", data.weather_x) or 0.0)
+    data.weather_y = float(raw.get("weather_y", data.weather_y) or 0.0)
+    data.weather_w = float(raw.get("weather_w", data.weather_w) or data.weather_w)
+    data.weather_h = float(raw.get("weather_h", data.weather_h) or data.weather_h)
+    if not (0.08 <= data.weather_w <= 0.6):
+        raise ConfigError("display.weather_w must be between 0.08 and 0.6")
+    if not (0.08 <= data.weather_h <= 0.5):
+        raise ConfigError("display.weather_h must be between 0.08 and 0.5")
+    data.weather_units = str(raw.get("weather_units", data.weather_units)).strip().lower() or "f"
+    if data.weather_units in {"fahrenheit", "f°", "°f"}:
+        data.weather_units = "f"
+    if data.weather_units in {"celsius", "c°", "°c"}:
+        data.weather_units = "c"
+    if data.weather_units not in VALID_WEATHER_UNITS:
+        raise ConfigError(f"display.weather_units must be one of {VALID_WEATHER_UNITS}")
+    data.weather_show_temp = _bool(raw, "weather_show_temp", data.weather_show_temp)
+    data.weather_show_conditions = _bool(
+        raw, "weather_show_conditions", data.weather_show_conditions
+    )
+    data.weather_show_storm = _bool(raw, "weather_show_storm", data.weather_show_storm)
+    data.weather_show_lightning = _bool(
+        raw, "weather_show_lightning", data.weather_show_lightning
+    )
+    if "weather_latitude" in raw and raw.get("weather_latitude") is not None:
+        try:
+            data.weather_latitude = float(raw.get("weather_latitude"))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("display.weather_latitude must be a number") from exc
+    if "weather_longitude" in raw and raw.get("weather_longitude") is not None:
+        try:
+            data.weather_longitude = float(raw.get("weather_longitude"))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("display.weather_longitude must be a number") from exc
+    data.weather_place = str(raw.get("weather_place", data.weather_place) or "").strip()
+    data.weather_refresh_seconds = _positive_float(
+        raw, "weather_refresh_seconds", data.weather_refresh_seconds
+    )
+    if data.weather_refresh_seconds < 60 or data.weather_refresh_seconds > 7200:
+        raise ConfigError("display.weather_refresh_seconds must be between 60 and 7200")
     return data
 
 

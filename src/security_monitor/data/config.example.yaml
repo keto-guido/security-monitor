@@ -63,6 +63,22 @@ display:
   # Auto-advance focused camera (Esc → Cameras → Cycle focus). Off by default.
   cycle_focus: false
   cycle_focus_seconds: 10
+  # Local weather HUD (Esc → Weather HUD…). Cameras shrink around the widget.
+  weather_enabled: false
+  weather_slot: bottom_right   # bottom_left | bottom_right | between_h | between_v | custom
+  weather_x: 0.0               # fine offset (or custom top-left when slot=custom)
+  weather_y: 0.0
+  weather_w: 0.24
+  weather_h: 0.20
+  weather_units: f             # f | c
+  weather_show_temp: true
+  weather_show_conditions: true
+  weather_show_storm: true
+  weather_show_lightning: true
+  # weather_latitude: 30.27
+  # weather_longitude: -97.74
+  # weather_place: Austin
+  weather_refresh_seconds: 300
 
 cameras:
   - name: Front Door

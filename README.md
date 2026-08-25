@@ -202,7 +202,20 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detection**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detection**, **Weather HUD**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+
+### Weather HUD
+
+`Esc` → **Weather HUD…**:
+
+- Toggle the on-mosaic weather widget (Open-Meteo; no API key)
+- **Placement** — bottom left/right, between columns, between rows, or custom
+- **Place widget on layout…** — still frame of the mosaic; drag the widget (←→↑↓ nudge, Enter save, Esc cancel)
+- Fine X/Y and width/height for precise positioning
+- Toggle each line independently: temperature, conditions, storm warnings, lightning tracker
+- °F / °C units; optional `weather_latitude` / `weather_longitude` in config (blank = IP auto-locate)
+
+Camera tiles **shrink around** the widget — they never draw under it. When placed between two feeds, both cameras lose a shared strip so one camera is not fully blocked.
 
 ### Video decode (GPU / CPU)
 
