@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from security_monitor import __version__
 from security_monitor.cli import main
 
 
@@ -11,6 +12,14 @@ def test_help_exits_zero() -> None:
     with pytest.raises(SystemExit) as exc:
         main(["--help"])
     assert exc.value.code == 0
+
+
+def test_version_matches_package(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["--version"])
+    assert exc.value.code == 0
+    assert __version__ == "0.2.0"
+    assert __version__ in capsys.readouterr().out
 
 
 def test_check_and_init(tmp_path: Path, capsys) -> None:

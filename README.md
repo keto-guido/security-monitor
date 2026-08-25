@@ -1,8 +1,21 @@
 # Security Monitor
 
-Command-line viewer for multiple IP cameras. It reads camera URLs and layout from a YAML config file, then shows a live mosaic window on Windows and Linux.
+Desktop mosaic viewer for IP cameras on **Windows** and **Linux**. It reads camera URLs and layout from a YAML file, captures each stream on its own thread, and composites a live grid with zoom, rewind, snapshots, camera reboot, and optional people / left-behind-object detection.
+
+**Version 0.2.0** · Python 3.10+ · OpenCV GUI (not headless)
 
 Default layout is **2×2 (4 cameras)**. Streams can be `rtsp://` or `rtp://` (HTTP MJPEG, local files, and webcams work too).
+
+## Features
+
+- Live mosaic from RTSP / RTP / HTTP / files / webcams, one capture thread per camera
+- Focus a tile, scroll-wheel zoom toward the cursor, pan when zoomed
+- Smooth playback buffer and rolling rewind (`,` / `.` / `l`)
+- Snapshots (`s`) and short clips (`c`), with an on-screen Capture menu
+- Opt-in **YOLOv8n** people boxes and lighting-normalized “new object” (package) detection
+- Reboot Ubiquiti (SSH) or Reolink / Amcrest / Dahua (HTTP) cameras from the menu or CLI
+- Ubuntu login autostart (XDG `.desktop` or systemd user unit) and Windows Startup folder
+- Linux fullscreen uses the real screen size from `xrandr` so OpenCV Qt does not squash the grid
 
 ## Install
 
@@ -14,7 +27,7 @@ One-line install (recommended):
 python -m pip install -U "git+https://github.com/keto-guido/security-monitor.git"
 ```
 
-That installs the `security-monitor` command and all Python dependencies (`opencv-python`, etc.).
+That installs the `security-monitor` command and Python dependencies (`opencv-python`, Ultralytics, etc.).
 
 ### Ubuntu system packages
 
@@ -188,7 +201,7 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `Home` | Reset zoom |
 | `r` | Reconnect every stream |
 | `h` | Toggle on-screen help |
-| Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
+| Click a tile | Focus camera (click again for grid; click again while zoomed resets zoom) |
 
 The options menu also has **Capture** (snapshot, clip length/format, save folder), **Detection** (people / new-object masters, per-camera includes, set empty-area baseline), **Video settings** (smooth buffer + rewind), and **Reboot cameras**. Settings are saved back into `config.yaml` when changed. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
 
@@ -225,9 +238,35 @@ python -m security_monitor       # same as security-monitor
 
 ## How it works
 
-Each camera is read on its own thread and only the latest frame is kept, so a slow stream does not stall the others. The UI thread composites a grid, letterboxes (or crops) each tile, and draws name / status / FPS. Dropped streams retry on `reconnect_seconds`.
+```
+config.yaml ──► CLI ──► MosaicApp (UI thread)
+                          │
+                          ├─ CameraWorker threads ──► OpenCV/FFmpeg RTSP
+                          │         └─ FrameHistory (smooth delay / rewind JPEG ring)
+                          ├─ DetectionEngine (YOLOv8n → MobileNet-SSD → HOG)
+                          │         └─ NewObjectTracker (CLAHE baseline + freeze mask)
+                          └─ Capture / Reboot jobs
+```
+
+Each camera is read on its own thread and only the latest frame is kept (plus optional history), so a slow stream does not stall the others. The UI thread composites a grid, letterboxes (or crops) each tile, and draws name / status / FPS. Dropped streams retry on `reconnect_seconds`.
 
 OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-python`, not `opencv-python-headless`.
+
+### Layout
+
+| Path | Role |
+| --- | --- |
+| `src/security_monitor/cli.py` | argparse entry point (`run`, `demo`, `check`, `init`, `reboot`, `autostart`, `display`) |
+| `src/security_monitor/config.py` | YAML load / validate / persist menu settings |
+| `src/security_monitor/stream.py` | Per-camera capture threads and FFmpeg options |
+| `src/security_monitor/buffer.py` | Smooth-delay and rewind ring (JPEG-compressed) |
+| `src/security_monitor/mosaic.py` | OpenCV window, HUD, menus, zoom, input |
+| `src/security_monitor/detection.py` | People + left-behind object pipeline |
+| `src/security_monitor/capture.py` | Snapshots and MP4 clips |
+| `src/security_monitor/reboot.py` | SSH / HTTP camera reboot with ping wait |
+| `src/security_monitor/autostart.py` | XDG / systemd / Windows Startup installers |
+| `src/security_monitor/display_setup.py` | Linux `xrandr` size and rotation |
+| `src/security_monitor/overlay.py` | TrueType HUD drawing via Pillow |
 
 ## Troubleshooting
 
@@ -245,6 +284,7 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 - **Autostart did nothing** — confirm you log into a desktop user session (not only SSH). Run `security-monitor autostart status` and check `~/.config/autostart/security-monitor.desktop`. Increase `--delay` if cameras are offline at boot.
 - **Wayland blank window** — the app sets `QT_QPA_PLATFORM=xcb`; also try logging into an “Ubuntu on Xorg” session.
 - **Passwords with `@` or `:`** — use the `username` and `password` fields so they are escaped.
+- **Mosaic hitches when detection is on** — inference currently runs on the UI thread (with a ~0.3s cache). See [Suggested upgrades](#suggested-upgrades).
 
 ## Development
 
@@ -252,3 +292,67 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 pip install -e ".[dev]"
 pytest
 ```
+
+Tests cover config parsing, CLI `init`/`check`, buffers, capture paths, detection helpers, autostart file generation, reboot targeting, and mosaic geometry. They do not open a live GUI or pull RTSP.
+
+## Suggested upgrades
+
+These come from a pass over the current tree (`mosaic.py` ~1.5k lines, detection on the UI thread, plaintext credentials, no CI). Highest payoff first.
+
+### 1. Keep the mosaic smooth while detecting
+
+`DetectionEngine.process()` is called from `_render_cell` on the UI thread. YOLO is cached (~3 fps) and frames are downscaled to 960px, but a slow inference still stalls `imshow`. Move people/object inference onto a worker per camera (or a shared pool), draw the last boxes on the UI thread, and add a config knob for interval / model size (`yolov8n` vs `s`).
+
+### 2. Make heavy ML optional
+
+`ultralytics` is a hard install dependency even when detection stays off. Split extras, for example:
+
+```bash
+pip install security-monitor            # viewer only
+pip install "security-monitor[detect]"  # YOLO + torch
+```
+
+Keep the MobileNet-SSD / HOG fallbacks for machines that should not pull PyTorch.
+
+### 3. In-app camera management
+
+A Cameras menu (grid size, show/hide, reorder, add RTSP/webcam, focus cycling with `n`/`p`) is already prototyped on branch `cursor/buffer-rewind-menu-66f4`. Finishing and merging that removes most hand-edits of `config.yaml` after first install.
+
+### 4. Alerts, not just boxes
+
+Detection currently draws overlays. Next step for a monitor kiosk:
+
+- Snapshot + optional clip when a person or new object is confirmed
+- Webhook / MQTT / ntfy / email
+- Offline-camera alerts after N reconnect failures
+- A small on-disk event log (timestamp, camera, kind, image path)
+
+### 5. Secrets and config hygiene
+
+Passwords live in plaintext YAML. Prefer OS keyring, `password_env: CAMERA_FRONT_PASSWORD`, or a `0600` secrets file. When the menu saves settings, `yaml.safe_dump` rewrites the file and **drops comments** — switch persist to [ruamel.yaml](https://yaml.readthedocs.io/) round-trip so the example comments survive.
+
+### 6. Split the UI module and add CI
+
+`mosaic.py` owns windowing, menus, capture HUD, reboot overlay, and input. Split menu / input / layout so each stays testable. Add GitHub Actions (`pytest` on Ubuntu + Windows), Ruff, and a single version source (`importlib.metadata.version("security-monitor")` instead of a second `__version__`).
+
+### 7. Optional remote view
+
+The app is a local OpenCV window. A thin FastAPI (or similar) MJPEG/WebRTC page would let a phone check the mosaic without a desktop session, while the kiosk display stays fullscreen.
+
+### 8. Decode and detect on the GPU when present
+
+FFmpeg/OpenCV software-decode of several 1080p RTSP streams plus YOLO will tax a small NUC. Optional NVIDIA NVDEC / VAAPI decode and ONNX Runtime / OpenVINO / TensorRT for the detector would make 6–9 cameras realistic on modest hardware.
+
+### Later / nice to have
+
+- Event-triggered or continuous recording (lightweight NVR), with disk caps
+- macOS windowing pass (fonts and autostart are Windows/Linux today)
+- Docker / kiosk image (X11 + unprivileged user) for a dedicated monitor PC
+- Per-camera PTZ keys when the vendor API exists
+- Audio from cameras, or a chime on detection
+- Watchdog that hard-restarts a hung FFmpeg capture instead of only reconnecting
+- Drop leftover `test.txt` from the repo root (install cheat-sheet, not product)
+
+## License
+
+MIT. See [LICENSE](LICENSE).
