@@ -60,7 +60,12 @@ def _ensure_opencv_qt_fonts() -> None:
             return
         break
 
-from security_monitor.config import AppConfig
+from security_monitor.buffer import (
+    REWIND_BUFFER_CHOICES,
+    SMOOTH_BUFFER_CHOICES,
+    next_choice,
+)
+from security_monitor.config import AppConfig, save_display_settings
 from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
 from security_monitor.reboot import RebootJob, reboot_targets
 from security_monitor.stream import Snapshot, build_sources
@@ -74,6 +79,8 @@ HELP_LINES = (
     "wheel    zoom in/out",
     "+ / -    zoom in/out",
     "arrows   pan / strafe",
+    ", / .    rewind back / forward",
+    "l        jump to live",
     "Home     reset zoom",
     "r        reconnect all",
     "click    focus tile",
@@ -83,6 +90,8 @@ ZOOM_MIN = 1.0
 ZOOM_MAX = 12.0
 ZOOM_FACTOR = 1.2
 PAN_VIEW_FRACTION = 0.18
+REWIND_STEP_SECONDS = 1.0
+REWIND_STEP_COARSE = 5.0
 
 # waitKeyEx codes differ by GUI backend (Win32 / GTK / Qt).
 KEY_LEFT = frozenset({2424832, 65361, 16777234})
@@ -260,6 +269,7 @@ class MosaicApp:
             cell = magnify(cell, self.view_zoom, self.pan_x, self.pan_y)
             self._draw_cell_overlay(cell, snap, name)
             self._draw_zoom_badge(cell)
+            self._draw_buffer_badge(cell, snap)
             return self._draw_menu(self._draw_reboot(self._draw_help(cell)))
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
@@ -270,11 +280,13 @@ class MosaicApp:
         y_off = max(0, (height - grid_h) // 2)
         self._grid_x, self._grid_y = x_off, y_off
         zoomed = self.view_zoom > 1.001
+        any_rewind = False
         for index in range(d.tile_count):
             row, col = divmod(index, d.columns)
             y, x = y_off + row * cell_h, x_off + col * cell_w
             if index < len(self.sources):
                 snap = self.sources[index].snapshot()
+                any_rewind = any_rewind or snap.rewinding
                 tile = self._render_cell(
                     snap,
                     self.sources[index].name,
@@ -289,6 +301,11 @@ class MosaicApp:
             self._draw_grid_lines(canvas, x_off=x_off, y_off=y_off)
         canvas = magnify(canvas, self.view_zoom, self.pan_x, self.pan_y)
         self._draw_zoom_badge(canvas)
+        if any_rewind or self.display.smooth_buffer or self.display.rewind_buffer:
+            # Aggregate badge from first live source when in grid view.
+            sample = self.sources[0].snapshot() if self.sources else None
+            if sample is not None:
+                self._draw_buffer_badge(canvas, sample)
         return self._draw_menu(self._draw_reboot(self._draw_help(canvas)))
 
     def _draw_grid_lines(
@@ -383,10 +400,16 @@ class MosaicApp:
             return
 
         if key in KEY_LEFT:
-            self._pan(-1, 0)
+            if self.view_zoom > 1.001:
+                self._pan(-1, 0)
+            elif self.display.rewind_buffer:
+                self._nudge_rewind(REWIND_STEP_SECONDS)
             return
         if key in KEY_RIGHT:
-            self._pan(1, 0)
+            if self.view_zoom > 1.001:
+                self._pan(1, 0)
+            elif self.display.rewind_buffer:
+                self._nudge_rewind(-REWIND_STEP_SECONDS)
             return
         if key in KEY_UP:
             self._pan(0, -1)
@@ -418,6 +441,13 @@ class MosaicApp:
             self._reconnect_all()
         elif ch in (ord("h"), ord("H"), ord("?")):
             self._show_help = not self._show_help
+        elif ch in (ord(","), ord("<")):
+            # Shift-, comes through as < on some layouts.
+            self._nudge_rewind(REWIND_STEP_SECONDS if ch == ord(",") else REWIND_STEP_COARSE)
+        elif ch in (ord("."), ord(">")):
+            self._nudge_rewind(-(REWIND_STEP_SECONDS if ch == ord(".") else REWIND_STEP_COARSE))
+        elif ch in (ord("l"), ord("L")):
+            self._go_live()
         elif ord("1") <= ch <= ord("9"):
             index = ch - ord("1")
             if index < len(self.sources):
@@ -431,11 +461,17 @@ class MosaicApp:
         if key in KEY_DOWN:
             self._menu_index = (self._menu_index + 1) % len(items)
             return
+        if key in KEY_LEFT:
+            self._adjust_menu_item(items[self._menu_index][0], -1)
+            return
+        if key in KEY_RIGHT:
+            self._adjust_menu_item(items[self._menu_index][0], 1)
+            return
         if key in KEY_ENTER or ch in (13, 10):
             self._activate_menu(items[self._menu_index][0])
             return
         if ch in (ord("q"), ord("Q")):
-            if self._menu_page == "reboot_confirm":
+            if self._menu_page in {"reboot_confirm", "video"}:
                 self._menu_page = "root"
                 self._menu_index = 0
                 return
@@ -448,7 +484,7 @@ class MosaicApp:
                 self._activate_menu(items[index][0])
 
     def _on_escape(self) -> None:
-        if self._menu_open and self._menu_page == "reboot_confirm":
+        if self._menu_open and self._menu_page in {"reboot_confirm", "video"}:
             self._menu_page = "root"
             self._menu_index = 0
             return
@@ -480,10 +516,22 @@ class MosaicApp:
                 ("reboot_run", "Yes, reboot all cameras"),
                 ("reboot_cancel", "Cancel"),
             ]
+        if self._menu_page == "video":
+            d = self.display
+            smooth = "On" if d.smooth_buffer else "Off"
+            rewind = "On" if d.rewind_buffer else "Off"
+            return [
+                ("smooth_toggle", f"Smooth buffer: {smooth}"),
+                ("smooth_length", f"Buffer length: {d.smooth_buffer_seconds:g}s"),
+                ("rewind_toggle", f"Rewind buffer: {rewind}"),
+                ("rewind_length", f"Rewind length: {d.rewind_buffer_seconds:g}s"),
+                ("video_back", "Back"),
+            ]
         fullscreen = "Windowed mode" if self.fullscreen else "Fullscreen"
         return [
             ("resume", "Resume"),
             ("fullscreen", fullscreen),
+            ("video", "Video settings"),
             ("reconnect", "Reconnect streams"),
             ("reboot", "Reboot cameras"),
             ("exit", "Exit"),
@@ -496,6 +544,21 @@ class MosaicApp:
         elif action == "fullscreen":
             self.fullscreen = not self.fullscreen
             self._apply_fullscreen()
+        elif action == "video":
+            self._menu_page = "video"
+            self._menu_index = 0
+            self._reboot_notice = ""
+        elif action == "video_back":
+            self._menu_page = "root"
+            self._menu_index = 0
+        elif action == "smooth_toggle":
+            self._set_smooth_buffer(not self.display.smooth_buffer)
+        elif action == "smooth_length":
+            self._adjust_menu_item("smooth_length", 1)
+        elif action == "rewind_toggle":
+            self._set_rewind_buffer(not self.display.rewind_buffer)
+        elif action == "rewind_length":
+            self._adjust_menu_item("rewind_length", 1)
         elif action == "reconnect":
             self._reconnect_all()
             self._menu_open = False
@@ -514,6 +577,67 @@ class MosaicApp:
             self._start_reboot()
         elif action == "exit":
             self._running = False
+
+    def _adjust_menu_item(self, action: str, step: int) -> None:
+        if action == "smooth_toggle":
+            self._set_smooth_buffer(not self.display.smooth_buffer)
+        elif action == "rewind_toggle":
+            self._set_rewind_buffer(not self.display.rewind_buffer)
+        elif action == "smooth_length":
+            was = self.display.smooth_buffer
+            value = next_choice(SMOOTH_BUFFER_CHOICES, self.display.smooth_buffer_seconds, step)
+            self.display.smooth_buffer_seconds = float(value)
+            self.display.smooth_buffer = True
+            self._apply_buffer_settings(persist=True)
+            if not was:
+                self._reconnect_all()
+        elif action == "rewind_length":
+            value = next_choice(REWIND_BUFFER_CHOICES, self.display.rewind_buffer_seconds, step)
+            self.display.rewind_buffer_seconds = float(value)
+            self.display.rewind_buffer = True
+            self._apply_buffer_settings(persist=True)
+
+    def _set_smooth_buffer(self, enabled: bool) -> None:
+        previous = self.display.smooth_buffer
+        self.display.smooth_buffer = bool(enabled)
+        self._apply_buffer_settings(persist=True)
+        print(
+            f"Smooth buffer {'on' if enabled else 'off'}"
+            f" ({self.display.smooth_buffer_seconds:g}s)"
+        )
+        # Capture open-options change with the smooth toggle — reconnect once.
+        if previous != enabled:
+            self._reconnect_all()
+
+    def _set_rewind_buffer(self, enabled: bool) -> None:
+        self.display.rewind_buffer = bool(enabled)
+        if not enabled:
+            self._go_live()
+        self._apply_buffer_settings(persist=True)
+        print(
+            f"Rewind buffer {'on' if enabled else 'off'}"
+            f" ({self.display.rewind_buffer_seconds:g}s)"
+        )
+
+    def _apply_buffer_settings(self, *, persist: bool = False) -> None:
+        for source in self.sources:
+            source.apply_buffer_settings(self.display)
+        if persist:
+            path = save_display_settings(self.config)
+            if path is not None:
+                self._reboot_notice = f"Saved to {path.name}"
+            elif self._menu_page == "video":
+                self._reboot_notice = "Settings applied (demo — not saved)"
+
+    def _nudge_rewind(self, delta_seconds: float) -> None:
+        if not self.display.rewind_buffer:
+            return
+        for source in self.sources:
+            source.history.nudge_rewind(delta_seconds)
+
+    def _go_live(self) -> None:
+        for source in self.sources:
+            source.history.go_live()
 
     def _start_reboot(self) -> None:
         devices = reboot_targets(self.config.cameras)
@@ -649,7 +773,7 @@ class MosaicApp:
             return canvas
         canvas[:] = (canvas.astype(np.float32) * 0.38).astype(np.uint8)
         items = self._menu_items()
-        card_w, row_h, pad = 480, 46, 20
+        card_w, row_h, pad = (560 if self._menu_page == "video" else 480), 46, 20
         title_h = 56
         footer_h = 36
         notice_h = 28 if self._reboot_notice else 0
@@ -664,7 +788,10 @@ class MosaicApp:
             alpha=0.92,
             radius=16,
         )
-        heading = "Confirm reboot" if self._menu_page == "reboot_confirm" else "Options"
+        heading = {
+            "reboot_confirm": "Confirm reboot",
+            "video": "Video settings",
+        }.get(self._menu_page, "Options")
         draw_text(
             canvas,
             heading,
@@ -705,7 +832,12 @@ class MosaicApp:
                 valign="top",
             )
             self._menu_hitboxes.append((action, *box))
-        footer = "This will restart every camera" if self._menu_page == "reboot_confirm" else "Enter to select    Esc to close"
+        if self._menu_page == "reboot_confirm":
+            footer = "This will restart every camera"
+        elif self._menu_page == "video":
+            footer = "Enter toggle/cycle    ← → adjust    Esc back"
+        else:
+            footer = "Enter to select    Esc to close"
         draw_text(
             canvas,
             footer,
@@ -763,6 +895,32 @@ class MosaicApp:
             size=16,
             color=(230, 230, 230),
             align="right",
+            valign="top",
+        )
+
+    def _draw_buffer_badge(self, canvas: np.ndarray, snap: Snapshot) -> None:
+        d = self.display
+        if not d.smooth_buffer and not d.rewind_buffer:
+            return
+        parts: list[str] = []
+        if snap.rewinding or (d.rewind_buffer and snap.behind > (d.smooth_buffer_seconds if d.smooth_buffer else 0) + 0.2):
+            parts.append(f"REWIND -{snap.behind:.1f}s")
+        elif d.smooth_buffer and snap.behind > 0.05:
+            parts.append(f"SMOOTH -{snap.behind:.1f}s")
+        elif d.smooth_buffer:
+            parts.append(f"SMOOTH {d.smooth_buffer_seconds:g}s")
+        if d.rewind_buffer:
+            parts.append(f"buf {snap.buffered:.0f}/{d.rewind_buffer_seconds:g}s")
+        if not parts:
+            return
+        label = "   ".join(parts)
+        color = (60, 180, 255) if snap.rewinding else (200, 200, 200)
+        draw_text(
+            canvas,
+            label,
+            (16, 14),
+            size=15,
+            color=color,
             valign="top",
         )
 
@@ -945,9 +1103,11 @@ def draw_status_bar(
     draw_dot(tile, (16 + name_size // 8, cy), max(5.0, name_size * 0.32), color)
     draw_text(tile, name, (28 + name_size // 4, h - 8), size=name_size, valign="bottom")
     status = snap.status.upper()
-    if snap.detail and snap.status not in ("live", "demo"):
+    if snap.rewinding:
+        status = f"REWIND -{snap.behind:.1f}s"
+    elif snap.detail and snap.status not in ("live", "demo"):
         status = f"{status}  {snap.detail}"
-    if fps_text:
+    if fps_text and not snap.rewinding:
         status = f"{status}   {fps_text}"
     draw_text(
         tile,

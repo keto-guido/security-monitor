@@ -86,6 +86,12 @@ class DisplayConfig:
     # (classic "squished" / sideways look).
     screen_rotate: str = "none"  # none | normal | left | right | inverted
     screen_output: str = "auto"  # auto | HDMI-1 | DP-1 | ...
+    # Smooth playback: show frames delayed by smooth_buffer_seconds to absorb jitter.
+    smooth_buffer: bool = False
+    smooth_buffer_seconds: float = 1.0
+    # Rolling history for quick rewind (comma/period or menu).
+    rewind_buffer: bool = False
+    rewind_buffer_seconds: float = 30.0
 
     @property
     def tile_count(self) -> int:
@@ -203,6 +209,38 @@ def example_config_text() -> str:
     return files("security_monitor").joinpath("data/config.example.yaml").read_text(encoding="utf-8")
 
 
+def save_display_settings(config: AppConfig) -> Path | None:
+    """
+    Persist buffer/rewind (and related display toggles) back into config.yaml.
+
+    Returns the path written, or None if there is no config file to update
+    (e.g. pure demo mode).
+    """
+    path = config.path
+    if path is None:
+        return None
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    display = raw.get("display")
+    if not isinstance(display, dict):
+        display = {}
+        raw["display"] = display
+    d = config.display
+    display["smooth_buffer"] = bool(d.smooth_buffer)
+    display["smooth_buffer_seconds"] = float(d.smooth_buffer_seconds)
+    display["rewind_buffer"] = bool(d.rewind_buffer)
+    display["rewind_buffer_seconds"] = float(d.rewind_buffer_seconds)
+    path.write_text(
+        yaml.safe_dump(raw, sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
+    return path
+
+
 def demo_config(columns: int = 2, rows: int = 2) -> AppConfig:
     display = DisplayConfig(columns=columns, rows=rows, show_fps=True)
     cameras = [
@@ -240,6 +278,18 @@ def _parse_display(raw: Any) -> DisplayConfig:
             f"display.screen_rotate must be one of {VALID_SCREEN_ROTATIONS}"
         )
     data.screen_output = str(raw.get("screen_output", data.screen_output)).strip() or "auto"
+    data.smooth_buffer = _bool(raw, "smooth_buffer", data.smooth_buffer)
+    data.smooth_buffer_seconds = _positive_float(
+        raw, "smooth_buffer_seconds", data.smooth_buffer_seconds
+    )
+    if data.smooth_buffer_seconds > 10:
+        raise ConfigError("display.smooth_buffer_seconds must be <= 10")
+    data.rewind_buffer = _bool(raw, "rewind_buffer", data.rewind_buffer)
+    data.rewind_buffer_seconds = _positive_float(
+        raw, "rewind_buffer_seconds", data.rewind_buffer_seconds
+    )
+    if data.rewind_buffer_seconds > 300:
+        raise ConfigError("display.rewind_buffer_seconds must be <= 300")
     return data
 
 

@@ -29,6 +29,12 @@ display:
   # Linux: optional xrandr orientation (normally leave as none).
   # screen_rotate: none       # none | normal | left | right | inverted
   # screen_output: auto       # auto | HDMI-1 | DP-1 | ...
+  # Smooth playback delay (menu: Esc → Video settings). Off by default.
+  smooth_buffer: false
+  smooth_buffer_seconds: 1.0
+  # Rolling history for quick rewind (, / . keys, L = live). Off by default.
+  rewind_buffer: false
+  rewind_buffer_seconds: 30
 
 cameras:
   - name: Front Door

@@ -122,6 +122,10 @@ display:
   # Linux fullscreen uses the real screen size (fixes OpenCV Qt squish)
   # screen_rotate: none
   # screen_output: auto
+  smooth_buffer: false           # delay playback for smoother video
+  smooth_buffer_seconds: 1.0
+  rewind_buffer: false           # rolling history for quick rewind
+  rewind_buffer_seconds: 30
 
 cameras:
   - name: Front Door
@@ -169,14 +173,16 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `g` / `0` | Back to the grid |
 | Scroll wheel | Zoom in / out (toward the cursor) |
 | `+` / `-` | Zoom in / out |
-| Arrow keys | Pan / strafe when zoomed; move in the options menu |
+| Arrow keys | Pan / strafe when zoomed; move in the options menu; scrub rewind when rewind buffer is on |
+| `,` / `.` | Rewind back / toward live (when rewind buffer is on) |
+| `l` | Jump to live |
 | `Enter` | Choose the highlighted options-menu item |
 | `Home` | Reset zoom |
 | `r` | Reconnect every stream |
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu also has **Reboot cameras**. That uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu also has **Video settings** (smooth buffer on/off + length, rewind buffer on/off + length) and **Reboot cameras**. Buffer settings are saved back into `config.yaml` when changed. Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
 
 ## Commands
 

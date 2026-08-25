@@ -228,6 +228,10 @@ def cmd_check(args: argparse.Namespace) -> int:
         f"scale={d.scale_mode}  transport={d.default_transport}  "
         f"screen_rotate={d.screen_rotate}"
     )
+    print(
+        f"Buffer: smooth={'on' if d.smooth_buffer else 'off'} ({d.smooth_buffer_seconds:g}s)  "
+        f"rewind={'on' if d.rewind_buffer else 'off'} ({d.rewind_buffer_seconds:g}s)"
+    )
     visible = config.visible_cameras()
     print(f"Cameras: {len(visible)} shown / {len(config.cameras)} configured")
     for i, cam in enumerate(config.cameras, start=1):
