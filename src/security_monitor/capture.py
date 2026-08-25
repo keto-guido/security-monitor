@@ -132,6 +132,7 @@ class CaptureItem:
     kind: str  # image | video
     size: int
     mtime: float
+    locked: bool = False
 
     @property
     def name(self) -> str:
@@ -141,7 +142,8 @@ class CaptureItem:
     def label(self) -> str:
         stamp = datetime.fromtimestamp(self.mtime).strftime("%Y-%m-%d %H:%M")
         tag = "IMG" if self.kind == "image" else "VID"
-        return f"[{tag}] {self.name}  ·  {_format_bytes(self.size)}  ·  {stamp}"
+        lock = "LOCKED · " if self.locked else ""
+        return f"{lock}[{tag}] {self.name}  ·  {_format_bytes(self.size)}  ·  {stamp}"
 
 
 def _format_bytes(size: int) -> str:
@@ -177,12 +179,14 @@ def list_captures(directory: Path | str | None, *, limit: int = 200) -> list[Cap
             stat = path.stat()
         except OSError:
             continue
+        locked = Path(str(path) + ".lock").is_file()
         items.append(
             CaptureItem(
                 path=path,
                 kind=kind,
                 size=int(stat.st_size),
                 mtime=float(stat.st_mtime),
+                locked=locked,
             )
         )
     items.sort(key=lambda item: item.mtime, reverse=True)
@@ -197,6 +201,12 @@ def delete_capture(path: Path) -> None:
         target.unlink()
     except OSError as exc:
         raise CaptureError(f"Could not delete {target.name}: {exc}") from exc
+    marker = Path(str(target) + ".lock")
+    if marker.is_file():
+        try:
+            marker.unlink()
+        except OSError:
+            pass
 
 
 def delete_captures(paths: list[Path]) -> int:

@@ -96,12 +96,14 @@ class PersonEventItem:
     snapshot: Path
     clip: Path | None
     has_clip: bool
+    locked: bool = False
 
     @property
     def label(self) -> str:
         stamp = self.when.strftime("%Y-%m-%d %H:%M:%S")
         clip = "clip" if self.has_clip else "no clip"
-        return f"{stamp}  ·  {self.camera}  ·  {clip}"
+        lock = "LOCKED · " if self.locked else ""
+        return f"{lock}{stamp}  ·  {self.camera}  ·  {clip}"
 
 
 def list_person_events(save_directory: Path | str | None, *, limit: int = 200) -> list[PersonEventItem]:
@@ -125,6 +127,7 @@ def list_person_events(save_directory: Path | str | None, *, limit: int = 200) -
             clip_path = clip
         camera = folder.name
         when = datetime.fromtimestamp(snap.stat().st_mtime)
+        locked = False
         meta_path = folder / "meta.json"
         if meta_path.is_file():
             try:
@@ -133,6 +136,7 @@ def list_person_events(save_directory: Path | str | None, *, limit: int = 200) -
                 raw_when = meta.get("started_at")
                 if raw_when:
                     when = datetime.fromisoformat(str(raw_when))
+                locked = bool(meta.get("locked"))
             except (OSError, ValueError, json.JSONDecodeError, TypeError):
                 pass
         else:
@@ -152,6 +156,7 @@ def list_person_events(save_directory: Path | str | None, *, limit: int = 200) -
                 snapshot=snap,
                 clip=clip_path,
                 has_clip=clip_path is not None,
+                locked=locked,
             )
         )
     items.sort(key=lambda item: item.when, reverse=True)

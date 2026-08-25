@@ -46,6 +46,9 @@ display:
   person_pre_roll_seconds: 5
   person_post_roll_seconds: 5
   person_max_event_seconds: 120
+  # Auto-erase unlocked captures/events (0 = off). Lock items in the browser to keep them.
+  capture_retention_days: 14
+  capture_max_gb: 20
   # Auto-advance focused camera (Esc → Cameras → Cycle focus). Off by default.
   cycle_focus: false
   cycle_focus_seconds: 10

@@ -203,6 +203,7 @@ The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detec
 - Records a clip with configurable **pre-roll** (from the rolling buffer), the time the person is present, and **post-roll** after they leave
 - Requires people detection master + per-camera include (`Cameras included…`)
 - Browse events as stamped snapshots; Enter opens the recording playback (Esc stops)
+- **Lock (keep forever)** so auto-erase / max-storage cleanup never removes that event
 
 Files land under `~/security-monitor/captures/events/<timestamp>_<camera>/` (`snapshot.jpg` + `clip.mp4`).
 
@@ -213,8 +214,16 @@ Files land under `~/security-monitor/captures/events/<timestamp>_<camera>/` (`sn
 - List snapshots and clips newest-first
 - Open a file to preview (images + first frame of videos)
 - ← → browse neighboring files
+- **Lock (keep forever)** / **Unlock** — locked files are never auto-erased
 - **Show in folder** opens the OS file manager
-- **Delete** / **Delete all** with confirmation
+- **Delete** / **Delete all** with confirmation (delete-all skips locked files)
+
+**Storage cleanup** (`Esc` → **Capture**):
+
+- **Auto-erase after** — Off / 1d … 90d (unlocked only)
+- **Max storage** — Off / 1–100 GB; when over the cap, oldest unlocked items are removed first
+- **Erase old unlocked now…** — run a sweep immediately
+- Defaults: 14 days and 20 GB; person events and manual captures share the same rules
 
 ### Cameras menu
 

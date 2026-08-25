@@ -101,7 +101,16 @@ from security_monitor.events import (
     list_person_events,
 )
 from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
-from security_monitor.reboot import RebootJob, reboot_targets
+from security_monitor.retention import (
+    RETENTION_DAY_CHOICES,
+    RETENTION_GB_CHOICES,
+    PurgeResult,
+    purge_old_media,
+    retention_label_days,
+    retention_label_gb,
+    set_capture_locked,
+    set_event_locked,
+)
 from security_monitor.stream import Snapshot, build_sources
 
 HELP_LINES = (
@@ -246,6 +255,7 @@ class MosaicApp:
         self._event_preview: np.ndarray | None = None
         self._event_playback: cv2.VideoCapture | None = None
         self._event_playback_label = ""
+        self._last_purge_at = 0.0
 
     def run(self) -> int:
         if not self.sources:
@@ -293,6 +303,7 @@ class MosaicApp:
         try:
             while self._running:
                 self._tick_cycle_focus()
+                self._maybe_purge_media()
                 canvas = self._compose()
                 cv2.imshow(self.window, canvas)
                 now = time.monotonic()
@@ -817,6 +828,15 @@ class MosaicApp:
                 ("captures_browse", "Browse saved captures…"),
                 ("clip_length", f"Clip length: {d.clip_seconds:g}s"),
                 ("snap_format", f"Snapshot format: {d.snapshot_format.upper()}"),
+                (
+                    "retention_days",
+                    f"Auto-erase after: {retention_label_days(d.capture_retention_days)}",
+                ),
+                (
+                    "retention_gb",
+                    f"Max storage: {retention_label_gb(d.capture_max_gb)}",
+                ),
+                ("purge_now", "Erase old unlocked now…"),
                 ("capture_folder", f"Folder: {folder}"),
                 ("capture_back", "Back"),
             ]
@@ -837,10 +857,12 @@ class MosaicApp:
             item = self._selected_capture()
             title = item.name if item else "(missing)"
             kind = item.kind if item else "?"
+            lock = "Unlock" if item and item.locked else "Lock (keep forever)"
             return [
                 ("captures_info", f"{title}  ({kind})"),
                 ("captures_prev", "◀ Previous"),
                 ("captures_next", "Next ▶"),
+                ("captures_lock", lock),
                 ("captures_open_folder", "Show in folder"),
                 ("captures_delete", "Delete…"),
                 ("captures_view_back", "Back to list"),
@@ -889,11 +911,13 @@ class MosaicApp:
             item = self._selected_event()
             title = item.label if item else "(missing)"
             play = "Play recording" if item and item.has_clip else "Play recording (unavailable)"
+            lock = "Unlock" if item and item.locked else "Lock (keep forever)"
             return [
                 ("events_info", title),
                 ("events_play", play),
                 ("events_prev", "◀ Previous"),
                 ("events_next", "Next ▶"),
+                ("events_lock", lock),
                 ("events_delete", "Delete event…"),
                 ("events_view_back", "Back to list"),
             ]
@@ -1048,6 +1072,8 @@ class MosaicApp:
             self._nudge_event_view(-1)
         elif action == "events_next":
             self._nudge_event_view(1)
+        elif action == "events_lock":
+            self._toggle_selected_event_lock()
         elif action == "events_play":
             self._start_event_playback()
         elif action == "events_play_stop" or action == "events_play_back":
@@ -1055,8 +1081,12 @@ class MosaicApp:
             self._menu_page = "events_view"
             self._menu_index = 0
         elif action == "events_delete":
-            self._menu_page = "events_delete"
-            self._menu_index = 1
+            item = self._selected_event()
+            if item is not None and item.locked:
+                self._reboot_notice = "Unlock before deleting"
+            else:
+                self._menu_page = "events_delete"
+                self._menu_index = 1
         elif action == "events_delete_yes":
             self._delete_selected_event()
         elif action == "events_delete_no" or action == "events_view_back":
@@ -1087,6 +1117,13 @@ class MosaicApp:
             self._adjust_menu_item("clip_length", 1)
         elif action == "snap_format":
             self._toggle_snapshot_format()
+        elif action == "retention_days":
+            self._adjust_menu_item("retention_days", 1)
+        elif action == "retention_gb":
+            self._adjust_menu_item("retention_gb", 1)
+        elif action == "purge_now":
+            result = self._run_media_purge(force=True)
+            self._reboot_notice = result.summary
         elif action == "capture_folder":
             self._reboot_notice = str(self._save_dir())
         elif action == "captures_browse" or action == "captures_root":
@@ -1114,9 +1151,15 @@ class MosaicApp:
             self._nudge_capture_view(-1)
         elif action == "captures_next":
             self._nudge_capture_view(1)
+        elif action == "captures_lock":
+            self._toggle_selected_capture_lock()
         elif action == "captures_delete":
-            self._menu_page = "captures_delete"
-            self._menu_index = 1
+            item = self._selected_capture()
+            if item is not None and item.locked:
+                self._reboot_notice = "Unlock before deleting"
+            else:
+                self._menu_page = "captures_delete"
+                self._menu_index = 1
         elif action == "captures_delete_yes":
             self._delete_selected_capture()
         elif action == "captures_delete_no" or action == "captures_view_back":
@@ -1246,6 +1289,16 @@ class MosaicApp:
         elif action == "clip_length":
             value = next_choice(CLIP_LENGTH_CHOICES, self.display.clip_seconds, step)
             self.display.clip_seconds = float(value)
+            self._apply_buffer_settings(persist=True)
+        elif action == "retention_days":
+            value = next_choice(
+                RETENTION_DAY_CHOICES, self.display.capture_retention_days, step
+            )
+            self.display.capture_retention_days = float(value)
+            self._apply_buffer_settings(persist=True)
+        elif action == "retention_gb":
+            value = next_choice(RETENTION_GB_CHOICES, self.display.capture_max_gb, step)
+            self.display.capture_max_gb = float(value)
             self._apply_buffer_settings(persist=True)
         elif action == "snap_format":
             self._toggle_snapshot_format()
@@ -1772,6 +1825,7 @@ class MosaicApp:
         self._captures = list_captures(self._save_dir())
 
     def _open_captures_browser(self) -> None:
+        self._run_media_purge()
         self._refresh_captures()
         self._close_capture_view()
         self._menu_page = "captures"
@@ -1846,19 +1900,87 @@ class MosaicApp:
         print(f"Deleted capture {name}")
 
     def _delete_all_captures(self) -> None:
-        paths = [item.path for item in self._captures]
+        paths = [item.path for item in self._captures if not item.locked]
+        skipped = sum(1 for item in self._captures if item.locked)
         deleted = delete_captures(paths)
         self._refresh_captures()
         self._close_capture_view()
         self._menu_page = "captures"
         self._menu_index = 0
-        self._reboot_notice = f"Deleted {deleted} file(s)"
-        print(f"Deleted {deleted} capture(s)")
+        notice = f"Deleted {deleted} file(s)"
+        if skipped:
+            notice += f" (kept {skipped} locked)"
+        self._reboot_notice = notice
+        print(notice)
+
+    def _toggle_selected_capture_lock(self) -> None:
+        item = self._selected_capture()
+        if item is None:
+            return
+        try:
+            set_capture_locked(item.path, not item.locked)
+        except CaptureError as exc:
+            self._reboot_notice = str(exc)
+            return
+        index = self._capture_view_index or 0
+        self._refresh_captures()
+        if index < len(self._captures):
+            self._open_capture_view(index)
+        state = "locked" if not item.locked else "unlocked"
+        self._reboot_notice = f"Capture {state}"
+
+    def _toggle_selected_event_lock(self) -> None:
+        item = self._selected_event()
+        if item is None:
+            return
+        try:
+            set_event_locked(item.path, not item.locked)
+        except CaptureError as exc:
+            self._reboot_notice = str(exc)
+            return
+        index = self._event_view_index or 0
+        self._refresh_events()
+        if index < len(self._events):
+            self._open_event_view(index)
+        state = "locked" if not item.locked else "unlocked"
+        self._reboot_notice = f"Event {state}"
+
+    def _run_media_purge(self, *, force: bool = False) -> PurgeResult:
+        d = self.display
+        if not force and d.capture_retention_days <= 0 and d.capture_max_gb <= 0:
+            return PurgeResult()
+        result = purge_old_media(
+            self._save_dir(),
+            max_age_days=float(d.capture_retention_days),
+            max_total_gb=float(d.capture_max_gb),
+        )
+        self._last_purge_at = time.monotonic()
+        if result.deleted:
+            self._refresh_captures()
+            self._refresh_events()
+            print(result.summary)
+        return result
+
+    def _maybe_purge_media(self) -> None:
+        d = self.display
+        if d.capture_retention_days <= 0 and d.capture_max_gb <= 0:
+            return
+        now = time.monotonic()
+        # Run shortly after start, then about every 15 minutes.
+        if self._last_purge_at > 0 and (now - self._last_purge_at) < 900:
+            return
+        if self._last_purge_at <= 0 and now < 30:
+            # Allow streams to settle before first sweep.
+            return
+        result = self._run_media_purge()
+        if result.deleted:
+            self._flash_capture(result.summary, seconds=4.0)
 
     def _refresh_events(self) -> None:
         self._events = list_person_events(self._save_dir())
 
     def _open_events_browser(self) -> None:
+        self._run_media_purge()
         self._refresh_events()
         self._close_event_view()
         self._stop_event_playback()

@@ -123,6 +123,9 @@ class DisplayConfig:
     person_pre_roll_seconds: float = 5.0
     person_post_roll_seconds: float = 5.0
     person_max_event_seconds: float = 120.0
+    # Auto-erase unlocked captures/events (0 = off). Locked items are kept.
+    capture_retention_days: float = 14.0
+    capture_max_gb: float = 20.0
     # Auto-advance focused camera (0 / False = off). Menu: Esc → Cameras.
     cycle_focus: bool = False
     cycle_focus_seconds: float = 10.0
@@ -365,6 +368,8 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["person_pre_roll_seconds"] = float(d.person_pre_roll_seconds)
     display["person_post_roll_seconds"] = float(d.person_post_roll_seconds)
     display["person_max_event_seconds"] = float(d.person_max_event_seconds)
+    display["capture_retention_days"] = float(d.capture_retention_days)
+    display["capture_max_gb"] = float(d.capture_max_gb)
     display["cycle_focus"] = bool(d.cycle_focus)
     display["cycle_focus_seconds"] = float(d.cycle_focus_seconds)
 
@@ -453,6 +458,14 @@ def _parse_display(raw: Any) -> DisplayConfig:
     )
     if data.person_max_event_seconds > 600:
         raise ConfigError("display.person_max_event_seconds must be <= 600")
+    data.capture_retention_days = float(
+        raw.get("capture_retention_days", data.capture_retention_days) or 0
+    )
+    if data.capture_retention_days < 0 or data.capture_retention_days > 3650:
+        raise ConfigError("display.capture_retention_days must be between 0 and 3650")
+    data.capture_max_gb = float(raw.get("capture_max_gb", data.capture_max_gb) or 0)
+    if data.capture_max_gb < 0 or data.capture_max_gb > 10_000:
+        raise ConfigError("display.capture_max_gb must be between 0 and 10000")
     data.cycle_focus = _bool(raw, "cycle_focus", data.cycle_focus)
     data.cycle_focus_seconds = _positive_float(
         raw, "cycle_focus_seconds", data.cycle_focus_seconds
