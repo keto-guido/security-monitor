@@ -130,6 +130,12 @@ display:
   clip_seconds: 15               # default Save clip length
   people_detection: false        # master switch (also enable per camera)
   object_detection: false        # packages / left-behind items vs baseline
+  encroachment_detection: false  # tripwire / polygon ROI alerts (also enable per camera)
+  encroachment_autofocus: false  # focus that camera while someone is in a zone
+  encroachment_alarm: true       # pulsing banner + strong tile highlight
+  encroachment_alarm_sound: true # beep on entry (and periodically while active)
+  cycle_focus: false             # auto-advance focused camera
+  cycle_focus_seconds: 10
 
 cameras:
   - name: Front Door
@@ -142,6 +148,11 @@ cameras:
     # rotate: 180           # 0 | 90 | 180 | 270 if the camera hangs upside-down
     # detect_people: false  # opt this camera into people boxes
     # detect_objects: false # opt this camera into "new object" boxes
+    # detect_encroachment: false
+    # encroach_zones:
+    #   - name: Porch
+    #     kind: polygon
+    #     points: [[0.05, 0.55], [0.95, 0.55], [0.95, 0.98], [0.05, 0.98]]
 ```
 
 Config search order:
@@ -176,6 +187,7 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `q` | Quit (or Exit from the options menu) |
 | `f` | Toggle fullscreen |
 | `1`–`9` | Focus that camera |
+| `n` / `p` | Next / previous camera (focus) |
 | `g` / `0` | Back to the grid |
 | Scroll wheel | Zoom in / out (toward the cursor) |
 | `+` / `-` | Zoom in / out |
@@ -190,7 +202,130 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu also has **Capture** (snapshot, clip length/format, save folder), **Detection** (people / new-object masters, per-camera includes, set empty-area baseline), **Video settings** (smooth buffer + rewind), and **Reboot cameras**. Settings are saved back into `config.yaml` when changed. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detection**, **Weather HUD**, **Home Assistant**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+
+### Weather HUD
+
+`Esc` → **Weather HUD…**:
+
+- Toggle the on-mosaic weather widget (Open-Meteo; no API key)
+- **Placement** — bottom left/right, between columns, between rows, or custom
+- **Place widget on layout…** — still frame of the mosaic; drag the widget (←→↑↓ nudge, Enter save, Esc cancel)
+- Fine X/Y and width/height for precise positioning
+- Toggle each line independently: temperature, conditions, storm warnings, lightning tracker
+- **Opacity** — blend the weather panel (← →); lower values let the camera show through
+- **Overlay cameras** — paint on top of full tiles instead of shrinking them around the widget
+- °F / °C units; optional `weather_latitude` / `weather_longitude` in config (blank = IP auto-locate)
+
+By default, camera tiles **shrink around** the widget so they never draw under it. When placed between two feeds, both cameras lose a shared strip. Turn on **Overlay cameras** (and lower **Opacity**) if you prefer a translucent HUD on top of the feed instead. Camera name/status strip opacity is under **Video settings** → **HUD opacity**.
+
+### Home Assistant (door sensors)
+
+`Esc` → **Home Assistant…** (local LAN only):
+
+1. Set HA base URL + a [long-lived access token](https://www.home-assistant.io/docs/authentication/)
+2. **Browse HA entities…** — pick a domain, then an entity from the live list
+3. Toggle which **state(s)** should alert (e.g. `on` / `open` / `unlocked`)
+4. Pick a **camera**, or **No camera** for HUD/popup-only alerts
+5. Choose notification types per link:
+   - **Popup toast** — temporary on-screen notice (not tied to a camera)
+   - **Persistent HUD strip** — stays while the sensor is active
+   - **Highlight / Autofocus** — requires a linked camera
+   - **Alarm sound**
+6. **Save link**
+
+**Light panel buttons…** — pin `light.*` / `switch.*` entities. Press **`]`** (or click the right-edge **HA** tab) to slide out the panel and tap buttons to toggle lights. Esc closes the panel.
+
+Example:
+
+```yaml
+display:
+  ha_enabled: true
+  ha_url: http://homeassistant.local:8123
+  ha_token: YOUR_LONG_LIVED_ACCESS_TOKEN
+  ha_popup_seconds: 5
+  ha_panel_enabled: true
+  ha_doors:
+    - entity_id: binary_sensor.front_door
+      label: Front door
+      camera: Front Door          # omit for popup/HUD only
+      open_states: [on]
+      notify_popup: true
+      notify_hud: true
+      notify_highlight: true
+      notify_autofocus: true
+      notify_sound: true
+  ha_lights:
+    - entity_id: light.kitchen
+      label: Kitchen
+```
+
+### Video decode (GPU / CPU)
+
+`Esc` → **Video settings**:
+
+- **Decode** — `auto` (prefer GPU, fall back to CPU), `cpu`, or `gpu`
+- **HW backend** — `auto`, `none`, or a specific FFmpeg accel (`cuda`, `qsv`, `vaapi`, `d3d11va`, `videotoolbox`)
+- **HUD opacity** — transparency of the camera name/status strip on each tile
+- **Decode status…** — OpenCV/FFmpeg capability summary plus the path each camera actually opened with (e.g. `auto/vaapi`, `cpu (fallback)`)
+
+Changing decode mode or backend reconnects streams. Optional `display.hwaccel_device` (e.g. `/dev/dri/renderD128`) is for VAAPI. Stock `opencv-python` wheels often still decode on the CPU even when hardware acceleration is requested — use `security-monitor check` to see what this build reports.
+
+### Person events (auto capture)
+
+`Esc` → **Detection** → **Auto person capture** (also **Person events…** on the root menu):
+
+- On rising edge (person appears), saves a **snapshot** with person boxes + date/time overlay
+- Records a clip with configurable **pre-roll** (from the rolling buffer), the time the person is present, and **post-roll** after they leave
+- Requires people detection master + per-camera include (`Cameras included…`)
+- Browse events as stamped snapshots; Enter opens the recording playback (Esc stops)
+- **Lock (keep forever)** so auto-erase / max-storage cleanup never removes that event
+
+Files land under `~/security-monitor/captures/events/<timestamp>_<camera>/` (`snapshot.jpg` + `clip.mp4`).
+
+### Saved captures
+
+`Esc` → **Saved captures…** (or **Capture** → **Browse saved captures…**):
+
+- List snapshots and clips newest-first
+- Open a file to preview (images + first frame of videos)
+- ← → browse neighboring files
+- **Lock (keep forever)** / **Unlock** — locked files are never auto-erased
+- **Show in folder** opens the OS file manager
+- **Delete** / **Delete all** with confirmation (delete-all skips locked files)
+
+**Storage cleanup** (`Esc` → **Capture**):
+
+- **Auto-erase after** — Off / 1d … 90d (unlocked only)
+- **Max storage** — Off / 1–100 GB; when over the cap, oldest unlocked items are removed first
+- **Erase old unlocked now…** — run a sweep immediately
+- Defaults: 14 days and 20 GB; person events and manual captures share the same rules
+
+### Cameras menu
+
+`Esc` → **Cameras…** updates `config.yaml` without hand-editing:
+
+- **Layout** — cycle grid size (1×1 … 4×4); empty slots show placeholders
+- **Cycle focus** — Off / 5s / 10s / 30s / 60s auto-advance (`n` / `p` also step manually)
+- **Arrange tiles** — ← → moves a camera earlier/later in the mosaic order
+- **Show / hide** — toggle `enabled` (hidden cameras stay in the file)
+- **Add camera** — RTSP/URL (on-screen text entry), webcam device 0/1, or a demo tile
+- **Remove camera** — delete from the running mosaic and from `config.yaml`
+
+### Encroachment (tripwire + polygon ROIs)
+
+`Esc` → **Detection**:
+
+- **Encroachment** — master switch (also turns on people detection)
+- **Autofocus on encroach** — while a person is in any zone, focus that camera; return to the grid when they leave
+- **On-screen alarm** — pulsing red mosaic banner + stronger tile border while active
+- **Alarm sound** — double beep on entry, then a reminder beep every few seconds while someone remains in a zone
+- **Cameras included…** — per-camera **encroach** opt-in
+- **Add tripwire preset** / **Tripwire zone side** / **Draw tripwire** — directed half-plane zones
+- **Add polygon preset** / **Draw polygon ROI** — click corners, **Enter** to finish (≥3 points); Esc cancels
+- **Clear all zones** — remove every ROI on the focused camera
+
+A camera can have **multiple zones** (mix of lines and polygons). Any person whose feet land inside a zone triggers highlight + alarm. Zones are stored under `encroach_zones` in `config.yaml` (legacy `encroach_line` still works as a fallback).
 
 ### Detection notes
 
@@ -198,7 +333,7 @@ The options menu also has **Capture** (snapshot, clip length/format, save folder
 
 **Seasonal drift:** You seed an empty-area baseline once. After that the baseline **slowly adapts** (hours-scale EMA) to leaves, snow texture, and lawn growth, and is saved back to disk periodically. Pixels under a confirmed package (and under people) are **frozen**, so a box left for days keeps its `new object` flag instead of being absorbed. A whole-scene shift with no packages (e.g. overnight snow) speeds up adaptation after it settles. Manual **Set empty-area baseline** still resets everything when you want a clean slate.
 
-- **People** and **new object** detection are off until you opt in globally **and** per camera (`Esc` → Detection).
+- **People**, **new object**, and **encroachment** detection are off until you opt in globally **and** per camera (`Esc` → Detection).
 - **Set empty-area baseline** while the porch/yard is clear (no packages). New persistent blobs vs that baseline get a `new object` box until they disappear.
 - First run downloads `yolov8n.pt` via Ultralytics (cached). OpenCV fallback models (if needed) go under `~/.cache/security-monitor/models/`.
 
@@ -227,13 +362,14 @@ python -m security_monitor       # same as security-monitor
 
 Each camera is read on its own thread and only the latest frame is kept, so a slow stream does not stall the others. The UI thread composites a grid, letterboxes (or crops) each tile, and draws name / status / FPS. Dropped streams retry on `reconnect_seconds`.
 
-OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-python`, not `opencv-python-headless`.
+OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-python`, not `opencv-python-headless`. Decode mode (`display.decode_mode` / Video settings) sets `OPENCV_FFMPEG_CAPTURE_OPTIONS` (`hwaccel=…`) when opening RTSP streams and falls back to software decode if the GPU path fails a smoke read.
 
 ## Troubleshooting
 
 - **NO SIGNAL / connect failed** — verify the URL in VLC first, then try `transport: tcp`.
 - **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python`.
-- **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost.
+- **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost. Try `decode_mode: cpu` if a bad GPU path stalls opens.
+- **Want GPU decode** — set `decode_mode: gpu` (or `auto`) and pick a backend under Video settings. Confirm with **Decode status…** or `security-monitor check`. Pip wheels frequently lack working CUDA/VAAPI decode; a custom OpenCV/FFmpeg build may be required.
 - **Linux display** — needs an X11/Wayland session. SSH needs X forwarding or a desktop.
 - **Squished / stretched mosaic on Linux** — OpenCV’s Qt window backend often reports the wrong window size (especially fullscreen). This build ignores bad rects and paints at the real screen size from `xrandr`. Update to the latest package, then:
   ```bash

@@ -13,6 +13,7 @@ import numpy as np
 
 from security_monitor.buffer import FrameHistory, HistoryView
 from security_monitor.config import CameraConfig, DisplayConfig
+from security_monitor.decode import apply_ffmpeg_capture_options
 
 Status = str  # live | reconnecting | disconnected | error | demo
 _OPEN_LOCK = threading.Lock()
@@ -27,6 +28,7 @@ class Snapshot:
     behind: float = 0.0
     buffered: float = 0.0
     rewinding: bool = False
+    decode: str = ""  # cpu | auto/vaapi | gpu/cuda | cpu (fallback) | ...
 
 
 class FrameSource(Protocol):
@@ -40,30 +42,24 @@ class FrameSource(Protocol):
     def apply_buffer_settings(self, display: DisplayConfig) -> None: ...
 
 
-def apply_ffmpeg_defaults(transport: str, *, low_latency: bool = True) -> None:
-    """FFmpeg options used by OpenCV's RTSP/RTP backend."""
-    options: list[str] = []
-    if transport == "tcp":
-        options.append("rtsp_transport;tcp")
-    elif transport == "udp":
-        options.append("rtsp_transport;udp")
-    if low_latency:
-        options.extend(
-            [
-                "fflags;nobuffer",
-                "flags;low_delay",
-                "max_delay;500000",
-            ]
-        )
-    else:
-        # Allow a little demux delay so smooth buffering has frames to work with.
-        options.extend(
-            [
-                "fflags;+genpts",
-                "max_delay;2000000",
-            ]
-        )
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(options)
+def apply_ffmpeg_defaults(
+    transport: str,
+    *,
+    low_latency: bool = True,
+    decode_mode: str = "auto",
+    hwaccel: str = "auto",
+    hwaccel_device: str = "",
+    force_cpu: bool = False,
+) -> str:
+    """FFmpeg options used by OpenCV's RTSP/RTP backend. Returns decode label."""
+    return apply_ffmpeg_capture_options(
+        transport,
+        low_latency=low_latency,
+        decode_mode=decode_mode,
+        hwaccel=hwaccel,
+        hwaccel_device=hwaccel_device,
+        force_cpu=force_cpu,
+    )
 
 
 class CameraWorker(threading.Thread):
@@ -84,6 +80,7 @@ class CameraWorker(threading.Thread):
         self._detail = "starting"
         self._fps = 0.0
         self._cap: cv2.VideoCapture | None = None
+        self._decode = "cpu"
         self.apply_buffer_settings(display)
 
     def apply_buffer_settings(self, display: DisplayConfig) -> None:
@@ -118,6 +115,7 @@ class CameraWorker(threading.Thread):
             status = self._status
             fps = self._fps
             detail = self._detail
+            decode = self._decode
         view = self._history_view(latest)
         return Snapshot(
             frame=view.frame.copy() if view.frame is not None else None,
@@ -127,6 +125,7 @@ class CameraWorker(threading.Thread):
             behind=view.behind,
             buffered=view.buffered,
             rewinding=view.rewinding,
+            decode=decode,
         )
 
     def _history_view(self, latest: np.ndarray | None) -> HistoryView:
@@ -177,24 +176,98 @@ class CameraWorker(threading.Thread):
 
     def _open(self) -> cv2.VideoCapture | None:
         source = self.camera.capture_source()
+        # Local webcams use OS backends — treat as CPU device capture.
+        if isinstance(source, int):
+            try:
+                cap = _create_capture(source)
+            except cv2.error:
+                return None
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+                return None
+            with self._lock:
+                self._decode = "cpu/device"
+            return self._finish_open(cap)
+
         transport = self.camera.transport or self.display.default_transport
         low_latency = not self.display.smooth_buffer
-        try:
-            with _OPEN_LOCK:
-                apply_ffmpeg_defaults(transport, low_latency=low_latency)
-                cap = _create_capture(source)
-        except cv2.error:
-            return None
-        if cap is None or not cap.isOpened():
+        decode_mode = getattr(self.display, "decode_mode", "auto")
+        hwaccel = getattr(self.display, "hwaccel", "auto")
+        hwaccel_device = getattr(self.display, "hwaccel_device", "") or ""
+
+        # Try preferred decode first; on failure fall back to CPU once.
+        attempts: list[bool] = [False]
+        if (decode_mode or "auto").lower() != "cpu" and (hwaccel or "auto").lower() != "none":
+            attempts = [False, True]  # GPU/auto request, then force CPU
+
+        last_label = "cpu"
+        for force_cpu in attempts:
+            try:
+                with _OPEN_LOCK:
+                    last_label = apply_ffmpeg_defaults(
+                        transport,
+                        low_latency=low_latency,
+                        decode_mode=decode_mode,
+                        hwaccel=hwaccel,
+                        hwaccel_device=hwaccel_device,
+                        force_cpu=force_cpu,
+                    )
+                    cap = _create_capture(source)
+            except cv2.error:
+                cap = None
+            if cap is not None and cap.isOpened():
+                # Confirm we can read at least one frame before accepting GPU path.
+                if not force_cpu and not self._smoke_read(cap):
+                    try:
+                        cap.release()
+                    except cv2.error:
+                        pass
+                    continue
+                label = last_label
+                if force_cpu and len(attempts) > 1:
+                    label = "cpu (fallback)"
+                with self._lock:
+                    self._decode = label
+                return self._finish_open(cap)
             if cap is not None:
-                cap.release()
-            return None
-        # Small OpenCV buffer when smoothing; single frame when chasing live.
+                try:
+                    cap.release()
+                except cv2.error:
+                    pass
+        with self._lock:
+            self._decode = last_label
+        return None
+
+    def _smoke_read(self, cap: cv2.VideoCapture) -> bool:
+        """Return True if the capture can produce a frame (GPU path sanity check)."""
+        try:
+            ok, frame = cap.read()
+        except cv2.error:
+            return False
+        return bool(ok and frame is not None and getattr(frame, "size", 0) > 0)
+
+    def _finish_open(self, cap: cv2.VideoCapture) -> cv2.VideoCapture:
         buf_size = 4 if self.display.smooth_buffer else 1
         cap.set(cv2.CAP_PROP_BUFFERSIZE, buf_size)
         _try_set(cap, "CAP_PROP_OPEN_TIMEOUT_MSEC", self.display.open_timeout_ms)
         _try_set(cap, "CAP_PROP_READ_TIMEOUT_MSEC", self.display.read_timeout_ms)
+        # Best-effort OpenCV HW acceleration property when present.
+        self._try_set_hw_acceleration(cap)
         return cap
+
+    def _try_set_hw_acceleration(self, cap: cv2.VideoCapture) -> None:
+        mode = (getattr(self.display, "decode_mode", "auto") or "auto").lower()
+        if mode == "cpu":
+            return
+        prop = getattr(cv2, "CAP_PROP_HW_ACCELERATION", None)
+        any_accel = getattr(cv2, "VIDEO_ACCELERATION_ANY", None)
+        if prop is None or any_accel is None:
+            return
+        try:
+            cap.set(prop, any_accel)
+        except cv2.error:
+            return
 
     def _release(self) -> None:
         cap = self._cap
@@ -276,6 +349,7 @@ class DemoWorker(threading.Thread):
             behind=view.behind,
             buffered=view.buffered,
             rewinding=view.rewinding,
+            decode="cpu/demo",
         )
 
     def run(self) -> None:

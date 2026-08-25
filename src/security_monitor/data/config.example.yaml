@@ -42,14 +42,92 @@ display:
   # Detection masters (also enable per camera below / in Esc → Detection).
   people_detection: false
   object_detection: false
+  # Encroachment: person in ROI → highlight (+ optional autofocus / alarm).
+  encroachment_detection: false
+  encroachment_autofocus: false
+  encroachment_alarm: true         # pulsing red banner + strong tile border
+  encroachment_alarm_sound: true   # beep on entry (+ every few seconds while in zone)
+  # Auto snapshot + pre/during/post clip when a person appears (Esc → Detection).
+  auto_person_capture: false
+  person_pre_roll_seconds: 5
+  person_post_roll_seconds: 5
+  person_max_event_seconds: 120
+  # Auto-erase unlocked captures/events (0 = off). Lock items in the browser to keep them.
+  capture_retention_days: 14
+  capture_max_gb: 20
+  # Stream decode (Esc → Video settings). auto tries GPU then falls back to CPU.
+  # Stock opencv-python wheels often still decode on CPU even when GPU is requested.
+  decode_mode: auto            # auto | cpu | gpu
+  hwaccel: auto                # auto | none | cuda | qsv | vaapi | d3d11va | videotoolbox
+  # hwaccel_device: /dev/dri/renderD128   # optional VAAPI render node
+  # Auto-advance focused camera (Esc → Cameras → Cycle focus). Off by default.
+  cycle_focus: false
+  cycle_focus_seconds: 10
+  # Local weather HUD (Esc → Weather HUD…). Cameras shrink around the widget.
+  weather_enabled: false
+  weather_slot: bottom_right   # bottom_left | bottom_right | between_h | between_v | custom
+  weather_x: 0.0               # fine offset (or custom top-left when slot=custom)
+  weather_y: 0.0
+  weather_w: 0.24
+  weather_h: 0.20
+  weather_units: f             # f | c
+  weather_show_temp: true
+  weather_show_conditions: true
+  weather_show_storm: true
+  weather_show_lightning: true
+  weather_opacity: 0.85        # 0.12–1.0; lower = more see-through over cameras
+  weather_overlay: false       # true = paint on top of full tiles (no shrink)
+  hud_opacity: 0.70            # camera name/status strip opacity
+  # weather_latitude: 30.27
+  # weather_longitude: -97.74
+  # weather_place: Austin
+  weather_refresh_seconds: 300
+  # Local Home Assistant door sensors (Esc → Home Assistant…).
+  ha_enabled: false
+  ha_url: http://homeassistant.local:8123
+  # ha_token: YOUR_LONG_LIVED_ACCESS_TOKEN
+  ha_poll_seconds: 2
+  ha_show_hud: true
+  ha_highlight: true
+  ha_autofocus: true
+  ha_alarm_sound: true
+  ha_hold_seconds: 20
+  ha_popup_seconds: 5
+  ha_panel_enabled: true
+  # ha_doors:
+  #   - entity_id: binary_sensor.front_door
+  #     label: Front door
+  #     camera: Front Door          # blank = HUD/popup only (no camera)
+  #     open_states: [on]
+  #     notify_popup: true          # temporary toast
+  #     notify_hud: true            # persistent open strip
+  #     notify_highlight: true
+  #     notify_autofocus: true
+  #     notify_sound: true
+  # ha_lights:                      # right-side slide-out panel (press ])
+  #   - entity_id: light.kitchen
+  #     label: Kitchen
 
 cameras:
   - name: Front Door
     url: rtsp://192.168.1.10:554/Streaming/Channels/101
     enabled: true
     type: ubiquiti
+    # ha_door_entity: binary_sensor.front_door   # optional 1:1 shortcut
+    # ha_door_label: Front door
     # detect_people: false
     # detect_objects: false
+    # detect_encroachment: false
+    # encroach_line: [0.0, 0.5, 1.0, 0.5]   # legacy single tripwire
+    # encroach_side: positive
+    # encroach_zones:
+    #   - name: Porch
+    #     kind: polygon
+    #     points: [[0.05, 0.55], [0.95, 0.55], [0.95, 0.98], [0.05, 0.98]]
+    #   - name: Gate line
+    #     kind: line
+    #     side: positive
+    #     points: [[0.0, 0.4], [1.0, 0.4]]
     # rotate: 180             # clockwise degrees if the camera is mounted upside-down
     # username: camera
     # password: secret

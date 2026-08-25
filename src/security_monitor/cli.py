@@ -232,6 +232,13 @@ def cmd_check(args: argparse.Namespace) -> int:
         f"Buffer: smooth={'on' if d.smooth_buffer else 'off'} ({d.smooth_buffer_seconds:g}s)  "
         f"rewind={'on' if d.rewind_buffer else 'off'} ({d.rewind_buffer_seconds:g}s)"
     )
+    from security_monitor.decode import decode_mode_label, opencv_decode_summary
+
+    print(
+        f"Decode: mode={d.decode_mode}  hwaccel={d.hwaccel}  "
+        f"({decode_mode_label(d.decode_mode, d.hwaccel)})"
+    )
+    print(f"  {opencv_decode_summary()}")
     from security_monitor.capture import default_save_directory, resolve_save_directory
 
     save_dir = resolve_save_directory(d.save_directory or str(default_save_directory()))

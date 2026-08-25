@@ -11,6 +11,9 @@ from security_monitor.buffer import FrameHistory
 from security_monitor.capture import (
     CaptureError,
     LiveClipJob,
+    delete_capture,
+    list_captures,
+    load_capture_preview,
     resolve_save_directory,
     save_snapshot,
     write_clip,
@@ -37,6 +40,25 @@ def test_write_clip_from_frames(tmp_path: Path) -> None:
     assert path.is_file()
     assert path.suffix in {".mp4", ".avi"}
     assert path.stat().st_size > 0
+
+
+def test_list_and_delete_captures(tmp_path: Path) -> None:
+    snap = save_snapshot(_frame(200), tmp_path, "Porch", fmt="jpg")
+    clip = write_clip([_frame(30 + i) for i in range(8)], tmp_path, "Gate", fps=10)
+    # Noise file should be ignored.
+    (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
+    items = list_captures(tmp_path)
+    names = {item.name for item in items}
+    assert snap.name in names
+    assert clip.name in names
+    assert all(item.kind in {"image", "video"} for item in items)
+    preview = load_capture_preview(snap)
+    assert preview is not None and preview.size > 0
+    delete_capture(snap)
+    assert not snap.is_file()
+    remaining = {item.name for item in list_captures(tmp_path)}
+    assert snap.name not in remaining
+    assert clip.name in remaining
 
 
 def test_write_clip_rejects_empty(tmp_path: Path) -> None:

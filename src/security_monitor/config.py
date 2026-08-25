@@ -13,12 +13,51 @@ from urllib.parse import quote, urlparse, urlunparse
 
 import yaml
 
+from security_monitor.encroachment import EncroachZone
+from security_monitor.home_assistant import (
+    HADoorMapping,
+    HALightControl,
+    door_mapping_to_dict,
+    light_control_to_dict,
+    normalize_ha_url,
+    parse_door_mappings,
+    parse_light_controls,
+)
+
 VALID_SCALE_MODES = ("fit", "fill", "stretch")
 VALID_TRANSPORTS = ("tcp", "udp", "auto")
 VALID_CAMERA_KINDS = ("ubiquiti", "reolink", "amcrest", "dahua")
 VALID_SCREEN_ROTATIONS = ("none", "normal", "left", "right", "inverted")
 VALID_CAMERA_ROTATIONS = (0, 90, 180, 270)
+VALID_DECODE_MODES = ("auto", "cpu", "gpu")
+VALID_HWACCELS = ("auto", "none", "cuda", "qsv", "vaapi", "d3d11va", "videotoolbox")
+VALID_ENCROACH_SIDES = ("positive", "negative")
+VALID_WEATHER_SLOTS = (
+    "bottom_left",
+    "bottom_right",
+    "between_h",
+    "between_v",
+    "custom",
+)
+VALID_WEATHER_UNITS = ("f", "c")
 URL_SCHEMES = ("rtsp", "rtp", "http", "https", "file", "rtmp")
+
+# Esc → Cameras → Layout presets (columns, rows).
+LAYOUT_PRESETS: tuple[tuple[int, int], ...] = (
+    (1, 1),
+    (1, 2),
+    (2, 1),
+    (2, 2),
+    (2, 3),
+    (3, 2),
+    (3, 3),
+    (4, 2),
+    (3, 4),
+    (4, 3),
+    (4, 4),
+)
+# 0 = cycle focus off; otherwise seconds between auto focus advances.
+CYCLE_FOCUS_CHOICES: tuple[float, ...] = (0.0, 5.0, 10.0, 30.0, 60.0)
 
 _CREDENTIALS_RE = re.compile(r"://([^:/?#]+):([^@/?#]+)@")
 
@@ -43,6 +82,15 @@ class CameraConfig:
     rotate: int = 0  # clockwise degrees: 0 | 90 | 180 | 270
     detect_people: bool = False
     detect_objects: bool = False
+    # Encroachment: tripwire / polygon ROIs (normalized coords).
+    detect_encroachment: bool = False
+    encroach_zones: list[EncroachZone] = field(default_factory=list)
+    # Legacy single tripwire (used when encroach_zones is empty).
+    encroach_line: tuple[float, float, float, float] | None = None
+    encroach_side: str = "positive"  # positive | negative
+    # Optional 1:1 Home Assistant door → this camera shortcut.
+    ha_door_entity: str = ""
+    ha_door_label: str = ""
 
     @property
     def is_device(self) -> bool:
@@ -101,6 +149,62 @@ class DisplayConfig:
     # Detection masters (still requires per-camera opt-in).
     people_detection: bool = False
     object_detection: bool = False
+    # Encroachment: person in ROI → highlight (+ optional autofocus / alarm).
+    encroachment_detection: bool = False
+    encroachment_autofocus: bool = False
+    encroachment_alarm: bool = True  # stronger on-screen alarm while in zone
+    encroachment_alarm_sound: bool = True  # beep on entry (+ periodic while active)
+    # Auto person events: snapshot + pre/during/post clip (Esc → Detection).
+    auto_person_capture: bool = False
+    person_pre_roll_seconds: float = 5.0
+    person_post_roll_seconds: float = 5.0
+    person_max_event_seconds: float = 120.0
+    # Auto-erase unlocked captures/events (0 = off). Locked items are kept.
+    capture_retention_days: float = 14.0
+    capture_max_gb: float = 20.0
+    # Stream decode: auto | cpu | gpu — hwaccel: auto | none | cuda | qsv | vaapi | d3d11va
+    decode_mode: str = "auto"
+    hwaccel: str = "auto"
+    hwaccel_device: str = ""  # e.g. /dev/dri/renderD128
+    # Auto-advance focused camera (0 / False = off). Menu: Esc → Cameras.
+    cycle_focus: bool = False
+    cycle_focus_seconds: float = 10.0
+    # Local weather HUD widget (Esc → Weather).
+    weather_enabled: bool = False
+    weather_slot: str = "bottom_right"  # bottom_left|bottom_right|between_h|between_v|custom
+    weather_x: float = 0.0  # custom top-left or fine-tune offset (grid-normalized)
+    weather_y: float = 0.0
+    weather_w: float = 0.24
+    weather_h: float = 0.20
+    weather_units: str = "f"  # f | c
+    weather_show_temp: bool = True
+    weather_show_conditions: bool = True
+    weather_show_storm: bool = True
+    weather_show_lightning: bool = True
+    # Weather widget blend (1.0 = solid). Useful when overlaying a camera feed.
+    weather_opacity: float = 0.85
+    # When true, cameras keep full tiles and the widget paints on top (see-through).
+    weather_overlay: bool = False
+    # Camera name/status strip opacity on each tile.
+    hud_opacity: float = 0.70
+    weather_latitude: float | None = None
+    weather_longitude: float | None = None
+    weather_place: str = ""
+    weather_refresh_seconds: float = 300.0
+    # Local Home Assistant door sensors (Esc → Home Assistant).
+    ha_enabled: bool = False
+    ha_url: str = "http://homeassistant.local:8123"
+    ha_token: str = ""
+    ha_poll_seconds: float = 2.0
+    ha_show_hud: bool = True
+    ha_highlight: bool = True
+    ha_autofocus: bool = True
+    ha_alarm_sound: bool = True
+    ha_hold_seconds: float = 20.0
+    ha_popup_seconds: float = 5.0
+    ha_panel_enabled: bool = True
+    ha_doors: list[HADoorMapping] = field(default_factory=list)
+    ha_lights: list[HALightControl] = field(default_factory=list)
 
     @property
     def tile_count(self) -> int:
@@ -109,6 +213,12 @@ class DisplayConfig:
     @property
     def canvas_size(self) -> tuple[int, int]:
         return self.columns * self.cell_width, self.rows * self.cell_height
+
+    @property
+    def cycle_focus_label(self) -> str:
+        if not self.cycle_focus or self.cycle_focus_seconds <= 0:
+            return "Off"
+        return f"{self.cycle_focus_seconds:g}s"
 
 
 @dataclass
@@ -218,12 +328,106 @@ def example_config_text() -> str:
     return files("security_monitor").joinpath("data/config.example.yaml").read_text(encoding="utf-8")
 
 
+def camera_to_dict(cam: CameraConfig) -> dict[str, Any]:
+    """Serialize a camera for YAML (only meaningful fields)."""
+    item: dict[str, Any] = {"name": cam.name}
+    if cam.device is not None:
+        item["device"] = int(cam.device)
+    if cam.url:
+        item["url"] = cam.url
+    item["enabled"] = bool(cam.enabled)
+    if cam.transport:
+        item["transport"] = cam.transport
+    if cam.username:
+        item["username"] = cam.username
+    if cam.password:
+        item["password"] = cam.password
+    if cam.kind:
+        item["type"] = cam.kind
+    if not cam.reboot:
+        item["reboot"] = False
+    if cam.ssh_port != 22:
+        item["ssh_port"] = int(cam.ssh_port)
+    if cam.http_port != 80:
+        item["http_port"] = int(cam.http_port)
+    if cam.rotate:
+        item["rotate"] = int(cam.rotate)
+    if cam.detect_people:
+        item["detect_people"] = True
+    if cam.detect_objects:
+        item["detect_objects"] = True
+    if cam.detect_encroachment:
+        item["detect_encroachment"] = True
+    if cam.encroach_zones:
+        from security_monitor.encroachment import zone_to_dict
+
+        item["encroach_zones"] = [zone_to_dict(z) for z in cam.encroach_zones]
+    if cam.encroach_line is not None:
+        item["encroach_line"] = [float(v) for v in cam.encroach_line]
+    if cam.encroach_side and cam.encroach_side != "positive":
+        item["encroach_side"] = str(cam.encroach_side)
+    if cam.ha_door_entity:
+        item["ha_door_entity"] = str(cam.ha_door_entity)
+    if cam.ha_door_label:
+        item["ha_door_label"] = str(cam.ha_door_label)
+    return item
+
+
+def unique_camera_name(cameras: list[CameraConfig], base: str) -> str:
+    base = (base or "Camera").strip() or "Camera"
+    taken = {cam.name.strip().lower() for cam in cameras}
+    if base.lower() not in taken:
+        return base
+    for n in range(2, 10000):
+        candidate = f"{base} {n}"
+        if candidate.lower() not in taken:
+            return candidate
+    return f"{base} copy"
+
+
+def next_layout_preset(columns: int, rows: int, step: int = 1) -> tuple[int, int]:
+    current = (int(columns), int(rows))
+    presets = list(LAYOUT_PRESETS)
+    if current not in presets:
+        presets.append(current)
+        presets.sort(key=lambda p: (p[0] * p[1], p[0], p[1]))
+    index = presets.index(current)
+    return presets[(index + int(step)) % len(presets)]
+
+
+def move_camera(cameras: list[CameraConfig], index: int, direction: int) -> int:
+    """Swap camera at index with neighbor (direction -1 earlier, +1 later)."""
+    if index < 0 or index >= len(cameras):
+        return index
+    target = index + (1 if direction > 0 else -1)
+    if target < 0 or target >= len(cameras):
+        return index
+    cameras[index], cameras[target] = cameras[target], cameras[index]
+    return target
+
+
+def ensure_layout_fits(display: DisplayConfig, enabled_count: int) -> bool:
+    """Grow columns/rows to the next preset that fits enabled_count. Return True if changed."""
+    if enabled_count <= display.tile_count:
+        return False
+    for cols, rows in LAYOUT_PRESETS:
+        if cols * rows >= enabled_count:
+            display.columns = cols
+            display.rows = rows
+            return True
+    # Fall back to a wide strip.
+    display.columns = max(1, enabled_count)
+    display.rows = 1
+    return True
+
+
 def save_display_settings(config: AppConfig) -> Path | None:
     """
-    Persist buffer/rewind/capture/detection toggles back into config.yaml.
+    Persist display + camera list settings back into config.yaml.
 
-    Returns the path written, or None if there is no config file to update
-    (e.g. pure demo mode).
+    Writes layout, buffers, capture, detection, focus cycling, and the full
+    cameras list (order, enabled, urls, …). Returns the path written, or None
+    if there is no config file (e.g. pure demo mode).
     """
     path = config.path
     if path is None:
@@ -239,6 +443,8 @@ def save_display_settings(config: AppConfig) -> Path | None:
         display = {}
         raw["display"] = display
     d = config.display
+    display["columns"] = int(d.columns)
+    display["rows"] = int(d.rows)
     display["smooth_buffer"] = bool(d.smooth_buffer)
     display["smooth_buffer_seconds"] = float(d.smooth_buffer_seconds)
     display["rewind_buffer"] = bool(d.rewind_buffer)
@@ -248,19 +454,56 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["clip_seconds"] = float(d.clip_seconds)
     display["people_detection"] = bool(d.people_detection)
     display["object_detection"] = bool(d.object_detection)
+    display["encroachment_detection"] = bool(d.encroachment_detection)
+    display["encroachment_autofocus"] = bool(d.encroachment_autofocus)
+    display["encroachment_alarm"] = bool(d.encroachment_alarm)
+    display["encroachment_alarm_sound"] = bool(d.encroachment_alarm_sound)
+    display["auto_person_capture"] = bool(d.auto_person_capture)
+    display["person_pre_roll_seconds"] = float(d.person_pre_roll_seconds)
+    display["person_post_roll_seconds"] = float(d.person_post_roll_seconds)
+    display["person_max_event_seconds"] = float(d.person_max_event_seconds)
+    display["capture_retention_days"] = float(d.capture_retention_days)
+    display["capture_max_gb"] = float(d.capture_max_gb)
+    display["decode_mode"] = str(d.decode_mode)
+    display["hwaccel"] = str(d.hwaccel)
+    display["hwaccel_device"] = str(d.hwaccel_device or "")
+    display["cycle_focus"] = bool(d.cycle_focus)
+    display["cycle_focus_seconds"] = float(d.cycle_focus_seconds)
+    display["weather_enabled"] = bool(d.weather_enabled)
+    display["weather_slot"] = str(d.weather_slot)
+    display["weather_x"] = float(d.weather_x)
+    display["weather_y"] = float(d.weather_y)
+    display["weather_w"] = float(d.weather_w)
+    display["weather_h"] = float(d.weather_h)
+    display["weather_units"] = str(d.weather_units)
+    display["weather_show_temp"] = bool(d.weather_show_temp)
+    display["weather_show_conditions"] = bool(d.weather_show_conditions)
+    display["weather_show_storm"] = bool(d.weather_show_storm)
+    display["weather_show_lightning"] = bool(d.weather_show_lightning)
+    display["weather_opacity"] = float(d.weather_opacity)
+    display["weather_overlay"] = bool(d.weather_overlay)
+    display["hud_opacity"] = float(d.hud_opacity)
+    if d.weather_latitude is not None:
+        display["weather_latitude"] = float(d.weather_latitude)
+    if d.weather_longitude is not None:
+        display["weather_longitude"] = float(d.weather_longitude)
+    display["weather_place"] = str(d.weather_place or "")
+    display["weather_refresh_seconds"] = float(d.weather_refresh_seconds)
+    display["ha_enabled"] = bool(d.ha_enabled)
+    display["ha_url"] = str(d.ha_url or "")
+    display["ha_token"] = str(d.ha_token or "")
+    display["ha_poll_seconds"] = float(d.ha_poll_seconds)
+    display["ha_show_hud"] = bool(d.ha_show_hud)
+    display["ha_highlight"] = bool(d.ha_highlight)
+    display["ha_autofocus"] = bool(d.ha_autofocus)
+    display["ha_alarm_sound"] = bool(d.ha_alarm_sound)
+    display["ha_hold_seconds"] = float(d.ha_hold_seconds)
+    display["ha_popup_seconds"] = float(d.ha_popup_seconds)
+    display["ha_panel_enabled"] = bool(d.ha_panel_enabled)
+    display["ha_doors"] = [door_mapping_to_dict(door) for door in d.ha_doors]
+    display["ha_lights"] = [light_control_to_dict(light) for light in d.ha_lights]
 
-    cameras_raw = raw.get("cameras")
-    if isinstance(cameras_raw, list):
-        by_name = {cam.name: cam for cam in config.cameras}
-        for item in cameras_raw:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").strip()
-            cam = by_name.get(name)
-            if cam is None:
-                continue
-            item["detect_people"] = bool(cam.detect_people)
-            item["detect_objects"] = bool(cam.detect_objects)
+    raw["cameras"] = [camera_to_dict(cam) for cam in config.cameras]
 
     path.write_text(
         yaml.safe_dump(raw, sort_keys=False, default_flow_style=False),
@@ -329,6 +572,134 @@ def _parse_display(raw: Any) -> DisplayConfig:
         raise ConfigError("display.clip_seconds must be <= 300")
     data.people_detection = _bool(raw, "people_detection", data.people_detection)
     data.object_detection = _bool(raw, "object_detection", data.object_detection)
+    data.encroachment_detection = _bool(
+        raw, "encroachment_detection", data.encroachment_detection
+    )
+    data.encroachment_autofocus = _bool(
+        raw, "encroachment_autofocus", data.encroachment_autofocus
+    )
+    data.encroachment_alarm = _bool(raw, "encroachment_alarm", data.encroachment_alarm)
+    data.encroachment_alarm_sound = _bool(
+        raw, "encroachment_alarm_sound", data.encroachment_alarm_sound
+    )
+    data.auto_person_capture = _bool(raw, "auto_person_capture", data.auto_person_capture)
+    data.person_pre_roll_seconds = _positive_float(
+        raw, "person_pre_roll_seconds", data.person_pre_roll_seconds
+    )
+    if data.person_pre_roll_seconds > 60:
+        raise ConfigError("display.person_pre_roll_seconds must be <= 60")
+    data.person_post_roll_seconds = _positive_float(
+        raw, "person_post_roll_seconds", data.person_post_roll_seconds
+    )
+    if data.person_post_roll_seconds > 60:
+        raise ConfigError("display.person_post_roll_seconds must be <= 60")
+    data.person_max_event_seconds = _positive_float(
+        raw, "person_max_event_seconds", data.person_max_event_seconds
+    )
+    if data.person_max_event_seconds > 600:
+        raise ConfigError("display.person_max_event_seconds must be <= 600")
+    data.capture_retention_days = float(
+        raw.get("capture_retention_days", data.capture_retention_days) or 0
+    )
+    if data.capture_retention_days < 0 or data.capture_retention_days > 3650:
+        raise ConfigError("display.capture_retention_days must be between 0 and 3650")
+    data.capture_max_gb = float(raw.get("capture_max_gb", data.capture_max_gb) or 0)
+    if data.capture_max_gb < 0 or data.capture_max_gb > 10_000:
+        raise ConfigError("display.capture_max_gb must be between 0 and 10000")
+    data.decode_mode = str(raw.get("decode_mode", data.decode_mode)).strip().lower() or "auto"
+    if data.decode_mode not in VALID_DECODE_MODES:
+        raise ConfigError(f"display.decode_mode must be one of {VALID_DECODE_MODES}")
+    data.hwaccel = str(raw.get("hwaccel", data.hwaccel)).strip().lower() or "auto"
+    if data.hwaccel not in VALID_HWACCELS:
+        raise ConfigError(f"display.hwaccel must be one of {VALID_HWACCELS}")
+    data.hwaccel_device = str(raw.get("hwaccel_device", data.hwaccel_device) or "").strip()
+    data.cycle_focus = _bool(raw, "cycle_focus", data.cycle_focus)
+    data.cycle_focus_seconds = _positive_float(
+        raw, "cycle_focus_seconds", data.cycle_focus_seconds
+    )
+    if data.cycle_focus_seconds > 600:
+        raise ConfigError("display.cycle_focus_seconds must be <= 600")
+    data.weather_enabled = _bool(raw, "weather_enabled", data.weather_enabled)
+    data.weather_slot = str(raw.get("weather_slot", data.weather_slot)).strip().lower() or "bottom_right"
+    if data.weather_slot not in VALID_WEATHER_SLOTS:
+        raise ConfigError(f"display.weather_slot must be one of {VALID_WEATHER_SLOTS}")
+    data.weather_x = float(raw.get("weather_x", data.weather_x) or 0.0)
+    data.weather_y = float(raw.get("weather_y", data.weather_y) or 0.0)
+    data.weather_w = float(raw.get("weather_w", data.weather_w) or data.weather_w)
+    data.weather_h = float(raw.get("weather_h", data.weather_h) or data.weather_h)
+    if not (0.08 <= data.weather_w <= 0.6):
+        raise ConfigError("display.weather_w must be between 0.08 and 0.6")
+    if not (0.08 <= data.weather_h <= 0.5):
+        raise ConfigError("display.weather_h must be between 0.08 and 0.5")
+    data.weather_units = str(raw.get("weather_units", data.weather_units)).strip().lower() or "f"
+    if data.weather_units in {"fahrenheit", "f°", "°f"}:
+        data.weather_units = "f"
+    if data.weather_units in {"celsius", "c°", "°c"}:
+        data.weather_units = "c"
+    if data.weather_units not in VALID_WEATHER_UNITS:
+        raise ConfigError(f"display.weather_units must be one of {VALID_WEATHER_UNITS}")
+    data.weather_show_temp = _bool(raw, "weather_show_temp", data.weather_show_temp)
+    data.weather_show_conditions = _bool(
+        raw, "weather_show_conditions", data.weather_show_conditions
+    )
+    data.weather_show_storm = _bool(raw, "weather_show_storm", data.weather_show_storm)
+    data.weather_show_lightning = _bool(
+        raw, "weather_show_lightning", data.weather_show_lightning
+    )
+    data.weather_opacity = float(raw.get("weather_opacity", data.weather_opacity) or data.weather_opacity)
+    if data.weather_opacity > 1.0 and data.weather_opacity <= 100.0:
+        data.weather_opacity = data.weather_opacity / 100.0
+    if not (0.12 <= data.weather_opacity <= 1.0):
+        raise ConfigError("display.weather_opacity must be between 0.12 and 1.0")
+    data.weather_overlay = _bool(raw, "weather_overlay", data.weather_overlay)
+    data.hud_opacity = float(raw.get("hud_opacity", data.hud_opacity) or data.hud_opacity)
+    if data.hud_opacity > 1.0 and data.hud_opacity <= 100.0:
+        data.hud_opacity = data.hud_opacity / 100.0
+    if not (0.12 <= data.hud_opacity <= 1.0):
+        raise ConfigError("display.hud_opacity must be between 0.12 and 1.0")
+    if "weather_latitude" in raw and raw.get("weather_latitude") is not None:
+        try:
+            data.weather_latitude = float(raw.get("weather_latitude"))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("display.weather_latitude must be a number") from exc
+    if "weather_longitude" in raw and raw.get("weather_longitude") is not None:
+        try:
+            data.weather_longitude = float(raw.get("weather_longitude"))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("display.weather_longitude must be a number") from exc
+    data.weather_place = str(raw.get("weather_place", data.weather_place) or "").strip()
+    data.weather_refresh_seconds = _positive_float(
+        raw, "weather_refresh_seconds", data.weather_refresh_seconds
+    )
+    if data.weather_refresh_seconds < 60 or data.weather_refresh_seconds > 7200:
+        raise ConfigError("display.weather_refresh_seconds must be between 60 and 7200")
+    data.ha_enabled = _bool(raw, "ha_enabled", data.ha_enabled)
+    data.ha_url = normalize_ha_url(str(raw.get("ha_url", data.ha_url) or data.ha_url))
+    data.ha_token = str(raw.get("ha_token", data.ha_token) or "").strip()
+    data.ha_poll_seconds = float(raw.get("ha_poll_seconds", data.ha_poll_seconds) or data.ha_poll_seconds)
+    if not (0.5 <= data.ha_poll_seconds <= 60.0):
+        raise ConfigError("display.ha_poll_seconds must be between 0.5 and 60")
+    data.ha_show_hud = _bool(raw, "ha_show_hud", data.ha_show_hud)
+    data.ha_highlight = _bool(raw, "ha_highlight", data.ha_highlight)
+    data.ha_autofocus = _bool(raw, "ha_autofocus", data.ha_autofocus)
+    data.ha_alarm_sound = _bool(raw, "ha_alarm_sound", data.ha_alarm_sound)
+    data.ha_hold_seconds = float(raw.get("ha_hold_seconds", data.ha_hold_seconds) or data.ha_hold_seconds)
+    if not (0.0 <= data.ha_hold_seconds <= 300.0):
+        raise ConfigError("display.ha_hold_seconds must be between 0 and 300")
+    data.ha_popup_seconds = float(
+        raw.get("ha_popup_seconds", data.ha_popup_seconds) or data.ha_popup_seconds
+    )
+    if not (1.0 <= data.ha_popup_seconds <= 60.0):
+        raise ConfigError("display.ha_popup_seconds must be between 1 and 60")
+    data.ha_panel_enabled = _bool(raw, "ha_panel_enabled", data.ha_panel_enabled)
+    try:
+        data.ha_doors = parse_door_mappings(raw.get("ha_doors", data.ha_doors))
+    except ValueError as exc:
+        raise ConfigError(f"display.{exc}") from exc
+    try:
+        data.ha_lights = parse_light_controls(raw.get("ha_lights", data.ha_lights))
+    except ValueError as exc:
+        raise ConfigError(f"display.{exc}") from exc
     return data
 
 
@@ -401,6 +772,29 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
             raise ConfigError(
                 f"cameras[{index}].rotate must be one of {VALID_CAMERA_ROTATIONS}"
             )
+    encroach_line = None
+    if "encroach_line" in raw and raw.get("encroach_line") is not None:
+        try:
+            from security_monitor.encroachment import parse_encroach_line
+
+            encroach_line = parse_encroach_line(raw.get("encroach_line"))
+        except ValueError as exc:
+            raise ConfigError(f"cameras[{index}].{exc}") from exc
+    encroach_side = str(raw.get("encroach_side", "positive") or "positive").strip().lower()
+    if encroach_side not in VALID_ENCROACH_SIDES:
+        raise ConfigError(
+            f"cameras[{index}].encroach_side must be one of {VALID_ENCROACH_SIDES}"
+        )
+    encroach_zones: list[EncroachZone] = []
+    if "encroach_zones" in raw and raw.get("encroach_zones") is not None:
+        try:
+            from security_monitor.encroachment import parse_encroach_zones
+
+            encroach_zones = parse_encroach_zones(raw.get("encroach_zones"))
+        except ValueError as exc:
+            raise ConfigError(f"cameras[{index}].{exc}") from exc
+    ha_door_entity = str(raw.get("ha_door_entity", "") or "").strip()
+    ha_door_label = str(raw.get("ha_door_label", "") or "").strip()
     return CameraConfig(
         name=name,
         url=url,
@@ -416,6 +810,12 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
         rotate=rotate,
         detect_people=_bool(raw, "detect_people", False),
         detect_objects=_bool(raw, "detect_objects", False),
+        detect_encroachment=_bool(raw, "detect_encroachment", False),
+        encroach_zones=encroach_zones,
+        encroach_line=encroach_line,
+        encroach_side=encroach_side,
+        ha_door_entity=ha_door_entity,
+        ha_door_label=ha_door_label,
     )
 
 
