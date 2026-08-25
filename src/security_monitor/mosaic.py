@@ -137,12 +137,16 @@ from security_monitor.retention import (
 )
 from security_monitor.stream import Snapshot, build_sources
 from security_monitor.weather import (
+    HUD_OPACITY_CHOICES,
+    WEATHER_OPACITY_CHOICES,
     WeatherRect,
     WeatherService,
     compute_tile_rects,
     draw_weather_widget,
+    next_opacity,
     next_weather_slot,
     nudge_norm,
+    opacity_label,
     resolve_weather_rect,
     slot_label,
 )
@@ -533,6 +537,8 @@ class MosaicApp:
         self._grid_x, self._grid_y = x_off, y_off
         reserved = self._resolve_weather_rect(width, height, x_off, y_off, grid_w, grid_h)
         self._weather_rect = reserved
+        # Overlay mode keeps full camera tiles and paints weather on top.
+        shrink = None if (reserved is None or d.weather_overlay) else reserved
         tile_rects = compute_tile_rects(
             columns=d.columns,
             rows=d.rows,
@@ -540,7 +546,7 @@ class MosaicApp:
             cell_h=cell_h,
             grid_x=x_off,
             grid_y=y_off,
-            reserved=reserved,
+            reserved=shrink,
         )
         zoomed = self.view_zoom > 1.001
         any_rewind = False
@@ -621,6 +627,7 @@ class MosaicApp:
             show_conditions=d.weather_show_conditions,
             show_storm=d.weather_show_storm,
             show_lightning=d.weather_show_lightning,
+            opacity=d.weather_opacity,
             editing=editing,
         )
 
@@ -642,7 +649,8 @@ class MosaicApp:
         )
         self._weather_rect = reserved
         if reserved is not None:
-            # Show how cameras would shrink around the widget.
+            # Preview layout impact: shrink outlines unless overlay mode.
+            shrink = None if d.weather_overlay else reserved
             tile_rects = compute_tile_rects(
                 columns=d.columns,
                 rows=d.rows,
@@ -650,7 +658,7 @@ class MosaicApp:
                 cell_h=self._cell_h,
                 grid_x=self._grid_x,
                 grid_y=self._grid_y,
-                reserved=reserved,
+                reserved=shrink,
             )
             for tx, ty, tw, th in tile_rects:
                 if tw > 2 and th > 2:
@@ -843,7 +851,14 @@ class MosaicApp:
             shown = self._stable_fps(name, snap.fps)
             fps_text = f"{shown:2d} fps" if shown else "-- fps"
         alert = bool(self._encroach_active.get(name))
-        draw_status_bar(tile, name, snap, fps_text, encroach=alert)
+        draw_status_bar(
+            tile,
+            name,
+            snap,
+            fps_text,
+            encroach=alert,
+            hud_opacity=self.display.hud_opacity,
+        )
         if self._zone_edit_name == name:
             if self._zone_edit_mode == "polygon":
                 n = len(self._zone_edit_points)
@@ -1173,6 +1188,7 @@ class MosaicApp:
                 ("rewind_length", f"Rewind length: {d.rewind_buffer_seconds:g}s"),
                 ("decode_mode", f"Decode: {d.decode_mode.upper()} — {decode}"),
                 ("hwaccel", f"HW backend: {d.hwaccel}"),
+                ("hud_opacity", f"HUD opacity: {opacity_label(d.hud_opacity)}"),
                 ("decode_status", "Decode status…"),
                 ("video_back", "Back"),
             ]
@@ -1356,6 +1372,11 @@ class MosaicApp:
                 ("weather_toggle", f"Weather HUD: {enabled}"),
                 ("weather_slot", f"Placement: {slot_label(d.weather_slot)}"),
                 ("weather_place", "Place widget on layout…"),
+                ("weather_opacity", f"Opacity: {opacity_label(d.weather_opacity)}  (← →)"),
+                (
+                    "weather_overlay",
+                    f"Overlay cameras: {'On' if d.weather_overlay else 'Off'}",
+                ),
                 ("weather_nudge_x", f"Fine X: {d.weather_x:+.2f}  (← →)"),
                 ("weather_nudge_y", f"Fine Y: {d.weather_y:+.2f}  (← →)"),
                 ("weather_size_w", f"Width: {d.weather_w:.2f}"),
@@ -1485,6 +1506,16 @@ class MosaicApp:
             )
         elif action == "weather_slot":
             self._adjust_menu_item("weather_slot", 1)
+        elif action == "weather_opacity":
+            self._adjust_menu_item("weather_opacity", 1)
+        elif action == "weather_overlay":
+            self.display.weather_overlay = not self.display.weather_overlay
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = (
+                "Weather overlays cameras"
+                if self.display.weather_overlay
+                else "Weather reserves camera space"
+            )
         elif action == "weather_place":
             self._start_weather_place_editor()
         elif action in {
@@ -1717,6 +1748,8 @@ class MosaicApp:
             self._adjust_menu_item("decode_mode", 1)
         elif action == "hwaccel":
             self._adjust_menu_item("hwaccel", 1)
+        elif action == "hud_opacity":
+            self._adjust_menu_item("hud_opacity", 1)
         elif action == "decode_status":
             self._menu_page = "decode_status"
             self._menu_index = 0
@@ -1841,6 +1874,12 @@ class MosaicApp:
             )
             if previous != self.display.decode_mode:
                 self._reconnect_all()
+        elif action == "hud_opacity":
+            self.display.hud_opacity = next_opacity(
+                HUD_OPACITY_CHOICES, self.display.hud_opacity, step
+            )
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = f"HUD opacity {opacity_label(self.display.hud_opacity)}"
         elif action == "hwaccel":
             previous = self.display.hwaccel
             self.display.hwaccel = next_hwaccel(self.display.hwaccel, step)
@@ -1955,6 +1994,12 @@ class MosaicApp:
                 self.display.weather_y = 0.0
             self._apply_buffer_settings(persist=True)
             self._reboot_notice = slot_label(self.display.weather_slot)
+        elif action == "weather_opacity":
+            self.display.weather_opacity = next_opacity(
+                WEATHER_OPACITY_CHOICES, self.display.weather_opacity, step
+            )
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = f"Weather opacity {opacity_label(self.display.weather_opacity)}"
         elif action == "weather_nudge_x":
             self.display.weather_x = nudge_norm(self.display.weather_x, 0.02 * step)
             if self.display.weather_slot != "custom":
@@ -1977,6 +2022,7 @@ class MosaicApp:
             "weather_conditions",
             "weather_storm",
             "weather_lightning",
+            "weather_overlay",
         }:
             self._activate_menu(action)
         elif action == "layout":
@@ -3030,6 +3076,7 @@ class MosaicApp:
         reserved = None
         if include_weather and d.weather_enabled:
             reserved = self._resolve_weather_rect(width, height, x_off, y_off, grid_w, grid_h)
+        shrink = None if (reserved is None or d.weather_overlay) else reserved
         tile_rects = compute_tile_rects(
             columns=d.columns,
             rows=d.rows,
@@ -3037,7 +3084,7 @@ class MosaicApp:
             cell_h=cell_h,
             grid_x=x_off,
             grid_y=y_off,
-            reserved=reserved,
+            reserved=shrink,
         )
         for index in range(d.tile_count):
             tx, ty, tw, th = tile_rects[index]
@@ -3777,11 +3824,13 @@ def draw_status_bar(
     fps_text: str | None,
     *,
     encroach: bool = False,
+    hud_opacity: float = 0.70,
 ) -> None:
     h, w = tile.shape[:2]
     bar_h = max(34, int(h * 0.08))
     fade = max(10, bar_h // 3)
-    shade_bottom_bar(tile, bar_h, alpha=0.70, fade=fade)
+    alpha = max(0.12, min(1.0, float(hud_opacity)))
+    shade_bottom_bar(tile, bar_h, alpha=alpha, fade=fade)
     color = (40, 70, 255) if encroach else STATUS_COLOR.get(snap.status, (180, 180, 180))
     cy = h - bar_h // 2
     name_size = max(14, min(22, int(h * 0.038)))

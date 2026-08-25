@@ -213,9 +213,11 @@ The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detec
 - **Place widget on layout…** — still frame of the mosaic; drag the widget (←→↑↓ nudge, Enter save, Esc cancel)
 - Fine X/Y and width/height for precise positioning
 - Toggle each line independently: temperature, conditions, storm warnings, lightning tracker
+- **Opacity** — blend the weather panel (← →); lower values let the camera show through
+- **Overlay cameras** — paint on top of full tiles instead of shrinking them around the widget
 - °F / °C units; optional `weather_latitude` / `weather_longitude` in config (blank = IP auto-locate)
 
-Camera tiles **shrink around** the widget — they never draw under it. When placed between two feeds, both cameras lose a shared strip so one camera is not fully blocked.
+By default, camera tiles **shrink around** the widget so they never draw under it. When placed between two feeds, both cameras lose a shared strip. Turn on **Overlay cameras** (and lower **Opacity**) if you prefer a translucent HUD on top of the feed instead. Camera name/status strip opacity is under **Video settings** → **HUD opacity**.
 
 ### Video decode (GPU / CPU)
 
@@ -223,6 +225,7 @@ Camera tiles **shrink around** the widget — they never draw under it. When pla
 
 - **Decode** — `auto` (prefer GPU, fall back to CPU), `cpu`, or `gpu`
 - **HW backend** — `auto`, `none`, or a specific FFmpeg accel (`cuda`, `qsv`, `vaapi`, `d3d11va`, `videotoolbox`)
+- **HUD opacity** — transparency of the camera name/status strip on each tile
 - **Decode status…** — OpenCV/FFmpeg capability summary plus the path each camera actually opened with (e.g. `auto/vaapi`, `cpu (fallback)`)
 
 Changing decode mode or backend reconnects streams. Optional `display.hwaccel_device` (e.g. `/dev/dri/renderD128`) is for VAAPI. Stock `opencv-python` wheels often still decode on the CPU even when hardware acceleration is requested — use `security-monitor check` to see what this build reports.

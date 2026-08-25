@@ -169,6 +169,12 @@ class DisplayConfig:
     weather_show_conditions: bool = True
     weather_show_storm: bool = True
     weather_show_lightning: bool = True
+    # Weather widget blend (1.0 = solid). Useful when overlaying a camera feed.
+    weather_opacity: float = 0.85
+    # When true, cameras keep full tiles and the widget paints on top (see-through).
+    weather_overlay: bool = False
+    # Camera name/status strip opacity on each tile.
+    hud_opacity: float = 0.70
     weather_latitude: float | None = None
     weather_longitude: float | None = None
     weather_place: str = ""
@@ -444,6 +450,9 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["weather_show_conditions"] = bool(d.weather_show_conditions)
     display["weather_show_storm"] = bool(d.weather_show_storm)
     display["weather_show_lightning"] = bool(d.weather_show_lightning)
+    display["weather_opacity"] = float(d.weather_opacity)
+    display["weather_overlay"] = bool(d.weather_overlay)
+    display["hud_opacity"] = float(d.hud_opacity)
     if d.weather_latitude is not None:
         display["weather_latitude"] = float(d.weather_latitude)
     if d.weather_longitude is not None:
@@ -594,6 +603,17 @@ def _parse_display(raw: Any) -> DisplayConfig:
     data.weather_show_lightning = _bool(
         raw, "weather_show_lightning", data.weather_show_lightning
     )
+    data.weather_opacity = float(raw.get("weather_opacity", data.weather_opacity) or data.weather_opacity)
+    if data.weather_opacity > 1.0 and data.weather_opacity <= 100.0:
+        data.weather_opacity = data.weather_opacity / 100.0
+    if not (0.12 <= data.weather_opacity <= 1.0):
+        raise ConfigError("display.weather_opacity must be between 0.12 and 1.0")
+    data.weather_overlay = _bool(raw, "weather_overlay", data.weather_overlay)
+    data.hud_opacity = float(raw.get("hud_opacity", data.hud_opacity) or data.hud_opacity)
+    if data.hud_opacity > 1.0 and data.hud_opacity <= 100.0:
+        data.hud_opacity = data.hud_opacity / 100.0
+    if not (0.12 <= data.hud_opacity <= 1.0):
+        raise ConfigError("display.hud_opacity must be between 0.12 and 1.0")
     if "weather_latitude" in raw and raw.get("weather_latitude") is not None:
         try:
             data.weather_latitude = float(raw.get("weather_latitude"))

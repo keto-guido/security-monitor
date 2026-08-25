@@ -11,11 +11,14 @@ from security_monitor.weather import (
     WeatherSnapshot,
     compute_tile_rects,
     draw_weather_widget,
+    next_opacity,
     next_weather_slot,
+    opacity_label,
     resolve_weather_rect,
     shrink_tile_from_reserved,
     slot_label,
     wmo_label,
+    WEATHER_OPACITY_CHOICES,
 )
 
 
@@ -115,6 +118,26 @@ def test_draw_weather_widget_smoke() -> None:
     assert canvas[250, 420].sum() > 0
 
 
+def test_draw_weather_opacity_blends_underlay() -> None:
+    canvas = np.full((200, 300, 3), 200, dtype=np.uint8)
+    snap = WeatherSnapshot(
+        temperature_c=10.0,
+        weather_code=0,
+        condition="Clear",
+        place="Blend",
+        updated_at=1.0,
+    )
+    solid = canvas.copy()
+    faded = canvas.copy()
+    rect = WeatherRect(20, 20, 160, 100)
+    draw_weather_widget(solid, rect, snap, opacity=1.0)
+    draw_weather_widget(faded, rect, snap, opacity=0.25)
+    # Low opacity should stay closer to the bright underlay than full opacity.
+    assert int(faded[50, 50].mean()) > int(solid[50, 50].mean())
+    assert opacity_label(0.85) == "85%"
+    assert next_opacity(WEATHER_OPACITY_CHOICES, 0.85, 1) == 1.0
+
+
 def test_config_weather_roundtrip(tmp_path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(
@@ -135,6 +158,9 @@ def test_config_weather_roundtrip(tmp_path) -> None:
                 "weather_show_conditions": False,
                 "weather_show_storm": True,
                 "weather_show_lightning": False,
+                "weather_opacity": 0.55,
+                "weather_overlay": True,
+                "hud_opacity": 0.40,
                 "weather_latitude": 30.27,
                 "weather_longitude": -97.74,
                 "weather_place": "Austin",
@@ -148,13 +174,30 @@ def test_config_weather_roundtrip(tmp_path) -> None:
     assert cfg.display.weather_units == "c"
     assert cfg.display.weather_show_conditions is False
     assert cfg.display.weather_show_lightning is False
+    assert cfg.display.weather_opacity == pytest.approx(0.55)
+    assert cfg.display.weather_overlay is True
+    assert cfg.display.hud_opacity == pytest.approx(0.40)
     assert cfg.display.weather_latitude == pytest.approx(30.27)
     assert save_display_settings(cfg) == path
     text = path.read_text(encoding="utf-8")
     assert "weather_enabled: true" in text
     assert "weather_slot: between_v" in text
     assert "weather_show_lightning: false" in text
+    assert "weather_opacity: 0.55" in text
+    assert "weather_overlay: true" in text
+    assert "hud_opacity: 0.4" in text or "hud_opacity: 0.40" in text
     assert "Austin" in text
+
+
+def test_config_accepts_percent_opacity() -> None:
+    cfg = parse_config(
+        {
+            "display": {"weather_opacity": 70, "hud_opacity": 50},
+            "cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}],
+        }
+    )
+    assert cfg.display.weather_opacity == pytest.approx(0.70)
+    assert cfg.display.hud_opacity == pytest.approx(0.50)
 
 
 def test_config_rejects_bad_weather_slot() -> None:
@@ -162,6 +205,16 @@ def test_config_rejects_bad_weather_slot() -> None:
         parse_config(
             {
                 "display": {"weather_slot": "top"},
+                "cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}],
+            }
+        )
+
+
+def test_config_rejects_bad_opacity() -> None:
+    with pytest.raises(ConfigError, match="weather_opacity"):
+        parse_config(
+            {
+                "display": {"weather_opacity": 0.05},
                 "cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}],
             }
         )

@@ -25,6 +25,8 @@ VALID_WEATHER_SLOTS = (
     "custom",
 )
 VALID_WEATHER_UNITS = ("f", "c")
+WEATHER_OPACITY_CHOICES: tuple[float, ...] = (0.25, 0.40, 0.55, 0.70, 0.85, 1.0)
+HUD_OPACITY_CHOICES: tuple[float, ...] = (0.35, 0.50, 0.65, 0.80, 0.90, 1.0)
 
 # WMO weather interpretation codes (Open-Meteo) that imply thunder / lightning risk.
 _THUNDER_CODES = frozenset({95, 96, 97, 98, 99})
@@ -446,6 +448,22 @@ def compute_tile_rects(
     return rects
 
 
+def opacity_label(value: float) -> str:
+    return f"{int(round(max(0.0, min(1.0, float(value))) * 100))}%"
+
+
+def next_opacity(choices: tuple[float, ...], current: float, step: int = 1) -> float:
+    values = list(choices)
+    try:
+        index = min(
+            range(len(values)),
+            key=lambda i: abs(values[i] - float(current)),
+        )
+    except ValueError:
+        index = len(values) - 1
+    return values[(index + int(step)) % len(values)]
+
+
 def draw_weather_widget(
     canvas: np.ndarray,
     rect: WeatherRect,
@@ -456,6 +474,7 @@ def draw_weather_widget(
     show_conditions: bool = True,
     show_storm: bool = True,
     show_lightning: bool = True,
+    opacity: float = 0.88,
     editing: bool = False,
 ) -> None:
     """Paint the weather HUD into ``rect`` on the mosaic canvas."""
@@ -464,11 +483,24 @@ def draw_weather_widget(
     x, y, w, h = rect.as_tuple
     if w < 20 or h < 20:
         return
+    opacity = max(0.12, min(1.0, float(opacity)))
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(canvas.shape[1], x + w), min(canvas.shape[0], y + h)
+    if x0 >= x1 or y0 >= y1:
+        return
+
+    # Draw onto a local layer, then blend so opacity reveals camera underlay.
+    under = canvas[y0:y1, x0:x1]
+    layer = under.copy()
+    # Shift draw coords into layer space.
+    ox, oy = x - x0, y - y0
+    lw, lh = x1 - x0, y1 - y0
+    panel_alpha = 0.92 if editing else 0.90
     shade_round_rect(
-        canvas,
-        (x, y, x + w, y + h),
+        layer,
+        (ox, oy, ox + w, oy + h),
         color=(22, 24, 32),
-        alpha=0.88,
+        alpha=panel_alpha,
         radius=12,
     )
     # Accent bar — redder when storm/lightning elevated.
@@ -477,20 +509,20 @@ def draw_weather_widget(
         accent = (40, 80, 255) if snap.lightning_risk == "High" else (40, 150, 230)
     if editing:
         accent = (60, 180, 255)
-        cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), accent, 2)
+        cv2.rectangle(layer, (ox, oy), (ox + w - 1, oy + h - 1), accent, 2)
 
     bar_h = max(4, h // 18)
-    cv2.rectangle(canvas, (x + 4, y + 4), (x + w - 4, y + 4 + bar_h), accent, -1)
+    cv2.rectangle(layer, (ox + 4, oy + 4), (ox + w - 4, oy + 4 + bar_h), accent, -1)
 
     pad = max(8, w // 24)
-    cursor_y = y + bar_h + pad + 2
+    cursor_y = oy + bar_h + pad + 2
     title = snap.place or "Local weather"
     if editing:
         title = "Weather widget — drag to place"
     draw_text(
-        canvas,
+        layer,
         title[:28],
-        (x + pad, cursor_y),
+        (ox + pad, cursor_y),
         size=max(12, min(16, h // 10)),
         color=(200, 205, 215),
         valign="top",
@@ -521,24 +553,31 @@ def draw_weather_widget(
         lines.append((f"Lightning: {risk}{detail}"[:44], color))
 
     for text, color in lines:
-        if cursor_y > y + h - 16:
+        if cursor_y > oy + h - 16:
             break
         size = max(13, min(28 if show_temp and text == lines[0][0] else 15, h // 7))
-        draw_text(canvas, text, (x + pad, cursor_y), size=size, color=color, valign="top")
+        draw_text(layer, text, (ox + pad, cursor_y), size=size, color=color, valign="top")
         cursor_y += size + max(4, h // 28)
 
     if snap.ok and snap.updated_at:
         age = max(0, int(time.time() - snap.updated_at))
         age_txt = f"{age}s ago" if age < 120 else f"{age // 60}m ago"
         draw_text(
-            canvas,
+            layer,
             age_txt,
-            (x + w - pad, y + h - 8),
+            (ox + w - pad, oy + h - 8),
             size=11,
             color=(120, 125, 135),
             align="right",
             valign="bottom",
         )
+
+    if opacity >= 0.999:
+        canvas[y0:y1, x0:x1] = layer[:lh, :lw]
+        return
+    base = under.astype(np.float32)
+    top = layer.astype(np.float32)
+    canvas[y0:y1, x0:x1] = (base * (1.0 - opacity) + top * opacity).astype(np.uint8)
 
 
 def nudge_norm(value: float, step: float, lo: float = -0.45, hi: float = 1.0) -> float:

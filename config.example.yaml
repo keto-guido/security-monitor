@@ -74,6 +74,9 @@ display:
   weather_show_conditions: true
   weather_show_storm: true
   weather_show_lightning: true
+  weather_opacity: 0.85        # 0.12–1.0; lower = more see-through over cameras
+  weather_overlay: false       # true = paint on top of full tiles (no shrink)
+  hud_opacity: 0.70            # camera name/status strip opacity
   # weather_latitude: 30.27
   # weather_longitude: -97.74
   # weather_place: Austin
