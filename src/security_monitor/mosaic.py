@@ -9,16 +9,35 @@ import cv2
 import numpy as np
 
 from security_monitor.config import AppConfig
+from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
 from security_monitor.stream import Snapshot, build_sources
 
 HELP_LINES = (
     "q / ESC  quit",
     "f        fullscreen",
     "g / 0    grid view",
-    "1-9      zoom camera",
+    "1-9      focus camera",
+    "wheel    zoom in/out",
+    "+ / -    zoom in/out",
+    "arrows   pan / strafe",
+    "Home     reset zoom",
     "r        reconnect all",
-    "click    zoom tile",
+    "click    focus tile",
 )
+
+ZOOM_MIN = 1.0
+ZOOM_MAX = 12.0
+ZOOM_FACTOR = 1.2
+PAN_VIEW_FRACTION = 0.18
+
+# waitKeyEx codes differ by GUI backend (Win32 / GTK / Qt).
+KEY_LEFT = frozenset({2424832, 65361, 81, 2, 0xFF51, 16777234})
+KEY_UP = frozenset({2490368, 65362, 82, 0xFF52, 16777235})
+KEY_RIGHT = frozenset({2555904, 65363, 83, 3, 0xFF53, 16777236})
+KEY_DOWN = frozenset({2621440, 65364, 84, 1, 0xFF54, 16777237})
+KEY_HOME = frozenset({2359296, 65360, 16777232, 0xFF50})
+KEY_PLUS = frozenset({ord("+"), ord("=")})
+KEY_MINUS = frozenset({ord("-"), ord("_")})
 
 STATUS_COLOR = {
     "live": (70, 190, 90),
@@ -41,6 +60,10 @@ class MosaicApp:
         self._running = True
         self._ui_fps = 0.0
         self._show_help = False
+        self._fps_shown: dict[str, tuple[float, int]] = {}
+        self.view_zoom = 1.0
+        self.pan_x = 0.5
+        self.pan_y = 0.5
 
     def run(self) -> int:
         if not self.sources:
@@ -66,7 +89,10 @@ class MosaicApp:
         cv2.resizeWindow(self.window, width, height)
         cv2.setMouseCallback(self.window, self._on_mouse)
         self._apply_fullscreen()
-        print("Controls: q quit | f fullscreen | 1-9 zoom | g grid | r reconnect | h help | click tile")
+        print(
+            "Controls: q quit | f fullscreen | 1-9 focus | g grid | "
+            "wheel/+/- zoom | arrows pan | Home reset zoom | h help"
+        )
 
         delay = max(1, int(1000 / self.display.fps))
         stamps: list[float] = []
@@ -79,8 +105,8 @@ class MosaicApp:
                 stamps = [t for t in stamps if now - t <= 1.5]
                 if len(stamps) >= 2:
                     self._ui_fps = (len(stamps) - 1) / (stamps[-1] - stamps[0])
-                key = cv2.waitKey(delay) & 0xFF
-                if key != 255:
+                key = cv2.waitKeyEx(delay)
+                if key >= 0:
                     self._handle_key(key)
                 try:
                     if cv2.getWindowProperty(self.window, cv2.WND_PROP_VISIBLE) < 1:
@@ -102,39 +128,50 @@ class MosaicApp:
         d = self.display
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
             snap = self.sources[self.zoom_index].snapshot()
-            cell = self._render_cell(
-                snap,
-                self.sources[self.zoom_index].name,
-                d.columns * d.cell_width,
-                d.rows * d.cell_height,
-            )
+            name = self.sources[self.zoom_index].name
+            width, height = d.columns * d.cell_width, d.rows * d.cell_height
+            cell = self._render_cell(snap, name, width, height, overlay=False)
+            cell = magnify(cell, self.view_zoom, self.pan_x, self.pan_y)
+            self._draw_cell_overlay(cell, snap, name)
+            self._draw_zoom_badge(cell)
             return self._draw_help(cell)
 
         canvas = np.zeros((d.rows * d.cell_height, d.columns * d.cell_width, 3), dtype=np.uint8)
         canvas[:] = (12, 12, 14)
+        zoomed = self.view_zoom > 1.001
         for index in range(d.tile_count):
             row, col = divmod(index, d.columns)
             y, x = row * d.cell_height, col * d.cell_width
             if index < len(self.sources):
                 snap = self.sources[index].snapshot()
                 tile = self._render_cell(
-                    snap, self.sources[index].name, d.cell_width, d.cell_height
+                    snap,
+                    self.sources[index].name,
+                    d.cell_width,
+                    d.cell_height,
+                    overlay=not zoomed,
                 )
             else:
                 tile = placeholder(d.cell_width, d.cell_height, "Empty", "No camera assigned")
             canvas[y : y + d.cell_height, x : x + d.cell_width] = tile
-        self._draw_grid_lines(canvas)
+        if not zoomed:
+            self._draw_grid_lines(canvas)
+        canvas = magnify(canvas, self.view_zoom, self.pan_x, self.pan_y)
+        self._draw_zoom_badge(canvas)
         return self._draw_help(canvas)
 
     def _draw_grid_lines(self, canvas: np.ndarray) -> None:
         d = self.display
-        color = (32, 32, 36)
+        tint = np.array([18, 18, 20], dtype=np.float32)
+        alpha = 0.45
         for col in range(1, d.columns):
             x = col * d.cell_width
-            cv2.line(canvas, (x, 0), (x, canvas.shape[0]), color, 1)
+            col_pixels = canvas[:, x].astype(np.float32)
+            canvas[:, x] = (col_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
         for row in range(1, d.rows):
             y = row * d.cell_height
-            cv2.line(canvas, (0, y), (canvas.shape[1], y), color, 1)
+            row_pixels = canvas[y, :].astype(np.float32)
+            canvas[y, :] = (row_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
 
     def _render_cell(self, snap: Snapshot, name: str, width: int, height: int) -> np.ndarray:
         if snap.frame is None:
@@ -143,39 +180,40 @@ class MosaicApp:
         else:
             tile = scale_frame(snap.frame, width, height, self.display.scale_mode)
         if self.display.show_labels:
-            draw_status_bar(tile, name, snap, self.display.show_fps)
-        color = STATUS_COLOR.get(snap.status, (80, 80, 80))
-        cv2.rectangle(tile, (0, 0), (width - 1, height - 1), color, 2)
+            fps_text = None
+            if self.display.show_fps:
+                shown = self._stable_fps(name, snap.fps)
+                fps_text = f"{shown:2d} fps" if shown else "-- fps"
+            draw_status_bar(tile, name, snap, fps_text)
         return tile
+
+    def _stable_fps(self, key: str, fps: float) -> int:
+        now = time.monotonic()
+        value = int(round(fps)) if fps > 0.5 else 0
+        prev = self._fps_shown.get(key)
+        if prev is None or now - prev[0] >= 0.5 or abs(value - prev[1]) >= 4:
+            self._fps_shown[key] = (now, value)
+            return value
+        return prev[1]
 
     def _draw_help(self, canvas: np.ndarray) -> np.ndarray:
         if not self._show_help:
             return canvas
-        overlay = canvas.copy()
-        box_h = 28 + 22 * len(HELP_LINES)
-        cv2.rectangle(overlay, (12, 12), (320, box_h), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, canvas, 0.3, 0, canvas)
-        cv2.putText(
-            canvas,
-            f"Controls  (h to hide)   UI {self._ui_fps:.0f} fps",
-            (24, 36),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (230, 230, 230),
-            1,
-            cv2.LINE_AA,
-        )
-        for i, line in enumerate(HELP_LINES):
-            cv2.putText(
+        ui = self._stable_fps("_ui", self._ui_fps)
+        lines = (f"Controls  (h to hide)   UI {ui} fps", *HELP_LINES)
+        box_h = 20 + 22 * len(lines)
+        shade_round_rect(canvas, (16, 16, 352, 16 + box_h), alpha=0.82, radius=12)
+        y = 28
+        for i, line in enumerate(lines):
+            draw_text(
                 canvas,
                 line,
-                (24, 62 + i * 22),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (200, 200, 200),
-                1,
-                cv2.LINE_AA,
+                (32, y),
+                size=14 if i == 0 else 13,
+                color=(232, 232, 232) if i == 0 else (198, 198, 198),
+                valign="top",
             )
+            y += 22
         return canvas
 
     def _handle_key(self, key: int) -> None:
@@ -252,9 +290,33 @@ def scale_frame(frame: np.ndarray, cell_w: int, cell_h: int, mode: str) -> np.nd
 def placeholder(width: int, height: int, title: str, message: str) -> np.ndarray:
     tile = np.zeros((height, width, 3), dtype=np.uint8)
     tile[:] = (22, 22, 26)
-    cv2.rectangle(tile, (12, 12), (width - 13, height - 13), (50, 50, 58), 1)
-    _center_text(tile, title or "Camera", height // 2 - 18, 0.7, (200, 200, 200))
-    _center_text(tile, message or "NO SIGNAL", height // 2 + 18, 0.55, (90, 90, 210))
+    inset = 18
+    shade_round_rect(
+        tile,
+        (inset, inset, width - inset, height - inset),
+        color=(48, 48, 54),
+        alpha=0.28,
+        radius=10,
+    )
+    cx, cy = width // 2, height // 2
+    draw_text(
+        tile,
+        title or "Camera",
+        (cx, cy - 6),
+        size=18,
+        color=(210, 210, 210),
+        align="center",
+        valign="bottom",
+    )
+    draw_text(
+        tile,
+        message or "NO SIGNAL",
+        (cx, cy + 8),
+        size=14,
+        color=(88, 88, 200),
+        align="center",
+        valign="top",
+    )
     return tile
 
 
@@ -262,50 +324,29 @@ def draw_status_bar(
     tile: np.ndarray,
     name: str,
     snap: Snapshot,
-    show_fps: bool,
+    fps_text: str | None,
 ) -> None:
     h, w = tile.shape[:2]
-    bar_h = 28
-    overlay = tile.copy()
-    cv2.rectangle(overlay, (0, h - bar_h), (w, h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.55, tile, 0.45, 0, tile)
+    bar_h = 36
+    shade_bottom_bar(tile, bar_h, alpha=0.70, fade=12)
     color = STATUS_COLOR.get(snap.status, (180, 180, 180))
-    cv2.circle(tile, (14, h - bar_h // 2), 5, color, -1)
-    label = name
-    if show_fps:
-        cam_fps = f"{snap.fps:.0f}" if snap.fps else "--"
-        label = f"{name}   {cam_fps} fps"
-    cv2.putText(
-        tile,
-        label,
-        (26, h - 8),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (230, 230, 230),
-        1,
-        cv2.LINE_AA,
-    )
+    cy = h - 15
+    draw_dot(tile, (16, cy), 5.5, color)
+    draw_text(tile, name, (28, h - 8), size=15, valign="bottom")
     status = snap.status.upper()
-    if snap.detail and snap.status != "live":
+    if snap.detail and snap.status not in ("live", "demo"):
         status = f"{status}  {snap.detail}"
-    size = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
-    cv2.putText(
+    if fps_text:
+        status = f"{status}   {fps_text}"
+    draw_text(
         tile,
         status,
-        (w - size[0] - 10, h - 9),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        color,
-        1,
-        cv2.LINE_AA,
+        (w - 12, h - 8),
+        size=13,
+        color=color,
+        align="right",
+        valign="bottom",
     )
-
-
-def _center_text(tile: np.ndarray, text: str, y: int, scale: float, color: tuple[int, int, int]) -> None:
-    width = tile.shape[1]
-    size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0]
-    x = max(8, (width - size[0]) // 2)
-    cv2.putText(tile, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
 
 def run_monitor(config: AppConfig) -> int:

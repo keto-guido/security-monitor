@@ -113,7 +113,10 @@ class CameraWorker(threading.Thread):
                 fps = (len(stamps) - 1) / (stamps[-1] - stamps[0]) if len(stamps) >= 2 else 0.0
                 with self._lock:
                     self._frame = frame
-                    self._fps = fps
+                    if self._fps > 0 and fps > 0:
+                        self._fps = self._fps * 0.85 + fps * 0.15
+                    else:
+                        self._fps = fps
                     self._status = "live"
                     self._detail = ""
             immediate = self._kick.is_set()
