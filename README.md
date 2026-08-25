@@ -130,6 +130,8 @@ display:
   clip_seconds: 15               # default Save clip length
   people_detection: false        # master switch (also enable per camera)
   object_detection: false        # packages / left-behind items vs baseline
+  cycle_focus: false             # auto-advance focused camera
+  cycle_focus_seconds: 10
 
 cameras:
   - name: Front Door
@@ -191,7 +193,17 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu also has **Cameras** (layout, show/hide, arrange, add/remove, focus cycling), **Capture**, **Detection**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detection**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+
+### Saved captures
+
+`Esc` → **Saved captures…** (or **Capture** → **Browse saved captures…**):
+
+- List snapshots and clips newest-first
+- Open a file to preview (images + first frame of videos)
+- ← → browse neighboring files
+- **Show in folder** opens the OS file manager
+- **Delete** / **Delete all** with confirmation
 
 ### Cameras menu
 

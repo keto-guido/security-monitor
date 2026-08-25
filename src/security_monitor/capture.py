@@ -13,6 +13,8 @@ import numpy as np
 
 CLIP_LENGTH_CHOICES = (5, 10, 15, 30, 60)
 VALID_SNAPSHOT_FORMATS = ("jpg", "jpeg", "png")
+CAPTURE_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp"})
+CAPTURE_VIDEO_EXTS = frozenset({".mp4", ".avi", ".mkv", ".mov", ".m4v"})
 
 
 class CaptureError(RuntimeError):
@@ -122,6 +124,148 @@ def write_clip(
             return out_path
         last_error = f"empty output ({fourcc_name})"
     raise CaptureError(f"Failed to write clip: {last_error}")
+
+
+@dataclass(frozen=True)
+class CaptureItem:
+    path: Path
+    kind: str  # image | video
+    size: int
+    mtime: float
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def label(self) -> str:
+        stamp = datetime.fromtimestamp(self.mtime).strftime("%Y-%m-%d %H:%M")
+        tag = "IMG" if self.kind == "image" else "VID"
+        return f"[{tag}] {self.name}  ·  {_format_bytes(self.size)}  ·  {stamp}"
+
+
+def _format_bytes(size: int) -> str:
+    value = float(max(0, size))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{size} B"
+
+
+def list_captures(directory: Path | str | None, *, limit: int = 200) -> list[CaptureItem]:
+    """Newest-first snapshots and clips under the save directory."""
+    root = resolve_save_directory(str(directory) if directory is not None else "")
+    items: list[CaptureItem] = []
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return []
+    for path in entries:
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower()
+        if ext in CAPTURE_IMAGE_EXTS:
+            kind = "image"
+        elif ext in CAPTURE_VIDEO_EXTS:
+            kind = "video"
+        else:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        items.append(
+            CaptureItem(
+                path=path,
+                kind=kind,
+                size=int(stat.st_size),
+                mtime=float(stat.st_mtime),
+            )
+        )
+    items.sort(key=lambda item: item.mtime, reverse=True)
+    return items[: max(1, int(limit))]
+
+
+def delete_capture(path: Path) -> None:
+    target = Path(path)
+    if not target.is_file():
+        raise CaptureError(f"File not found: {target}")
+    try:
+        target.unlink()
+    except OSError as exc:
+        raise CaptureError(f"Could not delete {target.name}: {exc}") from exc
+
+
+def delete_captures(paths: list[Path]) -> int:
+    deleted = 0
+    for path in paths:
+        try:
+            delete_capture(path)
+            deleted += 1
+        except CaptureError:
+            continue
+    return deleted
+
+
+def load_capture_preview(path: Path, *, max_edge: int = 1280) -> np.ndarray | None:
+    """Load an image or the first frame of a video for on-screen preview."""
+    target = Path(path)
+    if not target.is_file():
+        return None
+    ext = target.suffix.lower()
+    frame: np.ndarray | None = None
+    if ext in CAPTURE_IMAGE_EXTS:
+        frame = cv2.imread(str(target), cv2.IMREAD_COLOR)
+    elif ext in CAPTURE_VIDEO_EXTS:
+        cap = cv2.VideoCapture(str(target))
+        try:
+            ok, grabbed = cap.read()
+            if ok and grabbed is not None:
+                frame = grabbed
+        finally:
+            cap.release()
+    if frame is None or frame.size == 0:
+        return None
+    h, w = frame.shape[:2]
+    edge = max(h, w)
+    if edge > max_edge:
+        scale = max_edge / edge
+        frame = cv2.resize(
+            frame,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return frame
+
+
+def reveal_in_file_manager(path: Path) -> str:
+    """Open the captures folder (or parent of a file) in the OS file manager."""
+    import os
+    import subprocess
+    import sys
+
+    target = Path(path)
+    folder = target if target.is_dir() else target.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        if os.name == "nt":
+            if target.is_file():
+                subprocess.Popen(["explorer", "/select,", str(target)])  # noqa: S603
+            else:
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            if target.is_file():
+                subprocess.Popen(["open", "-R", str(target)])  # noqa: S603
+            else:
+                subprocess.Popen(["open", str(folder)])  # noqa: S603
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])  # noqa: S603
+    except OSError as exc:
+        raise CaptureError(f"Could not open folder: {exc}") from exc
+    return str(folder)
 
 
 @dataclass

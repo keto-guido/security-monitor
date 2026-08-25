@@ -69,9 +69,15 @@ from security_monitor.buffer import (
 from security_monitor.capture import (
     CLIP_LENGTH_CHOICES,
     CaptureError,
+    CaptureItem,
     LiveClipJob,
     default_save_directory,
+    delete_capture,
+    delete_captures,
+    list_captures,
+    load_capture_preview,
     resolve_save_directory,
+    reveal_in_file_manager,
     save_snapshot,
     write_clip,
 )
@@ -125,6 +131,14 @@ _CAMERA_MENU_PAGES = frozenset(
         "cameras_remove",
     }
 )
+_CAPTURE_BROWSER_PAGES = frozenset(
+    {
+        "captures",
+        "captures_view",
+        "captures_delete",
+        "captures_delete_all",
+    }
+)
 _NESTED_MENU_PAGES = frozenset(
     {
         "reboot_confirm",
@@ -133,6 +147,7 @@ _NESTED_MENU_PAGES = frozenset(
         "detection",
         "detection_cams",
         *_CAMERA_MENU_PAGES,
+        *_CAPTURE_BROWSER_PAGES,
     }
 )
 
@@ -201,6 +216,10 @@ class MosaicApp:
         self._grid_y = 0
         self._prompt: TextPrompt | None = None
         self._cycle_deadline = 0.0
+        self._captures: list[CaptureItem] = []
+        self._captures_origin = "capture"  # capture | root
+        self._capture_view_index: int | None = None
+        self._capture_preview: np.ndarray | None = None
 
     def run(self) -> int:
         if not self.sources:
@@ -334,7 +353,7 @@ class MosaicApp:
             self._draw_buffer_badge(cell, snap)
             self._feed_clip_job(cell)
             self._draw_capture_hud(cell)
-            return self._draw_prompt(self._draw_menu(self._draw_reboot(self._draw_help(cell))))
+            return self._finalize_ui(cell)
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
         canvas[:] = (12, 12, 14)
@@ -372,7 +391,31 @@ class MosaicApp:
                 self._draw_buffer_badge(canvas, sample)
         self._feed_clip_job(canvas)
         self._draw_capture_hud(canvas)
+        return self._finalize_ui(canvas)
+
+    def _finalize_ui(self, canvas: np.ndarray) -> np.ndarray:
+        if (
+            self._menu_open
+            and self._menu_page in {"captures_view", "captures_delete"}
+            and self._capture_preview is not None
+        ):
+            canvas = self._paint_capture_preview(
+                canvas.shape[1], canvas.shape[0], self._capture_preview
+            )
         return self._draw_prompt(self._draw_menu(self._draw_reboot(self._draw_help(canvas))))
+
+    def _paint_capture_preview(
+        self, width: int, height: int, frame: np.ndarray
+    ) -> np.ndarray:
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        canvas[:] = (10, 10, 12)
+        fitted = scale_frame(frame, width, height, "fit")
+        y = max(0, (height - fitted.shape[0]) // 2)
+        x = max(0, (width - fitted.shape[1]) // 2)
+        canvas[y : y + fitted.shape[0], x : x + fitted.shape[1]] = fitted
+        # Dim slightly so the action card stays readable.
+        canvas[:] = (canvas.astype(np.float32) * 0.72).astype(np.uint8)
+        return canvas
 
     def _draw_grid_lines(
         self,
@@ -567,6 +610,15 @@ class MosaicApp:
                 self._menu_page = "detection"
                 self._menu_index = 0
                 return
+            if self._menu_page in {"captures_view", "captures_delete", "captures_delete_all"}:
+                self._close_capture_view()
+                self._menu_page = "captures"
+                self._menu_index = 0
+                return
+            if self._menu_page == "captures":
+                self._menu_page = self._captures_origin
+                self._menu_index = 0
+                return
             if self._menu_page in _CAMERA_MENU_PAGES and self._menu_page != "cameras":
                 self._menu_page = "cameras"
                 self._menu_index = 0
@@ -591,6 +643,19 @@ class MosaicApp:
             self._menu_page = "detection"
             self._menu_index = 0
             return
+        if self._menu_open and self._menu_page in {
+            "captures_view",
+            "captures_delete",
+            "captures_delete_all",
+        }:
+            self._close_capture_view()
+            self._menu_page = "captures"
+            self._menu_index = 0
+            return
+        if self._menu_open and self._menu_page == "captures":
+            self._menu_page = self._captures_origin
+            self._menu_index = 0
+            return
         if self._menu_open and self._menu_page in _CAMERA_MENU_PAGES and self._menu_page != "cameras":
             self._menu_page = "cameras"
             self._menu_index = 0
@@ -609,6 +674,7 @@ class MosaicApp:
         if action == "close_menu":
             self._menu_open = False
             self._menu_page = "root"
+            self._close_capture_view()
         elif action == "main_layout":
             self._go_main_layout()
         else:
@@ -650,10 +716,48 @@ class MosaicApp:
             return [
                 ("snap_now", "Save snapshot"),
                 ("clip_now", f"Save clip ({d.clip_seconds:g}s)"),
+                ("captures_browse", "Browse saved captures…"),
                 ("clip_length", f"Clip length: {d.clip_seconds:g}s"),
                 ("snap_format", f"Snapshot format: {d.snapshot_format.upper()}"),
                 ("capture_folder", f"Folder: {folder}"),
                 ("capture_back", "Back"),
+            ]
+        if self._menu_page == "captures":
+            items: list[tuple[str, str]] = [
+                ("captures_refresh", f"Refresh list ({len(self._captures)} files)"),
+                ("captures_open_folder", "Open captures folder"),
+            ]
+            if self._captures:
+                items.append(("captures_delete_all", "Delete all captures…"))
+            for index, item in enumerate(self._captures):
+                items.append((f"cap:{index}", item.label))
+            if not self._captures:
+                items.append(("captures_empty", "(no snapshots or clips yet)"))
+            items.append(("captures_back", "Back"))
+            return items
+        if self._menu_page == "captures_view":
+            item = self._selected_capture()
+            title = item.name if item else "(missing)"
+            kind = item.kind if item else "?"
+            return [
+                ("captures_info", f"{title}  ({kind})"),
+                ("captures_prev", "◀ Previous"),
+                ("captures_next", "Next ▶"),
+                ("captures_open_folder", "Show in folder"),
+                ("captures_delete", "Delete…"),
+                ("captures_view_back", "Back to list"),
+            ]
+        if self._menu_page == "captures_delete":
+            item = self._selected_capture()
+            name = item.name if item else "file"
+            return [
+                ("captures_delete_yes", f"Yes, delete {name}"),
+                ("captures_delete_no", "Cancel"),
+            ]
+        if self._menu_page == "captures_delete_all":
+            return [
+                ("captures_delete_all_yes", f"Yes, delete all {len(self._captures)} files"),
+                ("captures_delete_all_no", "Cancel"),
             ]
         if self._menu_page == "detection":
             d = self.display
@@ -728,6 +832,7 @@ class MosaicApp:
             ("fullscreen", fullscreen),
             ("cameras", "Cameras…"),
             ("capture", "Capture"),
+            ("captures_root", "Saved captures…"),
             ("detection", "Detection"),
             ("video", "Video settings"),
             ("reconnect", "Reconnect streams"),
@@ -795,6 +900,52 @@ class MosaicApp:
             self._toggle_snapshot_format()
         elif action == "capture_folder":
             self._reboot_notice = str(self._save_dir())
+        elif action == "captures_browse" or action == "captures_root":
+            self._captures_origin = "root" if action == "captures_root" else "capture"
+            self._open_captures_browser()
+        elif action == "captures_back":
+            self._close_capture_view()
+            self._menu_page = self._captures_origin
+            self._menu_index = 0
+        elif action == "captures_refresh":
+            self._refresh_captures()
+            self._reboot_notice = f"{len(self._captures)} file(s)"
+        elif action == "captures_open_folder":
+            self._reveal_captures_folder()
+        elif action == "captures_empty":
+            self._reboot_notice = "Save a snapshot (s) or clip (c) first"
+        elif action.startswith("cap:"):
+            index = int(action.split(":", 1)[1])
+            self._open_capture_view(index)
+        elif action == "captures_info":
+            item = self._selected_capture()
+            if item is not None:
+                self._reboot_notice = str(item.path)
+        elif action == "captures_prev":
+            self._nudge_capture_view(-1)
+        elif action == "captures_next":
+            self._nudge_capture_view(1)
+        elif action == "captures_delete":
+            self._menu_page = "captures_delete"
+            self._menu_index = 1
+        elif action == "captures_delete_yes":
+            self._delete_selected_capture()
+        elif action == "captures_delete_no" or action == "captures_view_back":
+            if action == "captures_view_back":
+                self._close_capture_view()
+                self._menu_page = "captures"
+                self._menu_index = 0
+            else:
+                self._menu_page = "captures_view"
+                self._menu_index = 0
+        elif action == "captures_delete_all":
+            self._menu_page = "captures_delete_all"
+            self._menu_index = 1
+        elif action == "captures_delete_all_yes":
+            self._delete_all_captures()
+        elif action == "captures_delete_all_no":
+            self._menu_page = "captures"
+            self._menu_index = 0
         elif action == "video":
             self._menu_page = "video"
             self._menu_index = 0
@@ -945,6 +1096,19 @@ class MosaicApp:
             self._reboot_notice = "Tile order saved"
         elif action.startswith("toggle:"):
             self._activate_menu(action)
+        elif self._menu_page == "captures_view":
+            self._nudge_capture_view(step)
+        elif action.startswith("cap:"):
+            # Jump selection with arrows while browsing the list.
+            index = int(action.split(":", 1)[1])
+            target = index + (1 if step > 0 else -1)
+            if 0 <= target < len(self._captures):
+                # Move highlight to neighboring file row.
+                items = self._menu_items()
+                for i, (act, _) in enumerate(items):
+                    if act == f"cap:{target}":
+                        self._menu_index = i
+                        break
 
     def _set_people_detection(self, enabled: bool) -> None:
         self.display.people_detection = bool(enabled)
@@ -1267,6 +1431,93 @@ class MosaicApp:
     def _save_dir(self) -> Path:
         return resolve_save_directory(self.display.save_directory or str(default_save_directory()))
 
+    def _refresh_captures(self) -> None:
+        self._captures = list_captures(self._save_dir())
+
+    def _open_captures_browser(self) -> None:
+        self._refresh_captures()
+        self._close_capture_view()
+        self._menu_page = "captures"
+        self._menu_index = 0
+        self._reboot_notice = str(self._save_dir())
+
+    def _selected_capture(self) -> CaptureItem | None:
+        index = self._capture_view_index
+        if index is None or index < 0 or index >= len(self._captures):
+            return None
+        return self._captures[index]
+
+    def _close_capture_view(self) -> None:
+        self._capture_view_index = None
+        self._capture_preview = None
+
+    def _open_capture_view(self, index: int) -> None:
+        if index < 0 or index >= len(self._captures):
+            self._reboot_notice = "File not found"
+            return
+        self._capture_view_index = index
+        item = self._captures[index]
+        self._capture_preview = load_capture_preview(item.path)
+        self._menu_page = "captures_view"
+        self._menu_index = 0
+        if self._capture_preview is None:
+            self._reboot_notice = f"Could not preview {item.name}"
+        else:
+            self._reboot_notice = item.label
+
+    def _nudge_capture_view(self, step: int) -> None:
+        if not self._captures:
+            return
+        if self._capture_view_index is None:
+            self._open_capture_view(0 if step >= 0 else len(self._captures) - 1)
+            return
+        index = (self._capture_view_index + int(step)) % len(self._captures)
+        self._open_capture_view(index)
+
+    def _reveal_captures_folder(self) -> None:
+        item = self._selected_capture()
+        target = item.path if item is not None else self._save_dir()
+        try:
+            folder = reveal_in_file_manager(target)
+        except CaptureError as exc:
+            self._reboot_notice = str(exc)
+            return
+        self._reboot_notice = f"Opened {folder}"
+
+    def _delete_selected_capture(self) -> None:
+        item = self._selected_capture()
+        if item is None:
+            self._menu_page = "captures"
+            return
+        try:
+            delete_capture(item.path)
+        except CaptureError as exc:
+            self._reboot_notice = str(exc)
+            self._menu_page = "captures_view"
+            return
+        name = item.name
+        self._refresh_captures()
+        if self._captures:
+            index = min(self._capture_view_index or 0, len(self._captures) - 1)
+            self._open_capture_view(index)
+            self._reboot_notice = f"Deleted {name}"
+        else:
+            self._close_capture_view()
+            self._menu_page = "captures"
+            self._menu_index = 0
+            self._reboot_notice = f"Deleted {name}"
+        print(f"Deleted capture {name}")
+
+    def _delete_all_captures(self) -> None:
+        paths = [item.path for item in self._captures]
+        deleted = delete_captures(paths)
+        self._refresh_captures()
+        self._close_capture_view()
+        self._menu_page = "captures"
+        self._menu_index = 0
+        self._reboot_notice = f"Deleted {deleted} file(s)"
+        print(f"Deleted {deleted} capture(s)")
+
     def _capture_label(self) -> str:
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
             return self.sources[self.zoom_index].name
@@ -1540,7 +1791,9 @@ class MosaicApp:
         self._menu_hitboxes = []
         if not self._menu_open or self._reboot_job is not None or self._prompt is not None:
             return canvas
-        canvas[:] = (canvas.astype(np.float32) * 0.38).astype(np.uint8)
+        preview_pages = {"captures_view", "captures_delete"}
+        if self._menu_page not in preview_pages:
+            canvas[:] = (canvas.astype(np.float32) * 0.38).astype(np.uint8)
         items = self._menu_items()
         wide = self._menu_page in {
             "video",
@@ -1548,6 +1801,7 @@ class MosaicApp:
             "detection",
             "detection_cams",
             *_CAMERA_MENU_PAGES,
+            *_CAPTURE_BROWSER_PAGES,
         }
         card_w, row_h, pad = (600 if wide else 480), 46, 20
         title_h = 56
@@ -1584,6 +1838,10 @@ class MosaicApp:
             "cameras_toggle": "Show / hide",
             "cameras_add": "Add camera",
             "cameras_remove": "Remove camera",
+            "captures": "Saved captures",
+            "captures_view": "View capture",
+            "captures_delete": "Delete capture",
+            "captures_delete_all": "Delete all captures",
         }.get(self._menu_page, "Options")
         draw_text(
             canvas,
@@ -1632,11 +1890,18 @@ class MosaicApp:
             footer = "Enter toggle/cycle    ← → adjust    Esc back"
         elif self._menu_page == "capture":
             footer = "s snapshot  c clip    ← → length    Esc back"
+        elif self._menu_page == "captures_view":
+            footer = "← → browse files    Enter select    Esc back"
+        elif self._menu_page in {"captures_delete", "captures_delete_all"}:
+            footer = "Enter confirm    Esc cancel"
+        elif self._menu_page == "captures":
+            footer = "Enter open    ← → move    Esc back"
         elif self._menu_page == "cameras_arrange":
             footer = "← → move in grid order    Esc back"
         elif self._menu_page in _CAMERA_MENU_PAGES or self._menu_page in {
             "detection",
             "detection_cams",
+            "capture",
         }:
             footer = "Enter select    ← → adjust    Esc back"
         else:
