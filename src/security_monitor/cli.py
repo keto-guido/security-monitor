@@ -66,6 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.set_defaults(handler=cmd_init)
 
+    reboot = sub.add_parser("reboot", help="Reboot cameras from config.yaml (SSH/HTTP)")
+    reboot.add_argument("--config", "-c", default=argparse.SUPPRESS, help="Path to config.yaml")
+    reboot.set_defaults(handler=cmd_reboot)
+
     # Top-level flags so `security-monitor --config x.yaml` works without `run`.
     _add_run_flags(parser)
     return parser
@@ -128,7 +132,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     for i, cam in enumerate(config.cameras, start=1):
         mark = "*" if cam in visible else " "
         state = "on " if cam.enabled else "off"
-        print(f"  {mark} {i}. [{state}] {cam.name:20}  {cam.redacted_source()}")
+        kind = cam.kind or "-"
+        print(f"  {mark} {i}. [{state}] {cam.name:20}  {kind}  {cam.redacted_source()}")
     if not visible:
         print("warning: no enabled cameras fit in the grid", file=sys.stderr)
         return 1
@@ -144,6 +149,13 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"Wrote {dest}")
     print("Edit camera URLs, then run:  security-monitor")
     return 0
+
+
+def cmd_reboot(args: argparse.Namespace) -> int:
+    config = load_config(getattr(args, "config", None))
+    from security_monitor.reboot import reboot_targets, run_reboot_cli
+
+    return run_reboot_cli(reboot_targets(config.cameras))
 
 
 def _apply_overrides(config: AppConfig, args: argparse.Namespace) -> None:

@@ -15,6 +15,7 @@ import yaml
 
 VALID_SCALE_MODES = ("fit", "fill", "stretch")
 VALID_TRANSPORTS = ("tcp", "udp", "auto")
+VALID_CAMERA_KINDS = ("ubiquiti", "reolink", "amcrest", "dahua")
 URL_SCHEMES = ("rtsp", "rtp", "http", "https", "file", "rtmp")
 
 _CREDENTIALS_RE = re.compile(r"://([^:/?#]+):([^@/?#]+)@")
@@ -33,10 +34,20 @@ class CameraConfig:
     transport: str | None = None
     username: str | None = None
     password: str | None = None
+    kind: str | None = None
+    reboot: bool = True
+    ssh_port: int = 22
+    http_port: int = 80
 
     @property
     def is_device(self) -> bool:
         return self.device is not None
+
+    @property
+    def host(self) -> str | None:
+        if not self.url:
+            return None
+        return urlparse(self.url).hostname
 
     def capture_source(self) -> str | int:
         if self.device is not None:
@@ -246,6 +257,29 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
             )
     username = raw.get("username")
     password = raw.get("password")
+    kind = raw.get("type")
+    if kind is not None:
+        kind = str(kind).strip().lower()
+        if kind not in VALID_CAMERA_KINDS:
+            raise ConfigError(
+                f"cameras[{index}].type must be one of {VALID_CAMERA_KINDS}"
+            )
+    ssh_port = 22
+    if "ssh_port" in raw:
+        try:
+            ssh_port = int(raw["ssh_port"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"cameras[{index}].ssh_port must be an integer") from exc
+        if ssh_port < 1:
+            raise ConfigError(f"cameras[{index}].ssh_port must be >= 1")
+    http_port = 80
+    if "http_port" in raw:
+        try:
+            http_port = int(raw["http_port"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"cameras[{index}].http_port must be an integer") from exc
+        if http_port < 1:
+            raise ConfigError(f"cameras[{index}].http_port must be >= 1")
     return CameraConfig(
         name=name,
         url=url,
@@ -254,6 +288,10 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
         transport=transport,
         username=None if username is None else str(username),
         password=None if password is None else str(password),
+        kind=kind,
+        reboot=_bool(raw, "reboot", True),
+        ssh_port=ssh_port,
+        http_port=http_port,
     )
 
 

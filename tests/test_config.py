@@ -97,6 +97,11 @@ def test_webcam_and_file_sources() -> None:
     assert cfg.cameras[1].url.endswith("cam.mp4")
 
 
+def test_camera_type_is_validated() -> None:
+    with pytest.raises(ConfigError, match="type"):
+        parse_config({"cameras": [{"name": "X", "url": "rtsp://192.168.1.10/live", "type": "unknown"}]})
+
+
 def test_unsupported_scheme() -> None:
     with pytest.raises(ConfigError, match="scheme"):
         parse_config({"cameras": [{"name": "X", "url": "ftp://example/x"}]})

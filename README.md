@@ -76,6 +76,7 @@ cameras:
     url: rtsp://192.168.1.10:554/Streaming/Channels/101
     username: camera
     password: secret
+    type: ubiquiti          # ubiquiti | reolink | amcrest | dahua
     enabled: true
     transport: tcp
 ```
@@ -108,13 +109,21 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 
 | Key | Action |
 | --- | --- |
-| `q` / `Esc` | Quit |
+| `Esc` | Back to the grid; on the grid, open the options menu |
+| `q` | Quit (or Exit from the options menu) |
 | `f` | Toggle fullscreen |
-| `1`–`9` | Zoom that camera |
+| `1`–`9` | Focus that camera |
 | `g` / `0` | Back to the grid |
+| Scroll wheel | Zoom in / out (toward the cursor) |
+| `+` / `-` | Zoom in / out |
+| Arrow keys | Pan / strafe when zoomed; move in the options menu |
+| `Enter` | Choose the highlighted options-menu item |
+| `Home` | Reset zoom |
 | `r` | Reconnect every stream |
 | `h` | Toggle on-screen help |
-| Click a tile | Zoom (click again for grid) |
+| Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
+
+The options menu also has **Reboot cameras**. That uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
 
 ## Commands
 
@@ -125,6 +134,7 @@ security-monitor --fullscreen
 security-monitor --columns 3 --rows 2
 security-monitor demo
 security-monitor check
+security-monitor reboot
 security-monitor init
 python -m security_monitor       # same as security-monitor
 ```

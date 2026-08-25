@@ -16,6 +16,8 @@ dependencies = [
     "opencv-python>=4.8",
     "Pillow>=10.0",
     "PyYAML>=6.0",
+    "paramiko>=3.4",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
