@@ -1211,7 +1211,7 @@ class MosaicApp:
         elif self._menu_page == "capture":
             footer = "s snapshot  c clip    ← → length    Esc back"
         elif self._menu_page in {"detection", "detection_cams"}:
-            footer = "Enter toggle    Set baseline on empty scene    Esc back"
+            footer = "Baseline adapts to seasons; packages stay frozen    Esc back"
         else:
             footer = "Enter to select    Esc to close"
         draw_text(

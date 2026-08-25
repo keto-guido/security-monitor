@@ -24,7 +24,8 @@ def test_box_iou_and_clip() -> None:
 def test_new_object_appears_against_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
-    tracker = NewObjectTracker()
+    # Disable adapt during this test so the seeded baseline stays fixed.
+    tracker = NewObjectTracker(adapt_tau_seconds=1e9, persist_every_seconds=1e9)
     baseline = np.zeros((240, 320, 3), dtype=np.uint8)
     baseline[:] = (40, 40, 40)
     tracker.set_baseline("Porch", baseline)
@@ -45,6 +46,74 @@ def test_new_object_appears_against_baseline(tmp_path: Path, monkeypatch: pytest
     # Remove package — box clears after grace (~1.25s).
     time.sleep(1.35)
     assert tracker.detect("Porch", baseline.copy(), confirm_seconds=0.2) == []
+
+
+def test_baseline_adapts_around_frozen_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    tracker = NewObjectTracker(
+        adapt_tau_seconds=0.05,
+        absorb_non_reinforced_seconds=1e9,
+        persist_every_seconds=1e9,
+    )
+    baseline = np.zeros((240, 320, 3), dtype=np.uint8)
+    baseline[:] = (40, 40, 40)
+    tracker.set_baseline("Yard", baseline)
+
+    package = baseline.copy()
+    package[80:140, 100:180] = (220, 220, 220)
+    assert tracker.detect("Yard", package, confirm_seconds=0.05) == []
+    time.sleep(0.08)
+    assert len(tracker.detect("Yard", package, confirm_seconds=0.05)) == 1
+
+    # Surroundings shift (season / leaves) while the package stays put.
+    seasonal = package.copy()
+    seasonal[:, :] = (90, 110, 70)
+    seasonal[80:140, 100:180] = (220, 220, 220)
+    for _ in range(40):
+        boxes = tracker.detect(
+            "Yard", seasonal, confirm_seconds=0.05, adapt_tau_seconds=0.05
+        )
+        assert len(boxes) == 1
+        time.sleep(0.02)
+
+    # Same seasonal scene without the package should eventually clear.
+    clear = seasonal.copy()
+    clear[80:140, 100:180] = (90, 110, 70)
+    time.sleep(1.35)
+    # Allow a bit more adapt so the old package hole fills from neighbors over time
+    # once the track expires — run a few empty frames.
+    for _ in range(20):
+        tracker.detect("Yard", clear, confirm_seconds=0.05, adapt_tau_seconds=0.05)
+        time.sleep(0.02)
+    assert tracker.detect("Yard", clear, confirm_seconds=0.05) == []
+
+
+def test_gradual_scene_drift_does_not_false_alarm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    tracker = NewObjectTracker(
+        adapt_tau_seconds=0.05,
+        persist_every_seconds=1e9,
+    )
+    baseline = np.zeros((240, 320, 3), dtype=np.uint8)
+    baseline[:] = (50, 50, 50)
+    tracker.set_baseline("Drive", baseline)
+
+    frame = baseline.copy()
+    for step in range(25):
+        # Mild global drift — should be absorbed, not flagged as a package.
+        value = min(50 + step * 4, 140)
+        frame[:, :] = (value, value, value)
+        boxes = tracker.detect(
+            "Drive", frame, confirm_seconds=0.05, adapt_tau_seconds=0.05
+        )
+        time.sleep(0.02)
+    assert boxes == []
 
 
 def test_draw_boxes_mutates_frame() -> None:

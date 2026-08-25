@@ -3,15 +3,18 @@
 People: Ultralytics YOLOv8n (modern real-time detector). Falls back to
 OpenCV MobileNet-SSD, then HOG, if YOLO cannot load.
 
-New objects: lighting-normalized baseline change detection against the
-user-captured empty-area frame, with multi-frame persistence tracking.
-Walking people are masked out using the people detector. Optional YOLO
-"thing" hits that overlap a change blob reinforce confirmation (packages
-are often not a COCO class, so baseline change remains the source of truth).
+New objects: lighting-normalized baseline change detection against an
+empty-area baseline, with multi-frame persistence tracking. The baseline
+slowly adapts (EMA) to seasonal / lighting drift, but pixels under
+confirmed packages (and people) are frozen so a left-behind box stays
+flagged for days. Walking people are masked out. Optional YOLO "thing"
+hits that overlap a change blob reinforce confirmation (packages are
+often not a COCO class, so baseline change remains the source of truth).
 """
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
@@ -61,6 +64,19 @@ _MOBILENET_MODEL_URL = (
 
 _YOLO_WEIGHTS = "yolov8n.pt"
 
+# Adaptive baseline: ~6h time-constant for leaves / gradual season drift.
+_DEFAULT_ADAPT_TAU_S = 6 * 3600
+# Faster absorb when the whole scene shifts (snow dump) with no packages.
+_ENV_ADAPT_TAU_S = 20 * 60
+_ENV_CHANGE_RATIO = 0.35
+_ENV_SETTLE_S = 15 * 60
+# Non-YOLO "new object" blobs (leaf piles) may merge into baseline after this.
+_ABSORB_NON_REINFORCED_S = 48 * 3600
+_PERSIST_EVERY_S = 15 * 60
+_TRACK_GRACE_S = 1.25
+_HEAL_SECONDS = 45.0
+_HEAL_ADAPT_TAU_S = 8.0
+
 
 @dataclass(frozen=True)
 class Box:
@@ -102,6 +118,15 @@ class _TrackedObject:
     last_seen: float
     confirmed: bool = False
     reinforced: bool = False  # overlapped a YOLO "thing" at least once
+    first_confirmed: float | None = None
+
+
+@dataclass
+class _HealRegion:
+    """After a package leaves, heal the frozen baseline hole quickly."""
+
+    box: Box
+    until: float
 
 
 def models_dir() -> Path:
@@ -344,13 +369,55 @@ class PersonDetector:
         return boxes
 
 
-class NewObjectTracker:
-    """Find left-behind objects by comparing to a user-set empty-area baseline."""
+def _blends_with_surroundings(frame: np.ndarray, box: Box, *, pad: int = 18) -> bool:
+    """True when the box interior looks like the ring around it (object gone)."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = box.x1, box.y1, box.x2, box.y2
+    if x2 <= x1 + 2 or y2 <= y1 + 2:
+        return True
+    inner = frame[y1:y2, x1:x2]
+    ox1, oy1 = max(0, x1 - pad), max(0, y1 - pad)
+    ox2, oy2 = min(w, x2 + pad), min(h, y2 + pad)
+    ring = frame[oy1:oy2, ox1:ox2].astype(np.int16)
+    iy1, ix1 = y1 - oy1, x1 - ox1
+    iy2, ix2 = iy1 + (y2 - y1), ix1 + (x2 - x1)
+    ring[iy1:iy2, ix1:ix2] = -1
+    valid = ring.reshape(-1, 3)
+    valid = valid[np.all(valid >= 0, axis=1)]
+    if valid.size == 0:
+        return True
+    inner_mean = inner.reshape(-1, 3).mean(axis=0).astype(np.float64)
+    ring_mean = valid.mean(axis=0).astype(np.float64)
+    return float(np.linalg.norm(inner_mean - ring_mean)) < 22.0
 
-    def __init__(self) -> None:
+class NewObjectTracker:
+    """Find left-behind objects vs an adaptive empty-area baseline.
+
+    The user seeds the baseline once (empty scene). After that the baseline
+    slowly EMA-adapts to seasonal drift (leaves, snow texture, lawn growth).
+    Confirmed package regions are frozen so a box left for days stays flagged.
+    YOLO-reinforced packages never merge into the baseline; non-reinforced
+    blobs (often leaf piles) may absorb after a long idle period.
+    """
+
+    def __init__(
+        self,
+        *,
+        adapt_tau_seconds: float = _DEFAULT_ADAPT_TAU_S,
+        absorb_non_reinforced_seconds: float = _ABSORB_NON_REINFORCED_S,
+        persist_every_seconds: float = _PERSIST_EVERY_S,
+    ) -> None:
         self._baselines: dict[str, np.ndarray] = {}
+        self._baseline_f: dict[str, np.ndarray] = {}
         self._tracks: dict[str, list[_TrackedObject]] = {}
+        self._heal: dict[str, list[_HealRegion]] = {}
+        self._last_adapt_at: dict[str, float] = {}
+        self._last_persist_at: dict[str, float] = {}
+        self._env_change_since: dict[str, float | None] = {}
         self._lock = threading.Lock()
+        self._adapt_tau = float(adapt_tau_seconds)
+        self._absorb_after = float(absorb_non_reinforced_seconds)
+        self._persist_every = float(persist_every_seconds)
 
     def load_baseline(self, camera_name: str, path: Path | None = None) -> bool:
         path = path or baseline_path(camera_name)
@@ -360,8 +427,7 @@ class NewObjectTracker:
         if image is None:
             return False
         with self._lock:
-            self._baselines[camera_name] = image
-            self._tracks[camera_name] = []
+            self._store_baseline_locked(camera_name, image, reset_tracks=True)
         return True
 
     def has_baseline(self, camera_name: str) -> bool:
@@ -379,9 +445,20 @@ class NewObjectTracker:
         if not ok:
             raise OSError(f"Could not write baseline: {path}")
         with self._lock:
-            self._baselines[camera_name] = frame.copy()
-            self._tracks[camera_name] = []
+            self._store_baseline_locked(camera_name, frame.copy(), reset_tracks=True)
+            self._last_persist_at[camera_name] = time.monotonic()
         return path
+
+    def _store_baseline_locked(
+        self, camera_name: str, image: np.ndarray, *, reset_tracks: bool
+    ) -> None:
+        self._baselines[camera_name] = image
+        self._baseline_f[camera_name] = image.astype(np.float32)
+        self._last_adapt_at[camera_name] = time.monotonic()
+        self._env_change_since[camera_name] = None
+        if reset_tracks:
+            self._tracks[camera_name] = []
+            self._heal[camera_name] = []
 
     def detect(
         self,
@@ -392,6 +469,7 @@ class NewObjectTracker:
         thing_boxes: list[Box] | None = None,
         min_area_ratio: float = 0.0035,
         confirm_seconds: float = 2.0,
+        adapt_tau_seconds: float | None = None,
     ) -> list[Box]:
         if frame is None or frame.size == 0:
             return []
@@ -408,6 +486,9 @@ class NewObjectTracker:
         h, w = frame.shape[:2]
         if baseline.shape[0] != h or baseline.shape[1] != w:
             baseline = cv2.resize(baseline, (w, h), interpolation=cv2.INTER_AREA)
+            with self._lock:
+                self._baselines[camera_name] = baseline
+                self._baseline_f[camera_name] = baseline.astype(np.float32)
 
         gray = _lighting_normalized_gray(frame)
         base = _lighting_normalized_gray(baseline)
@@ -421,6 +502,8 @@ class NewObjectTracker:
         _, mask = cv2.threshold(diff, thresh, 255, cv2.THRESH_BINARY)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=2)
+
+        change_ratio = float(np.count_nonzero(mask)) / float(max(1, mask.size))
 
         if person_boxes:
             for box in person_boxes:
@@ -444,6 +527,18 @@ class NewObjectTracker:
 
         now = time.monotonic()
         with self._lock:
+            heals = [
+                h for h in self._heal.get(camera_name, []) if h.until > now
+            ]
+            self._heal[camera_name] = heals
+            if heals:
+                filtered: list[Box] = []
+                for cand in candidates:
+                    if any(cand.iou(h.box) >= 0.2 for h in heals):
+                        continue
+                    filtered.append(cand)
+                candidates = filtered
+
             tracks = self._tracks.setdefault(camera_name, [])
             updated: list[_TrackedObject] = []
             for cand in candidates:
@@ -467,7 +562,15 @@ class NewObjectTracker:
                     needed = 1.0 if matched.reinforced else confirm_seconds
                     if not matched.confirmed and now - matched.first_seen >= needed:
                         matched.confirmed = True
-                    updated.append(matched)
+                        matched.first_confirmed = now
+                    # If a confirmed "object" now blends with the porch, it was
+                    # removed — the leftover change is a baseline hole to heal.
+                    if matched.confirmed and _blends_with_surroundings(frame, cand):
+                        self._heal.setdefault(camera_name, []).append(
+                            _HealRegion(box=cand, until=now + _HEAL_SECONDS)
+                        )
+                    else:
+                        updated.append(matched)
                     tracks.remove(matched)
                 else:
                     updated.append(
@@ -480,10 +583,167 @@ class NewObjectTracker:
                         )
                     )
             for track in tracks:
-                if track.confirmed and now - track.last_seen < 1.25:
+                if track.confirmed and now - track.last_seen < _TRACK_GRACE_S:
                     updated.append(track)
+                elif track.confirmed:
+                    # Package left — heal the frozen hole so it does not
+                    # immediately re-trigger as a new object.
+                    self._heal.setdefault(camera_name, []).append(
+                        _HealRegion(box=track.box, until=now + _HEAL_SECONDS)
+                    )
             self._tracks[camera_name] = updated
-            return [t.box for t in updated if t.confirmed]
+            confirmed = [t.box for t in updated if t.confirmed]
+            self._adapt_baseline_locked(
+                camera_name,
+                frame,
+                updated,
+                person_boxes or [],
+                change_ratio=change_ratio,
+                now=now,
+                adapt_tau_seconds=adapt_tau_seconds,
+            )
+            return confirmed
+
+    def _freeze_mask(
+        self,
+        h: int,
+        w: int,
+        tracks: list[_TrackedObject],
+        person_boxes: list[Box],
+        now: float,
+    ) -> np.ndarray:
+        """True where the baseline must not adapt (packages / people)."""
+        freeze = np.zeros((h, w), dtype=bool)
+        for box in person_boxes:
+            pad = 20
+            x1, y1 = max(0, box.x1 - pad), max(0, box.y1 - pad)
+            x2, y2 = min(w, box.x2 + pad), min(h, box.y2 + pad)
+            freeze[y1:y2, x1:x2] = True
+        for track in tracks:
+            # Keep unconfirmed candidates frozen during the confirm window.
+            if not track.confirmed:
+                box = track.box
+                pad = 12
+                x1, y1 = max(0, box.x1 - pad), max(0, box.y1 - pad)
+                x2, y2 = min(w, box.x2 + pad), min(h, box.y2 + pad)
+                freeze[y1:y2, x1:x2] = True
+                continue
+            # YOLO-reinforced packages stay frozen forever.
+            # Non-reinforced blobs may eventually absorb (leaf piles, etc.).
+            age = 0.0
+            if track.first_confirmed is not None:
+                age = now - track.first_confirmed
+            if track.reinforced or age < self._absorb_after:
+                box = track.box
+                pad = 12
+                x1, y1 = max(0, box.x1 - pad), max(0, box.y1 - pad)
+                x2, y2 = min(w, box.x2 + pad), min(h, box.y2 + pad)
+                freeze[y1:y2, x1:x2] = True
+        return freeze
+
+    def _adapt_baseline_locked(
+        self,
+        camera_name: str,
+        frame: np.ndarray,
+        tracks: list[_TrackedObject],
+        person_boxes: list[Box],
+        *,
+        change_ratio: float,
+        now: float,
+        adapt_tau_seconds: float | None,
+    ) -> None:
+        h, w = frame.shape[:2]
+        base_f = self._baseline_f.get(camera_name)
+        if base_f is None:
+            return
+        if base_f.shape[0] != h or base_f.shape[1] != w:
+            base_f = cv2.resize(base_f, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32)
+            self._baseline_f[camera_name] = base_f
+
+        confirmed_any = any(t.confirmed for t in tracks)
+        people_present = bool(person_boxes)
+
+        # Whole-scene environmental shift (snow dump): speed up adapt when
+        # nothing is flagged as a package and nobody is walking through.
+        env_since = self._env_change_since.get(camera_name)
+        if (
+            change_ratio >= _ENV_CHANGE_RATIO
+            and not confirmed_any
+            and not people_present
+        ):
+            if env_since is None:
+                self._env_change_since[camera_name] = now
+                env_since = now
+        else:
+            self._env_change_since[camera_name] = None
+            env_since = None
+
+        tau = float(adapt_tau_seconds) if adapt_tau_seconds is not None else self._adapt_tau
+        if (
+            env_since is not None
+            and now - env_since >= _ENV_SETTLE_S
+            and not confirmed_any
+        ):
+            tau = min(tau, float(_ENV_ADAPT_TAU_S))
+
+        last = self._last_adapt_at.get(camera_name, now)
+        dt = max(0.0, now - last)
+        self._last_adapt_at[camera_name] = now
+        if dt <= 0.0 or tau <= 0.0:
+            return
+        alpha = 1.0 - math.exp(-dt / tau)
+        # Cap a single step so a hitch doesn't yank the baseline.
+        alpha = min(alpha, 0.08)
+        if alpha < 1e-6:
+            return
+
+        freeze = self._freeze_mask(h, w, tracks, person_boxes, now)
+        frame_f = frame.astype(np.float32)
+        if not np.any(freeze):
+            base_f = (1.0 - alpha) * base_f + alpha * frame_f
+        else:
+            update3 = (~freeze)[:, :, None]
+            mixed = (1.0 - alpha) * base_f + alpha * frame_f
+            base_f = np.where(update3, mixed, base_f)
+
+        # Fast-heal regions where a package recently left (frozen hole).
+        heals = [h for h in self._heal.get(camera_name, []) if h.until > now]
+        if heals:
+            heal_alpha = 1.0 - math.exp(-dt / _HEAL_ADAPT_TAU_S)
+            heal_alpha = min(heal_alpha, 0.25)
+            if heal_alpha >= 1e-6:
+                heal_mask = np.zeros((h, w), dtype=bool)
+                for region in heals:
+                    box = region.box
+                    pad = 8
+                    x1, y1 = max(0, box.x1 - pad), max(0, box.y1 - pad)
+                    x2, y2 = min(w, box.x2 + pad), min(h, box.y2 + pad)
+                    heal_mask[y1:y2, x1:x2] = True
+                heal3 = heal_mask[:, :, None]
+                healed = (1.0 - heal_alpha) * base_f + heal_alpha * frame_f
+                base_f = np.where(heal3, healed, base_f)
+
+        np.clip(base_f, 0, 255, out=base_f)
+        self._baseline_f[camera_name] = base_f
+        self._baselines[camera_name] = np.round(base_f).astype(np.uint8)
+
+        last_persist = self._last_persist_at.get(camera_name, 0.0)
+        if now - last_persist >= self._persist_every:
+            self._persist_baseline_locked(camera_name)
+
+    def _persist_baseline_locked(self, camera_name: str) -> None:
+        image = self._baselines.get(camera_name)
+        if image is None:
+            return
+        path = baseline_path(camera_name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".part")
+            if cv2.imwrite(str(tmp), image):
+                tmp.replace(path)
+                self._last_persist_at[camera_name] = time.monotonic()
+        except OSError:
+            pass
 
 
 @dataclass
