@@ -119,6 +119,23 @@ def test_demo_config_matches_grid() -> None:
     assert all(cam.url and cam.url.startswith("demo://") for cam in cfg.cameras)
 
 
+def test_power_and_safe_mode_defaults() -> None:
+    cfg = parse_config({"cameras": [{"name": "A", "url": "rtsp://192.168.1.10/live"}]})
+    assert cfg.display.power_mode == "auto"
+    assert cfg.display.low_power_fps == 12.0
+    assert cfg.display.safe_mode_on_crash is True
+
+
+def test_power_mode_must_be_valid() -> None:
+    with pytest.raises(ConfigError, match="power_mode"):
+        parse_config(
+            {
+                "display": {"power_mode": "turbo"},
+                "cameras": [{"name": "A", "url": "rtsp://192.168.1.10/live"}],
+            }
+        )
+
+
 def test_load_config_from_disk(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(

@@ -21,6 +21,8 @@ These are in `main` (merged via PRs #1–#4). Nothing below is “coming later.�
 - **Weather HUD** — Open-Meteo widget, placeable on the mosaic, per-line toggles, opacity
 - **Home Assistant** — local door/sensor links (popup, HUD, highlight, autofocus, sound) and a right-side lights panel (`]`)
 - GPU/CPU **decode** controls (`auto` / `cpu` / `gpu`, VAAPI/CUDA/QSV/D3D11/VideoToolbox) plus decode status
+- **Low power** — if UI FPS stays below 12, extras pause and only video + HUD keep running (`Esc` → Video settings)
+- **Safe mode** — after a crash, the next start is video + HUD only until you choose Exit safe mode
 - Reboot Ubiquiti (SSH) or Reolink / Amcrest / Dahua (HTTP) from the menu or CLI
 - Ubuntu login autostart (XDG `.desktop` or systemd user unit) and Windows Startup folder
 - Linux fullscreen uses the real screen size from `xrandr` so OpenCV Qt does not squash the grid
@@ -288,7 +290,14 @@ display:
 - **Decode** — `auto` (prefer GPU, fall back to CPU), `cpu`, or `gpu`
 - **HW backend** — `auto`, `none`, or a specific FFmpeg accel (`cuda`, `qsv`, `vaapi`, `d3d11va`, `videotoolbox`)
 - **HUD opacity** — transparency of the camera name/status strip on each tile
+- **Low power** — `Auto` (pause extras if UI FPS stays under `low_power_fps`, default 12), `On` (always video+HUD), or `Off`
 - **Decode status…** — OpenCV/FFmpeg capability summary plus the path each camera actually opened with (e.g. `auto/vaapi`, `cpu (fallback)`)
+
+On a slow PC, Auto keeps camera tiles and the name/status HUD and skips detection, weather, Home Assistant, person events, and rewind encoding until FPS recovers. A **LOW POWER** badge shows while that is active.
+
+### Safe mode (after a crash)
+
+If the app is killed or raises, the next launch starts in **safe mode**: same video+HUD-only path, with a **SAFE MODE** badge. Use `Esc` → **Exit safe mode (restore extras)** or `security-monitor --no-safe-mode`. Force it with `--safe-mode`. Disable the auto-recover behavior with `display.safe_mode_on_crash: false`.
 
 Changing decode mode or backend reconnects streams. Optional `display.hwaccel_device` (e.g. `/dev/dri/renderD128`) is for VAAPI. Stock `opencv-python` wheels often still decode on the CPU even when hardware acceleration is requested — use `security-monitor check` to see what this build reports.
 
@@ -364,6 +373,8 @@ A camera can have **multiple zones** (mix of lines and polygons). Any person who
 security-monitor                 # mosaic from config.yaml
 security-monitor -c other.yaml
 security-monitor --fullscreen
+security-monitor --safe-mode          # video + HUD only
+security-monitor --no-safe-mode       # ignore unclean-exit marker
 security-monitor --delay 15      # wait before opening (login / network)
 security-monitor --columns 3 --rows 2
 security-monitor demo
@@ -406,6 +417,8 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 - **NO SIGNAL / connect failed** — verify the URL in VLC first, then try `transport: tcp`.
 - **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python`.
 - **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost. Try `decode_mode: cpu` if a bad GPU path stalls opens.
+- **Choppy mosaic / low FPS** — Video settings → **Low power: Auto** (default). Extras pause until the UI is above ~15 fps. Use **On** to lock video+HUD only.
+- **Started in SAFE MODE** — previous run did not exit cleanly. Esc → Exit safe mode, or `--no-safe-mode`.
 - **Want GPU decode** — set `decode_mode: gpu` (or `auto`) and pick a backend under Video settings. Confirm with **Decode status…** or `security-monitor check`. Pip wheels frequently lack working CUDA/VAAPI decode; a custom OpenCV/FFmpeg build may be required.
 - **Linux display** — needs an X11/Wayland session. SSH needs X forwarding or a desktop.
 - **Squished / stretched mosaic on Linux** — OpenCV’s Qt window backend often reports the wrong window size (especially fullscreen). This build ignores bad rects and paints at the real screen size from `xrandr`. Update to the latest package, then:

@@ -182,6 +182,18 @@ def _add_run_flags(parser: argparse.ArgumentParser, *, suppress_defaults: bool =
     )
     parser.add_argument("--columns", type=int, help="Override grid columns", **extra)
     parser.add_argument("--rows", type=int, help="Override grid rows", **extra)
+    parser.add_argument(
+        "--safe-mode",
+        action="store_true",
+        help="Start with video + HUD only (skip detection, weather, Home Assistant)",
+        **extra,
+    )
+    parser.add_argument(
+        "--no-safe-mode",
+        action="store_true",
+        help="Ignore the unclean-exit marker and start with full features",
+        **extra,
+    )
 
 
 def _maybe_delay(args: argparse.Namespace) -> None:
@@ -192,15 +204,32 @@ def _maybe_delay(args: argparse.Namespace) -> None:
     time.sleep(delay)
 
 
+def _safe_mode_from_args(args: argparse.Namespace, *, on_crash: bool) -> bool:
+    from security_monitor.runtime import crash_marker_present, should_start_safe_mode
+
+    force = bool(getattr(args, "safe_mode", False))
+    ignore = bool(getattr(args, "no_safe_mode", False))
+    safe = should_start_safe_mode(force=force, ignore=ignore, on_crash=on_crash)
+    if not safe:
+        return False
+    print("Starting in SAFE MODE — video and HUD only.")
+    if force:
+        print("(--safe-mode)")
+    elif crash_marker_present():
+        print("Previous session did not exit cleanly. Esc → Exit safe mode to restore extras.")
+    return True
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if getattr(args, "demo", False):
         return cmd_demo(args)
     _maybe_delay(args)
     config = load_config(getattr(args, "config", None))
     _apply_overrides(config, args)
+    safe = _safe_mode_from_args(args, on_crash=config.display.safe_mode_on_crash)
     from security_monitor.mosaic import run_monitor
 
-    return run_monitor(config)
+    return run_monitor(config, safe_mode=safe)
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
@@ -212,10 +241,11 @@ def cmd_demo(args: argparse.Namespace) -> int:
     config = demo_config(columns=columns, rows=rows)
     if getattr(args, "fullscreen", False):
         config.display.fullscreen = True
+    safe = _safe_mode_from_args(args, on_crash=config.display.safe_mode_on_crash)
     from security_monitor.mosaic import run_monitor
 
     print("Demo mode — synthetic feeds, no network cameras.")
-    return run_monitor(config)
+    return run_monitor(config, safe_mode=safe)
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -231,6 +261,13 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(
         f"Buffer: smooth={'on' if d.smooth_buffer else 'off'} ({d.smooth_buffer_seconds:g}s)  "
         f"rewind={'on' if d.rewind_buffer else 'off'} ({d.rewind_buffer_seconds:g}s)"
+    )
+    from security_monitor.runtime import crash_marker_present, power_mode_label
+
+    marker = "unclean (will safe-mode)" if crash_marker_present() else "clean"
+    print(
+        f"Power: {power_mode_label(d.power_mode, threshold=d.low_power_fps)}  "
+        f"safe_mode_on_crash={'on' if d.safe_mode_on_crash else 'off'}  last_exit={marker}"
     )
     from security_monitor.decode import decode_mode_label, opencv_decode_summary
 
