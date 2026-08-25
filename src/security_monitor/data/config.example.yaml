@@ -42,6 +42,9 @@ display:
   # Detection masters (also enable per camera below / in Esc → Detection).
   people_detection: false
   object_detection: false
+  # Encroachment: person in tripwire zone → highlight (+ optional autofocus).
+  encroachment_detection: false
+  encroachment_autofocus: false
   # Auto snapshot + pre/during/post clip when a person appears (Esc → Detection).
   auto_person_capture: false
   person_pre_roll_seconds: 5
@@ -66,6 +69,9 @@ cameras:
     type: ubiquiti
     # detect_people: false
     # detect_objects: false
+    # detect_encroachment: false
+    # encroach_line: [0.0, 0.5, 1.0, 0.5]   # normalized tripwire
+    # encroach_side: positive                 # positive | negative
     # rotate: 180             # clockwise degrees if the camera is mounted upside-down
     # username: camera
     # password: secret

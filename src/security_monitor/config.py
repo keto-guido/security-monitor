@@ -20,6 +20,7 @@ VALID_SCREEN_ROTATIONS = ("none", "normal", "left", "right", "inverted")
 VALID_CAMERA_ROTATIONS = (0, 90, 180, 270)
 VALID_DECODE_MODES = ("auto", "cpu", "gpu")
 VALID_HWACCELS = ("auto", "none", "cuda", "qsv", "vaapi", "d3d11va", "videotoolbox")
+VALID_ENCROACH_SIDES = ("positive", "negative")
 URL_SCHEMES = ("rtsp", "rtp", "http", "https", "file", "rtmp")
 
 # Esc → Cameras → Layout presets (columns, rows).
@@ -62,6 +63,10 @@ class CameraConfig:
     rotate: int = 0  # clockwise degrees: 0 | 90 | 180 | 270
     detect_people: bool = False
     detect_objects: bool = False
+    # Encroachment tripwire (normalized line + which half-plane is the zone).
+    detect_encroachment: bool = False
+    encroach_line: tuple[float, float, float, float] | None = None
+    encroach_side: str = "positive"  # positive | negative
 
     @property
     def is_device(self) -> bool:
@@ -120,6 +125,9 @@ class DisplayConfig:
     # Detection masters (still requires per-camera opt-in).
     people_detection: bool = False
     object_detection: bool = False
+    # Encroachment: person in tripwire zone → highlight (+ optional autofocus).
+    encroachment_detection: bool = False
+    encroachment_autofocus: bool = False
     # Auto person events: snapshot + pre/during/post clip (Esc → Detection).
     auto_person_capture: bool = False
     person_pre_roll_seconds: float = 5.0
@@ -286,6 +294,12 @@ def camera_to_dict(cam: CameraConfig) -> dict[str, Any]:
         item["detect_people"] = True
     if cam.detect_objects:
         item["detect_objects"] = True
+    if cam.detect_encroachment:
+        item["detect_encroachment"] = True
+    if cam.encroach_line is not None:
+        item["encroach_line"] = [float(v) for v in cam.encroach_line]
+    if cam.encroach_side and cam.encroach_side != "positive":
+        item["encroach_side"] = str(cam.encroach_side)
     return item
 
 
@@ -370,6 +384,8 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["clip_seconds"] = float(d.clip_seconds)
     display["people_detection"] = bool(d.people_detection)
     display["object_detection"] = bool(d.object_detection)
+    display["encroachment_detection"] = bool(d.encroachment_detection)
+    display["encroachment_autofocus"] = bool(d.encroachment_autofocus)
     display["auto_person_capture"] = bool(d.auto_person_capture)
     display["person_pre_roll_seconds"] = float(d.person_pre_roll_seconds)
     display["person_post_roll_seconds"] = float(d.person_post_roll_seconds)
@@ -451,6 +467,12 @@ def _parse_display(raw: Any) -> DisplayConfig:
         raise ConfigError("display.clip_seconds must be <= 300")
     data.people_detection = _bool(raw, "people_detection", data.people_detection)
     data.object_detection = _bool(raw, "object_detection", data.object_detection)
+    data.encroachment_detection = _bool(
+        raw, "encroachment_detection", data.encroachment_detection
+    )
+    data.encroachment_autofocus = _bool(
+        raw, "encroachment_autofocus", data.encroachment_autofocus
+    )
     data.auto_person_capture = _bool(raw, "auto_person_capture", data.auto_person_capture)
     data.person_pre_roll_seconds = _positive_float(
         raw, "person_pre_roll_seconds", data.person_pre_roll_seconds
@@ -560,6 +582,19 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
             raise ConfigError(
                 f"cameras[{index}].rotate must be one of {VALID_CAMERA_ROTATIONS}"
             )
+    encroach_line = None
+    if "encroach_line" in raw and raw.get("encroach_line") is not None:
+        try:
+            from security_monitor.encroachment import parse_encroach_line
+
+            encroach_line = parse_encroach_line(raw.get("encroach_line"))
+        except ValueError as exc:
+            raise ConfigError(f"cameras[{index}].{exc}") from exc
+    encroach_side = str(raw.get("encroach_side", "positive") or "positive").strip().lower()
+    if encroach_side not in VALID_ENCROACH_SIDES:
+        raise ConfigError(
+            f"cameras[{index}].encroach_side must be one of {VALID_ENCROACH_SIDES}"
+        )
     return CameraConfig(
         name=name,
         url=url,
@@ -575,6 +610,9 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
         rotate=rotate,
         detect_people=_bool(raw, "detect_people", False),
         detect_objects=_bool(raw, "detect_objects", False),
+        detect_encroachment=_bool(raw, "detect_encroachment", False),
+        encroach_line=encroach_line,
+        encroach_side=encroach_side,
     )
 
 
