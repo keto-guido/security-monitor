@@ -1,0 +1,57 @@
+# Copy this file to config.yaml and edit to match your cameras:
+#   copy config.example.yaml config.yaml
+#
+# URLs may be rtsp://, rtp://, http:// (MJPEG), or a local video file path.
+# Prefer the username/password fields over embedding credentials in the URL.
+
+display:
+  # Grid of camera tiles. Default is 2x2 (4 cameras).
+  columns: 2
+  rows: 2
+  cell_width: 640
+  cell_height: 360
+  # How frames are fitted into a tile: fit (letterbox), fill (crop), stretch
+  scale_mode: fit
+  window_title: Security Monitor
+  fullscreen: false
+  show_labels: true
+  show_fps: true
+  # Target UI refresh rate. Camera capture runs independently.
+  fps: 25
+  reconnect_seconds: 5
+  # tcp is usually more reliable through routers/NAT; udp is lower latency.
+  default_transport: tcp
+  # Open/read timeouts for FFmpeg-backed streams (milliseconds).
+  open_timeout_ms: 8000
+  read_timeout_ms: 5000
+
+cameras:
+  - name: Front Door
+    url: rtsp://192.168.1.10:554/Streaming/Channels/101
+    enabled: true
+    # username: camera
+    # password: secret
+
+  - name: Driveway
+    url: rtsp://192.168.1.11:554/stream1
+    enabled: true
+    transport: tcp
+
+  - name: Backyard
+    url: rtsp://192.168.1.12:554/live
+    enabled: true
+
+  - name: Garage
+    url: rtsp://192.168.1.13:554/h264
+    enabled: true
+
+  # Extra cameras are ignored unless you raise columns * rows.
+  # Local webcam (useful for testing the mosaic):
+  # - name: Webcam
+  #   device: 0
+  #   enabled: true
+  #
+  # Local file:
+  # - name: Playback
+  #   url: C:/path/to/clip.mp4
+  #   enabled: true
