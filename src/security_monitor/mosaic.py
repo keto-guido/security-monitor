@@ -1858,6 +1858,17 @@ class MosaicApp:
             self._menu_index = 0
             self._configure_ha_service()
             self._reboot_notice = self._ha.snapshot.status_line()
+            if (
+                self.display.ha_url
+                and self.display.ha_token
+                and not self._ha.entities
+                and not self._ha.entities_error
+            ):
+                threading.Thread(
+                    target=lambda: self._ha.refresh_entities(),
+                    name="ha-entities",
+                    daemon=True,
+                ).start()
         elif action == "ha_back":
             self._reset_ha_wizard()
             self._menu_page = "root"
