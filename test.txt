@@ -1,4 +1,6 @@
-python -m venv .venv
-.venv\Scripts\activate
-pip install -e .
-security-monitor init
+sudo apt install -y python3-venv fonts-dejavu-core libgl1 libglib2.0-0
+python3 -m venv .venv && source .venv/bin/activate && pip install -e .
+security-monitor init --user          # ~/.config/security-monitor/config.yaml
+# edit camera URLs, then:
+security-monitor check
+security-monitor autostart install --fullscreen
