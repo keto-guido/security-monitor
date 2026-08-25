@@ -41,6 +41,8 @@ class CameraConfig:
     ssh_port: int = 22
     http_port: int = 80
     rotate: int = 0  # clockwise degrees: 0 | 90 | 180 | 270
+    detect_people: bool = False
+    detect_objects: bool = False
 
     @property
     def is_device(self) -> bool:
@@ -96,6 +98,9 @@ class DisplayConfig:
     save_directory: str = ""  # empty → ~/security-monitor/captures
     snapshot_format: str = "jpg"  # jpg | png
     clip_seconds: float = 15.0
+    # Detection masters (still requires per-camera opt-in).
+    people_detection: bool = False
+    object_detection: bool = False
 
     @property
     def tile_count(self) -> int:
@@ -215,7 +220,7 @@ def example_config_text() -> str:
 
 def save_display_settings(config: AppConfig) -> Path | None:
     """
-    Persist buffer/rewind (and related display toggles) back into config.yaml.
+    Persist buffer/rewind/capture/detection toggles back into config.yaml.
 
     Returns the path written, or None if there is no config file to update
     (e.g. pure demo mode).
@@ -241,6 +246,22 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["save_directory"] = str(d.save_directory or "")
     display["snapshot_format"] = str(d.snapshot_format)
     display["clip_seconds"] = float(d.clip_seconds)
+    display["people_detection"] = bool(d.people_detection)
+    display["object_detection"] = bool(d.object_detection)
+
+    cameras_raw = raw.get("cameras")
+    if isinstance(cameras_raw, list):
+        by_name = {cam.name: cam for cam in config.cameras}
+        for item in cameras_raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            cam = by_name.get(name)
+            if cam is None:
+                continue
+            item["detect_people"] = bool(cam.detect_people)
+            item["detect_objects"] = bool(cam.detect_objects)
+
     path.write_text(
         yaml.safe_dump(raw, sort_keys=False, default_flow_style=False),
         encoding="utf-8",
@@ -306,6 +327,8 @@ def _parse_display(raw: Any) -> DisplayConfig:
     data.clip_seconds = _positive_float(raw, "clip_seconds", data.clip_seconds)
     if data.clip_seconds > 300:
         raise ConfigError("display.clip_seconds must be <= 300")
+    data.people_detection = _bool(raw, "people_detection", data.people_detection)
+    data.object_detection = _bool(raw, "object_detection", data.object_detection)
     return data
 
 
@@ -391,6 +414,8 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
         ssh_port=ssh_port,
         http_port=http_port,
         rotate=rotate,
+        detect_people=_bool(raw, "detect_people", False),
+        detect_objects=_bool(raw, "detect_objects", False),
     )
 
 

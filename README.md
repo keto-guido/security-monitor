@@ -6,33 +6,32 @@ Default layout is **2×2 (4 cameras)**. Streams can be `rtsp://` or `rtp://` (HT
 
 ## Install
 
-Python 3.10+ is required. From the project directory:
+Python 3.10+ and a desktop session (Windows, or Linux X11/Wayland) are required.
+
+One-line install (recommended):
 
 ```bash
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# Linux
-source .venv/bin/activate
-
-pip install -e .
+python -m pip install -U "git+https://github.com/keto-guido/security-monitor.git"
 ```
 
-That installs the `security-monitor` command.
+That installs the `security-monitor` command and all Python dependencies (`opencv-python`, etc.).
 
-### Ubuntu packages
+### Ubuntu system packages
 
-On Ubuntu Desktop, install a few system packages first (venv, fonts for HUD text, and OpenGL for OpenCV):
+On Ubuntu Desktop, install these once before the pip line (venv optional if you use `--user`):
 
 ```bash
-sudo apt update
-sudo apt install -y python3-venv python3-pip \
+sudo apt update && sudo apt install -y python3-pip python3-venv \
   fonts-dejavu-core libgl1 libglib2.0-0
 ```
 
-You need a logged-in graphical session (X11 or Wayland). Headless SSH alone will not show the window.
+### Editable / from a clone
+
+```bash
+git clone https://github.com/keto-guido/security-monitor.git
+cd security-monitor
+python -m pip install -e .
+```
 
 ## Quick start
 
@@ -129,6 +128,8 @@ display:
   # save_directory: ~/security-monitor/captures
   snapshot_format: jpg           # jpg | png
   clip_seconds: 15               # default Save clip length
+  people_detection: false        # master switch (also enable per camera)
+  object_detection: false        # packages / left-behind items vs baseline
 
 cameras:
   - name: Front Door
@@ -139,6 +140,8 @@ cameras:
     enabled: true
     transport: tcp
     # rotate: 180           # 0 | 90 | 180 | 270 if the camera hangs upside-down
+    # detect_people: false  # opt this camera into people boxes
+    # detect_objects: false # opt this camera into "new object" boxes
 ```
 
 Config search order:
@@ -187,7 +190,13 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu also has **Capture** (snapshot, clip length/format, save folder), **Video settings** (smooth buffer on/off + length, rewind buffer on/off + length), and **Reboot cameras**. Capture and buffer settings are saved back into `config.yaml` when changed. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu also has **Capture** (snapshot, clip length/format, save folder), **Detection** (people / new-object masters, per-camera includes, set empty-area baseline), **Video settings** (smooth buffer + rewind), and **Reboot cameras**. Settings are saved back into `config.yaml` when changed. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+
+### Detection notes
+
+- **People** and **new object** detection are off until you opt in globally **and** per camera (`Esc` → Detection).
+- **Set empty-area baseline** while the porch/yard is clear (no packages). New persistent blobs vs that baseline get a `new object` box until they disappear.
+- People boxes use MobileNet-SSD (downloaded once into `~/.cache/security-monitor/models/`) with an OpenCV HOG fallback — works on Windows and Linux. No extra pip packages beyond this project's install.
 
 ## Commands
 

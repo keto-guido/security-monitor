@@ -39,12 +39,17 @@ display:
   # save_directory: ~/security-monitor/captures
   snapshot_format: jpg          # jpg | png
   clip_seconds: 15
+  # Detection masters (also enable per camera below / in Esc → Detection).
+  people_detection: false
+  object_detection: false
 
 cameras:
   - name: Front Door
     url: rtsp://192.168.1.10:554/Streaming/Channels/101
     enabled: true
     type: ubiquiti
+    # detect_people: false
+    # detect_objects: false
     # rotate: 180             # clockwise degrees if the camera is mounted upside-down
     # username: camera
     # password: secret

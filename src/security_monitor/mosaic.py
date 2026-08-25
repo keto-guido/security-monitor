@@ -74,7 +74,8 @@ from security_monitor.capture import (
     save_snapshot,
     write_clip,
 )
-from security_monitor.config import AppConfig, save_display_settings
+from security_monitor.config import AppConfig, CameraConfig, save_display_settings
+from security_monitor.detection import DetectionEngine, draw_boxes
 from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
 from security_monitor.reboot import RebootJob, reboot_targets
 from security_monitor.stream import Snapshot, build_sources
@@ -129,7 +130,9 @@ class MosaicApp:
         self.config = config
         self.display = config.display
         self.cameras = config.visible_cameras()
+        self._camera_by_name = {cam.name: cam for cam in self.cameras}
         self.sources = build_sources(self.cameras, self.display)
+        self._detection = DetectionEngine()
         self.zoom_index: int | None = None
         self.fullscreen = self.display.fullscreen
         self.window = self.display.window_title
@@ -361,8 +364,23 @@ class MosaicApp:
             message = snap.detail or snap.status.replace("_", " ")
             tile = placeholder(width, height, name, message.upper() or "NO SIGNAL")
         else:
+            frame = snap.frame
+            cam = self._camera_by_name.get(name)
+            if cam is not None and (
+                (self.display.people_detection and cam.detect_people)
+                or (self.display.object_detection and cam.detect_objects)
+            ):
+                boxes = self._detection.process(
+                    name,
+                    frame,
+                    detect_people=bool(self.display.people_detection and cam.detect_people),
+                    detect_objects=bool(self.display.object_detection and cam.detect_objects),
+                )
+                if boxes:
+                    frame = frame.copy()
+                    draw_boxes(frame, boxes)
             mode = self.display.scale_mode if self.view_zoom <= 1.001 else "fill"
-            tile = scale_frame(snap.frame, width, height, mode)
+            tile = scale_frame(frame, width, height, mode)
         if overlay:
             self._draw_cell_overlay(tile, snap, name)
         return tile
@@ -493,8 +511,8 @@ class MosaicApp:
             self._activate_menu(items[self._menu_index][0])
             return
         if ch in (ord("q"), ord("Q")):
-            if self._menu_page in {"reboot_confirm", "video", "capture"}:
-                self._menu_page = "root"
+            if self._menu_page in {"reboot_confirm", "video", "capture", "detection", "detection_cams"}:
+                self._menu_page = "root" if self._menu_page != "detection_cams" else "detection"
                 self._menu_index = 0
                 return
             self._activate_menu("exit")
@@ -506,7 +524,16 @@ class MosaicApp:
                 self._activate_menu(items[index][0])
 
     def _on_escape(self) -> None:
-        if self._menu_open and self._menu_page in {"reboot_confirm", "video", "capture"}:
+        if self._menu_open and self._menu_page == "detection_cams":
+            self._menu_page = "detection"
+            self._menu_index = 0
+            return
+        if self._menu_open and self._menu_page in {
+            "reboot_confirm",
+            "video",
+            "capture",
+            "detection",
+        }:
             self._menu_page = "root"
             self._menu_index = 0
             return
@@ -560,11 +587,34 @@ class MosaicApp:
                 ("capture_folder", f"Folder: {folder}"),
                 ("capture_back", "Back"),
             ]
+        if self._menu_page == "detection":
+            d = self.display
+            people = "On" if d.people_detection else "Off"
+            objects = "On" if d.object_detection else "Off"
+            cam = self._target_camera()
+            baseline_label = cam.name if cam else "(focus a camera)"
+            return [
+                ("people_master", f"People detection: {people}"),
+                ("object_master", f"Object detection: {objects}"),
+                ("detection_cams", "Cameras included…"),
+                ("set_baseline", f"Set empty-area baseline: {baseline_label}"),
+                ("detection_back", "Back"),
+            ]
+        if self._menu_page == "detection_cams":
+            items: list[tuple[str, str]] = []
+            for index, cam in enumerate(self.cameras):
+                p = "On" if cam.detect_people else "Off"
+                o = "On" if cam.detect_objects else "Off"
+                items.append((f"cam_people:{index}", f"{cam.name} — people: {p}"))
+                items.append((f"cam_objects:{index}", f"{cam.name} — objects: {o}"))
+            items.append(("detection_cams_back", "Back"))
+            return items
         fullscreen = "Windowed mode" if self.fullscreen else "Fullscreen"
         return [
             ("resume", "Resume"),
             ("fullscreen", fullscreen),
             ("capture", "Capture"),
+            ("detection", "Detection"),
             ("video", "Video settings"),
             ("reconnect", "Reconnect streams"),
             ("reboot", "Reboot cameras"),
@@ -585,6 +635,38 @@ class MosaicApp:
         elif action == "capture_back":
             self._menu_page = "root"
             self._menu_index = 0
+        elif action == "detection":
+            self._menu_page = "detection"
+            self._menu_index = 0
+            self._reboot_notice = ""
+            if self.display.people_detection:
+                backend = self._detection.ensure_ready()
+                if backend == "unavailable":
+                    self._reboot_notice = "People detector unavailable"
+                else:
+                    self._reboot_notice = f"People backend: {backend}"
+        elif action == "detection_back":
+            self._menu_page = "root"
+            self._menu_index = 0
+        elif action == "detection_cams":
+            self._menu_page = "detection_cams"
+            self._menu_index = 0
+            self._reboot_notice = ""
+        elif action == "detection_cams_back":
+            self._menu_page = "detection"
+            self._menu_index = 0
+        elif action == "people_master":
+            self._set_people_detection(not self.display.people_detection)
+        elif action == "object_master":
+            self._set_object_detection(not self.display.object_detection)
+        elif action == "set_baseline":
+            self._set_baseline_for_target()
+        elif action.startswith("cam_people:"):
+            index = int(action.split(":", 1)[1])
+            self._toggle_camera_detection(index, people=True)
+        elif action.startswith("cam_objects:"):
+            index = int(action.split(":", 1)[1])
+            self._toggle_camera_detection(index, people=False)
         elif action == "snap_now":
             self._save_snapshot()
             self._menu_open = False
@@ -657,6 +739,86 @@ class MosaicApp:
             self._apply_buffer_settings(persist=True)
         elif action == "snap_format":
             self._toggle_snapshot_format()
+        elif action == "people_master":
+            self._set_people_detection(not self.display.people_detection)
+        elif action == "object_master":
+            self._set_object_detection(not self.display.object_detection)
+        elif action.startswith("cam_people:"):
+            self._activate_menu(action)
+        elif action.startswith("cam_objects:"):
+            self._activate_menu(action)
+
+    def _set_people_detection(self, enabled: bool) -> None:
+        self.display.people_detection = bool(enabled)
+        if enabled:
+            backend = self._detection.ensure_ready()
+            self._reboot_notice = (
+                "People detector unavailable"
+                if backend == "unavailable"
+                else f"People backend: {backend}"
+            )
+        self._apply_buffer_settings(persist=True)
+        print(f"People detection {'on' if enabled else 'off'}")
+
+    def _set_object_detection(self, enabled: bool) -> None:
+        self.display.object_detection = bool(enabled)
+        self._apply_buffer_settings(persist=True)
+        print(f"Object detection {'on' if enabled else 'off'}")
+
+    def _toggle_camera_detection(self, index: int, *, people: bool) -> None:
+        if index < 0 or index >= len(self.cameras):
+            return
+        cam = self.cameras[index]
+        # Keep the same object identity as config.cameras for persistence.
+        for cfg_cam in self.config.cameras:
+            if cfg_cam.name == cam.name:
+                if people:
+                    cfg_cam.detect_people = not cfg_cam.detect_people
+                    cam.detect_people = cfg_cam.detect_people
+                else:
+                    cfg_cam.detect_objects = not cfg_cam.detect_objects
+                    cam.detect_objects = cfg_cam.detect_objects
+                break
+        self._camera_by_name[cam.name] = cam
+        self._apply_buffer_settings(persist=True)
+
+    def _target_camera(self) -> CameraConfig | None:
+        if self.zoom_index is not None and 0 <= self.zoom_index < len(self.cameras):
+            return self.cameras[self.zoom_index]
+        if self.cameras:
+            return self.cameras[0]
+        return None
+
+    def _set_baseline_for_target(self) -> None:
+        cam = self._target_camera()
+        if cam is None:
+            self._reboot_notice = "No camera available for baseline"
+            return
+        # Prefer the live (undelayed) frame for a clean empty-area reference.
+        source = next((s for s in self.sources if s.name == cam.name), None)
+        frame = None
+        if source is not None:
+            snap = source.snapshot()
+            frame = snap.frame
+        if frame is None:
+            self._reboot_notice = f"No frame for {cam.name}"
+            return
+        try:
+            path = self._detection.objects.set_baseline(cam.name, frame)
+        except (OSError, ValueError) as exc:
+            self._reboot_notice = f"Baseline failed: {exc}"
+            return
+        # Opt the camera into object detection when capturing a baseline.
+        cam.detect_objects = True
+        for cfg_cam in self.config.cameras:
+            if cfg_cam.name == cam.name:
+                cfg_cam.detect_objects = True
+                break
+        if not self.display.object_detection:
+            self.display.object_detection = True
+        self._apply_buffer_settings(persist=True)
+        self._reboot_notice = f"Baseline saved: {path.name}"
+        print(f"Baseline for {cam.name} → {path}")
 
     def _set_smooth_buffer(self, enabled: bool) -> None:
         previous = self.display.smooth_buffer
@@ -687,7 +849,7 @@ class MosaicApp:
             path = save_display_settings(self.config)
             if path is not None:
                 self._reboot_notice = f"Saved to {path.name}"
-            elif self._menu_page == "video":
+            elif self._menu_page in {"video", "detection", "detection_cams"}:
                 self._reboot_notice = "Settings applied (demo — not saved)"
 
     def _nudge_rewind(self, delta_seconds: float) -> None:
@@ -978,7 +1140,9 @@ class MosaicApp:
             return canvas
         canvas[:] = (canvas.astype(np.float32) * 0.38).astype(np.uint8)
         items = self._menu_items()
-        card_w, row_h, pad = (560 if self._menu_page in {"video", "capture"} else 480), 46, 20
+        card_w, row_h, pad = (
+            560 if self._menu_page in {"video", "capture", "detection", "detection_cams"} else 480
+        ), 46, 20
         title_h = 56
         footer_h = 36
         notice_h = 28 if self._reboot_notice else 0
@@ -997,6 +1161,8 @@ class MosaicApp:
             "reboot_confirm": "Confirm reboot",
             "video": "Video settings",
             "capture": "Capture",
+            "detection": "Detection",
+            "detection_cams": "Cameras for detection",
         }.get(self._menu_page, "Options")
         draw_text(
             canvas,
@@ -1044,6 +1210,8 @@ class MosaicApp:
             footer = "Enter toggle/cycle    ← → adjust    Esc back"
         elif self._menu_page == "capture":
             footer = "s snapshot  c clip    ← → length    Esc back"
+        elif self._menu_page in {"detection", "detection_cams"}:
+            footer = "Enter toggle    Set baseline on empty scene    Esc back"
         else:
             footer = "Enter to select    Esc to close"
         draw_text(
