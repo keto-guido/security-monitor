@@ -20,6 +20,10 @@ display:
   show_fps: true
   # Target UI refresh rate. Camera capture runs independently.
   fps: 25
+  # Low power: auto = drop extras if UI FPS stays below low_power_fps; on = always; off = never.
+  power_mode: auto            # auto | on | off
+  low_power_fps: 12
+  safe_mode_on_crash: true    # next start is video+HUD only after an unclean exit
   reconnect_seconds: 5
   # tcp is usually more reliable through routers/NAT; udp is lower latency.
   default_transport: tcp

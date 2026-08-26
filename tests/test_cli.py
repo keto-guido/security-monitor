@@ -22,6 +22,15 @@ def test_version_matches_package(capsys) -> None:
     assert __version__ in capsys.readouterr().out
 
 
+def test_safe_mode_flags_in_help(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--safe-mode" in help_text
+    assert "--no-safe-mode" in help_text
+
+
 def test_check_and_init(tmp_path: Path, capsys) -> None:
     dest = tmp_path / "config.yaml"
     assert main(["init", "-o", str(dest)]) == 0

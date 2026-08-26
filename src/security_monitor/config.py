@@ -40,6 +40,7 @@ VALID_WEATHER_SLOTS = (
     "custom",
 )
 VALID_WEATHER_UNITS = ("f", "c")
+VALID_POWER_MODES = ("auto", "on", "off")
 URL_SCHEMES = ("rtsp", "rtp", "http", "https", "file", "rtmp")
 
 # Esc → Cameras → Layout presets (columns, rows).
@@ -205,6 +206,11 @@ class DisplayConfig:
     ha_panel_enabled: bool = True
     ha_doors: list[HADoorMapping] = field(default_factory=list)
     ha_lights: list[HALightControl] = field(default_factory=list)
+    # Low-power: skip extras (detection, weather, HA, rewind) when the UI FPS drops.
+    power_mode: str = "auto"  # auto | on | off
+    low_power_fps: float = 12.0
+    # After an unclean exit, start with video + HUD only until the user recovers.
+    safe_mode_on_crash: bool = True
 
     @property
     def tile_count(self) -> int:
@@ -502,6 +508,9 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["ha_panel_enabled"] = bool(d.ha_panel_enabled)
     display["ha_doors"] = [door_mapping_to_dict(door) for door in d.ha_doors]
     display["ha_lights"] = [light_control_to_dict(light) for light in d.ha_lights]
+    display["power_mode"] = str(d.power_mode)
+    display["low_power_fps"] = float(d.low_power_fps)
+    display["safe_mode_on_crash"] = bool(d.safe_mode_on_crash)
 
     raw["cameras"] = [camera_to_dict(cam) for cam in config.cameras]
 
@@ -700,6 +709,13 @@ def _parse_display(raw: Any) -> DisplayConfig:
         data.ha_lights = parse_light_controls(raw.get("ha_lights", data.ha_lights))
     except ValueError as exc:
         raise ConfigError(f"display.{exc}") from exc
+    data.power_mode = str(raw.get("power_mode", data.power_mode)).strip().lower() or "auto"
+    if data.power_mode not in VALID_POWER_MODES:
+        raise ConfigError(f"display.power_mode must be one of {VALID_POWER_MODES}")
+    data.low_power_fps = float(raw.get("low_power_fps", data.low_power_fps) or data.low_power_fps)
+    if not (4.0 <= data.low_power_fps <= 30.0):
+        raise ConfigError("display.low_power_fps must be between 4 and 30")
+    data.safe_mode_on_crash = _bool(raw, "safe_mode_on_crash", data.safe_mode_on_crash)
     return data
 
 
