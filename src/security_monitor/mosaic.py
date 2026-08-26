@@ -160,6 +160,14 @@ from security_monitor.retention import (
     set_event_locked,
 )
 from security_monitor.stream import Snapshot, build_sources
+from security_monitor.runtime import (
+    POWER_MODE_CHOICES,
+    CrashGuard,
+    PowerPolicy,
+    PowerTracker,
+    clear_crash_marker,
+    power_mode_label,
+)
 from security_monitor.weather import (
     HUD_OPACITY_CHOICES,
     WEATHER_OPACITY_CHOICES,
@@ -193,6 +201,7 @@ HELP_LINES = (
     "Home     reset zoom",
     "r        reconnect all",
     "click    focus tile",
+    "low power  auto when UI FPS drops",
 )
 
 ZOOM_MIN = 1.0
@@ -379,9 +388,18 @@ def visible_menu_range(
 
 
 class MosaicApp:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, safe_mode: bool = False) -> None:
         self.config = config
         self.display = config.display
+        self._safe_mode = bool(safe_mode)
+        self._power = PowerTracker(
+            PowerPolicy(
+                mode=str(self.display.power_mode or "auto"),
+                fps_threshold=float(self.display.low_power_fps or 12.0),
+            )
+        )
+        self._power.set_mode(self.display.power_mode)
+        self._low_power = bool(self._power.low_power)
         self.cameras = config.visible_cameras()
         self._camera_by_name = {cam.name: cam for cam in self.cameras}
         self.sources = build_sources(self.cameras, self.display)
@@ -459,28 +477,55 @@ class MosaicApp:
         self._ha_panel_hitboxes: list[tuple[str, int, int, int, int]] = []
         self._configure_ha_service()
 
+    @property
+    def _extras_enabled(self) -> bool:
+        """Detection, weather, HA, events, rewind — off in safe mode or low power."""
+        return not self._safe_mode and not self._low_power
+
+    def _sync_power_services(self) -> None:
+        self._apply_buffer_settings(persist=False)
+
+    def _tick_power_mode(self, now: float) -> None:
+        if self._safe_mode:
+            return
+        self._power.policy.mode = str(self.display.power_mode or "auto")
+        self._power.policy.fps_threshold = float(self.display.low_power_fps or 12.0)
+        if not self._power.update(self._ui_fps, now):
+            self._low_power = bool(self._power.low_power)
+            return
+        self._low_power = bool(self._power.low_power)
+        self._sync_power_services()
+        if self._low_power:
+            message = (
+                f"Low power on — video + HUD only (UI {self._ui_fps:.0f} fps)"
+            )
+        else:
+            message = f"Low power off — extras restored (UI {self._ui_fps:.0f} fps)"
+        self._flash_capture(message, seconds=3.5)
+        print(message)
+
     def _configure_weather_service(self) -> None:
         d = self.display
         self._weather.configure(
-            enabled=bool(d.weather_enabled),
+            enabled=bool(d.weather_enabled and self._extras_enabled),
             latitude=d.weather_latitude,
             longitude=d.weather_longitude,
             place=d.weather_place or "",
             refresh_seconds=float(d.weather_refresh_seconds or 300),
         )
 
-    def _effective_ha_doors(self) -> list[HADoorMapping]:
-        return merge_camera_door_entities(list(self.display.ha_doors), self.config.cameras)
-
     def _configure_ha_service(self) -> None:
         d = self.display
         self._ha.configure(
-            enabled=bool(d.ha_enabled),
+            enabled=bool(d.ha_enabled and self._extras_enabled),
             url=d.ha_url,
             token=d.ha_token,
             poll_seconds=float(d.ha_poll_seconds or 2.0),
             doors=self._effective_ha_doors(),
         )
+
+    def _effective_ha_doors(self) -> list[HADoorMapping]:
+        return merge_camera_door_entities(list(self.display.ha_doors), self.config.cameras)
 
     def _ha_entity_by_id(self, entity_id: str) -> HAEntityInfo | None:
         key = entity_id.lower()
@@ -694,13 +739,18 @@ class MosaicApp:
             "Controls: Esc back/options | q quit | f fullscreen | 1-9 focus | "
             "n/p next/prev | ] HA lights | wheel/+/- zoom | arrows pan | h help"
         )
+        if self._safe_mode:
+            print("SAFE MODE: video + HUD only. Esc → Exit safe mode to restore extras.")
+        elif self._low_power:
+            print("Low power is ON (video + HUD only). Esc → Video settings to change.")
 
         delay = max(1, int(1000 / self.display.fps))
         stamps: list[float] = []
         try:
             while self._running:
-                self._tick_cycle_focus()
-                self._maybe_purge_media()
+                if self._extras_enabled:
+                    self._tick_cycle_focus()
+                    self._maybe_purge_media()
                 canvas = self._compose()
                 cv2.imshow(self.window, canvas)
                 now = time.monotonic()
@@ -708,6 +758,7 @@ class MosaicApp:
                 stamps = [t for t in stamps if now - t <= 1.5]
                 if len(stamps) >= 2:
                     self._ui_fps = (len(stamps) - 1) / (stamps[-1] - stamps[0])
+                self._tick_power_mode(now)
                 wait = getattr(cv2, "waitKeyEx", cv2.waitKey)
                 key = wait(delay)
                 if key >= 0:
@@ -783,14 +834,16 @@ class MosaicApp:
         return cell_w, cell_h, self._view_w, self._view_h
 
     def _compose(self) -> np.ndarray:
-        self._tick_person_events()
-        self._update_encroachment_state()
-        self._update_door_state()
+        extras = self._extras_enabled
+        if extras:
+            self._tick_person_events()
+            self._update_encroachment_state()
+            self._update_door_state()
         d = self.display
         cell_w, cell_h, width, height = self._sync_layout()
-        if self._weather_place_mode and self._weather_place_still is not None:
+        if extras and self._weather_place_mode and self._weather_place_still is not None:
             return self._finalize_ui(self._paint_weather_place_editor(width, height))
-        if self._event_playback is not None:
+        if extras and self._event_playback is not None:
             return self._finalize_ui(self._paint_event_playback(width, height))
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
             snap = self.sources[self.zoom_index].snapshot()
@@ -798,13 +851,14 @@ class MosaicApp:
             cell = self._render_cell(snap, name, width, height, overlay=False)
             cell = magnify(cell, self.view_zoom, self.pan_x, self.pan_y)
             self._draw_cell_overlay(cell, snap, name)
-            self._draw_zoom_badge(cell)
-            self._draw_buffer_badge(cell, snap)
-            self._feed_clip_job(cell)
-            self._draw_capture_hud(cell)
-            if d.ha_enabled:
-                draw_door_hud(cell, self._ha.snapshot, opacity=d.hud_opacity)
-            self._draw_ha_overlays(cell)
+            if extras:
+                self._draw_zoom_badge(cell)
+                self._draw_buffer_badge(cell, snap)
+                self._feed_clip_job(cell)
+                self._draw_capture_hud(cell)
+                if d.ha_enabled:
+                    draw_door_hud(cell, self._ha.snapshot, opacity=d.hud_opacity)
+                self._draw_ha_overlays(cell)
             return self._finalize_ui(cell)
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
@@ -814,7 +868,9 @@ class MosaicApp:
         x_off = max(0, (width - grid_w) // 2)
         y_off = max(0, (height - grid_h) // 2)
         self._grid_x, self._grid_y = x_off, y_off
-        reserved = self._resolve_weather_rect(width, height, x_off, y_off, grid_w, grid_h)
+        reserved = None
+        if extras:
+            reserved = self._resolve_weather_rect(width, height, x_off, y_off, grid_w, grid_h)
         self._weather_rect = reserved
         # Overlay mode keeps full camera tiles and paints weather on top.
         shrink = None if (reserved is None or d.weather_overlay) else reserved
@@ -846,22 +902,22 @@ class MosaicApp:
             else:
                 tile = placeholder(tw, th, "Empty", "No camera assigned")
             canvas[ty : ty + th, tx : tx + tw] = tile
-        if reserved is not None and not zoomed:
+        if extras and reserved is not None and not zoomed:
             self._paint_weather_widget(canvas, reserved, editing=False)
         if not zoomed:
             self._draw_grid_lines(canvas, x_off=x_off, y_off=y_off)
         canvas = magnify(canvas, self.view_zoom, self.pan_x, self.pan_y)
-        self._draw_zoom_badge(canvas)
-        if any_rewind or self.display.smooth_buffer or self.display.rewind_buffer:
-            # Aggregate badge from first live source when in grid view.
-            sample = self.sources[0].snapshot() if self.sources else None
-            if sample is not None:
-                self._draw_buffer_badge(canvas, sample)
-        self._feed_clip_job(canvas)
-        self._draw_capture_hud(canvas)
-        if d.ha_enabled and not zoomed:
-            draw_door_hud(canvas, self._ha.snapshot, opacity=d.hud_opacity)
-        self._draw_ha_overlays(canvas)
+        if extras:
+            self._draw_zoom_badge(canvas)
+            if any_rewind or self.display.smooth_buffer or self.display.rewind_buffer:
+                sample = self.sources[0].snapshot() if self.sources else None
+                if sample is not None:
+                    self._draw_buffer_badge(canvas, sample)
+            self._feed_clip_job(canvas)
+            self._draw_capture_hud(canvas)
+            if d.ha_enabled and not zoomed:
+                draw_door_hud(canvas, self._ha.snapshot, opacity=d.hud_opacity)
+            self._draw_ha_overlays(canvas)
         return self._finalize_ui(canvas)
 
     def _draw_ha_overlays(self, canvas: np.ndarray) -> None:
@@ -987,7 +1043,8 @@ class MosaicApp:
         return canvas
 
     def _finalize_ui(self, canvas: np.ndarray) -> np.ndarray:
-        if self.display.encroachment_alarm and (
+        extras = self._extras_enabled
+        if extras and self.display.encroachment_alarm and (
             any(self._encroach_active.values()) or time.monotonic() < self._alarm_until
         ):
             labels = [
@@ -999,7 +1056,7 @@ class MosaicApp:
                 labels = ["alert"]
             pulse = 0.55 + 0.45 * abs(math.sin(time.monotonic() * 7.0))
             draw_alarm_banner(canvas, labels, pulse=pulse)
-        elif self.display.ha_enabled and self._door_active:
+        elif extras and self.display.ha_enabled and self._door_active:
             labels = [f"{label}" for label in self._door_active.values()]
             pulse = 0.55 + 0.45 * abs(math.sin(time.monotonic() * 5.0))
             draw_alarm_banner(canvas, labels[:4], pulse=pulse, title="DOOR OPEN")
@@ -1016,6 +1073,7 @@ class MosaicApp:
         if self._event_playback is not None and self._menu_page == "events_play":
             # Playback canvas already painted; keep menu card on top.
             pass
+        self._draw_power_badge(canvas)
         return self._draw_prompt(self._draw_menu(self._draw_reboot(self._draw_help(canvas))))
 
     def _paint_capture_preview(
@@ -1096,8 +1154,10 @@ class MosaicApp:
         else:
             frame = snap.frame
             cam = self._camera_by_name.get(name)
+            extras = self._extras_enabled
             want_people = bool(
-                cam is not None
+                extras
+                and cam is not None
                 and (
                     (self.display.people_detection and cam.detect_people)
                     or (
@@ -1107,7 +1167,8 @@ class MosaicApp:
                 )
             )
             want_objects = bool(
-                cam is not None
+                extras
+                and cam is not None
                 and self.display.object_detection
                 and cam.detect_objects
             )
@@ -1120,7 +1181,8 @@ class MosaicApp:
                     detect_objects=want_objects,
                 )
             encroach_on = bool(
-                cam is not None
+                extras
+                and cam is not None
                 and self.display.encroachment_detection
                 and cam.detect_encroachment
             )
@@ -1608,6 +1670,15 @@ class MosaicApp:
                 menu_section("Decode"),
                 ("decode_mode", f"Decode: {d.decode_mode.upper()} — {decode}"),
                 ("hwaccel", f"HW backend: {d.hwaccel}"),
+                (
+                    "power_mode",
+                    "Low power: "
+                    + power_mode_label(
+                        d.power_mode,
+                        active=self._low_power and d.power_mode == "auto",
+                        threshold=d.low_power_fps,
+                    ),
+                ),
                 ("decode_status", "Decode status…"),
                 menu_section("Overlay"),
                 ("hud_opacity", f"HUD opacity: {opacity_label(d.hud_opacity)}"),
@@ -2058,7 +2129,7 @@ class MosaicApp:
             items.append(("cameras_remove_back", "Back"))
             return items
         fullscreen = "Windowed mode" if self.fullscreen else "Fullscreen"
-        return [
+        items = [
             ("resume", "Resume"),
             ("fullscreen", fullscreen),
             menu_section("Cameras"),
@@ -2078,6 +2149,24 @@ class MosaicApp:
             ("reboot", "Reboot cameras"),
             ("exit", "Exit"),
         ]
+        if self._safe_mode:
+            items.append(("exit_safe_mode", "Exit safe mode (restore extras)"))
+        items.extend(
+            [
+                ("cameras", "Cameras…"),
+                ("capture", "Capture"),
+                ("captures_root", "Saved captures…"),
+                ("events_root", "Person events…"),
+                ("detection", "Detection"),
+                ("weather", "Weather HUD…"),
+                ("ha", "Home Assistant…"),
+                ("video", "Video settings"),
+                ("reconnect", "Reconnect streams"),
+                ("reboot", "Reboot cameras"),
+                ("exit", "Exit"),
+            ]
+        )
+        return items
 
     def _activate_menu(self, action: str) -> None:
         if is_menu_header(action):
@@ -2088,6 +2177,14 @@ class MosaicApp:
         elif action == "fullscreen":
             self.fullscreen = not self.fullscreen
             self._apply_fullscreen()
+        elif action == "exit_safe_mode":
+            self._safe_mode = False
+            clear_crash_marker()
+            self._sync_power_services()
+            self._reboot_notice = "Safe mode off — extras restored"
+            print(self._reboot_notice)
+            self._menu_open = False
+            self._menu_page = "root"
         elif action == "capture":
             self._menu_page = "capture"
             self._menu_index = 0
@@ -2099,7 +2196,11 @@ class MosaicApp:
             self._menu_page = "detection"
             self._menu_index = 0
             self._reboot_notice = ""
-            if self.display.people_detection:
+            if not self._extras_enabled:
+                self._reboot_notice = (
+                    "Safe/low power: detection paused (video + HUD only)"
+                )
+            elif self.display.people_detection:
                 backend = self._detection.ensure_ready()
                 if backend == "unavailable":
                     self._reboot_notice = "People detector unavailable"
@@ -2639,6 +2740,8 @@ class MosaicApp:
             self._adjust_menu_item("hwaccel", 1)
         elif action == "hud_opacity":
             self._adjust_menu_item("hud_opacity", 1)
+        elif action == "power_mode":
+            self._adjust_menu_item("power_mode", 1)
         elif action == "decode_status":
             self._menu_page = "decode_status"
             self._menu_index = 0
@@ -2771,6 +2874,21 @@ class MosaicApp:
             )
             self._apply_buffer_settings(persist=True)
             self._reboot_notice = f"HUD opacity {opacity_label(self.display.hud_opacity)}"
+        elif action == "power_mode":
+            modes = POWER_MODE_CHOICES
+            try:
+                index = modes.index(self.display.power_mode)
+            except ValueError:
+                index = 0
+            self.display.power_mode = modes[(index + int(step)) % len(modes)]
+            self._power.set_mode(self.display.power_mode)
+            self._low_power = bool(self._power.low_power)
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = "Low power: " + power_mode_label(
+                self.display.power_mode,
+                active=self._low_power and self.display.power_mode == "auto",
+                threshold=self.display.low_power_fps,
+            )
         elif action == "hwaccel":
             previous = self.display.hwaccel
             self.display.hwaccel = next_hwaccel(self.display.hwaccel, step)
@@ -3296,19 +3414,18 @@ class MosaicApp:
 
     def _apply_buffer_settings(self, *, persist: bool = False) -> None:
         history_clip = float(self.display.clip_seconds)
-        if self.display.auto_person_capture:
+        extras = self._extras_enabled
+        if extras and self.display.auto_person_capture:
             history_clip = max(history_clip, float(self.display.person_pre_roll_seconds))
         for source in self.sources:
+            source.apply_buffer_settings(self.display)
             source.history.configure(
-                smooth_enabled=self.display.smooth_buffer,
+                smooth_enabled=bool(self.display.smooth_buffer and extras),
                 smooth_seconds=self.display.smooth_buffer_seconds,
-                rewind_enabled=self.display.rewind_buffer,
+                rewind_enabled=bool(self.display.rewind_buffer and extras),
                 rewind_seconds=self.display.rewind_buffer_seconds,
                 clip_seconds=history_clip,
             )
-            source.apply_buffer_settings(self.display)
-            # Re-apply history clip after apply_buffer_settings overwrote it.
-            source.history.configure(clip_seconds=history_clip)
         self._configure_weather_service()
         self._configure_ha_service()
         if persist:
@@ -4660,6 +4777,29 @@ class MosaicApp:
             valign="top",
         )
 
+    def _draw_power_badge(self, canvas: np.ndarray) -> None:
+        if self._safe_mode:
+            label = "SAFE MODE  video + HUD"
+            color = (40, 180, 255)
+        elif self._low_power:
+            label = f"LOW POWER  UI {self._ui_fps:.0f} fps"
+            color = (40, 200, 255)
+        else:
+            return
+        w = canvas.shape[1]
+        x0 = max(8, w // 2 - 170)
+        y0 = 8
+        shade_round_rect(canvas, (x0, y0, x0 + 340, y0 + 36), alpha=0.78, radius=10)
+        draw_text(
+            canvas,
+            label,
+            (w // 2, 14),
+            size=15,
+            color=color,
+            align="center",
+            valign="top",
+        )
+
     def _draw_buffer_badge(self, canvas: np.ndarray, snap: Snapshot) -> None:
         d = self.display
         if not d.smooth_buffer and not d.rewind_buffer:
@@ -5018,8 +5158,12 @@ def draw_status_bar(
     )
 
 
-def run_monitor(config: AppConfig) -> int:
-    return MosaicApp(config).run()
+def run_monitor(config: AppConfig, *, safe_mode: bool = False) -> int:
+    with CrashGuard() as guard:
+        app = MosaicApp(config, safe_mode=safe_mode)
+        code = app.run()
+        guard.disarm()
+        return code
 
 
 def escape_action(*, menu_open: bool, on_main_layout: bool) -> str:
