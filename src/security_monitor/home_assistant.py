@@ -837,6 +837,8 @@ def open_sensor_labels(doors: list[DoorState]) -> dict[str, str]:
     for door in doors:
         if not door.open:
             continue
+        if not door.notify_hud:
+            continue
         camera = (door.camera or "").strip()
         if not camera:
             continue

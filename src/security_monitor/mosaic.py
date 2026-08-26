@@ -134,7 +134,6 @@ from security_monitor.home_assistant import (
     HALightControl,
     HAPopup,
     HomeAssistantService,
-    cameras_highlighted_by_doors,
     default_trigger_states,
     domain_counts,
     door_open_edges,
@@ -147,10 +146,6 @@ from security_monitor.home_assistant import (
     merge_camera_door_entities,
     normalize_ha_url,
     open_sensor_labels,
-    prune_popups,
-    mask_token,
-    merge_camera_door_entities,
-    normalize_ha_url,
     prune_popups,
     suggested_states_for_entity,
     toast_seconds,
@@ -1741,6 +1736,7 @@ class MosaicApp:
         self._menu_open = False
         self._menu_page = "root"
         self._door_owned_focus = False
+        self._door_peek_until = 0.0
         self._encroach_owned_focus = False
 
     def _ensure_selectable_menu_index(
@@ -2161,7 +2157,7 @@ class MosaicApp:
                 ("ha_notify_name", f"Name: {draft.display_label}"),
                 ("ha_notify_info", f"{draft.display_label} → {cam} · {draft.trigger_label()}"),
                 ("ha_notify_popup", f"Popup toast: {'On' if draft.notify_popup else 'Off'}"),
-                ("ha_notify_hud", f"Persistent HUD strip: {'On' if draft.notify_hud else 'Off'}"),
+                ("ha_notify_hud", f"Tile note while open: {'On' if draft.notify_hud else 'Off'}"),
                 (
                     "ha_notify_highlight",
                     f"Highlight camera: {'On' if draft.notify_highlight else 'Off'}"
@@ -2440,6 +2436,14 @@ class MosaicApp:
                     break
         elif action == "ha_event_info":
             pass
+        elif action == "ha_notify_name":
+            draft = self._ha_draft
+            if draft is not None:
+                self._prompt = TextPrompt(
+                    title="Notification name",
+                    kind="ha_label",
+                    value=draft.display_label,
+                )
         elif action.startswith("ha_state:"):
             draft = self._ha_draft
             if draft is not None:
@@ -3183,9 +3187,9 @@ class MosaicApp:
             )
             self._apply_buffer_settings(persist=True)
             self._reboot_notice = (
-                f"Door hold {self.display.ha_hold_seconds:g}s"
+                f"Camera peek {self.display.ha_hold_seconds:g}s"
                 if self.display.ha_hold_seconds > 0
-                else "Camera hold off"
+                else "Camera peek off"
             )
         elif action == "ha_popup":
             self.display.ha_popup_seconds = float(
@@ -3786,18 +3790,18 @@ class MosaicApp:
             self._go_main_layout()
 
     def _update_door_state(self) -> None:
-        """React to Home Assistant door opens: HUD, highlight, optional autofocus."""
+        """Toasts + quiet tile chips; camera peek is a timed, dismissible zoom."""
         d = self.display
         now = time.monotonic()
         if not d.ha_enabled:
-            if self._door_active or self._door_focus_cameras or self._door_owned_focus:
-                self._door_active = {}
-                self._door_focus_cameras = {}
-                if self._door_owned_focus and not self._encroach_owned_focus:
-                    self._door_owned_focus = False
-                    self._go_main_layout()
-                else:
-                    self._door_owned_focus = False
+            self._door_active = {}
+            if self._door_owned_focus and not self._encroach_owned_focus:
+                self._door_owned_focus = False
+                self._door_peek_until = 0.0
+                self._go_main_layout()
+            else:
+                self._door_owned_focus = False
+                self._door_peek_until = 0.0
             self._ha_popups = prune_popups(self._ha_popups, now=now)
             return
 
@@ -3814,10 +3818,7 @@ class MosaicApp:
         )
         if not snap.ok:
             self._door_active = {}
-            self._door_focus_cameras = {}
-            if self._door_owned_focus and not self._encroach_owned_focus:
-                self._door_owned_focus = False
-                self._go_main_layout()
+            self._apply_door_focus()
             return
 
         for door in opened:
@@ -3836,21 +3837,31 @@ class MosaicApp:
                         entity_id=door.entity_id,
                     ),
                 )
+            if door.notify_autofocus and door.camera:
+                self._begin_door_peek(door.camera, now)
 
-        # Banner / tile outline only while the sensor is actually open.
-        self._door_active = cameras_highlighted_by_doors(
-            snap.doors,
-            hold_seconds=0.0,
-            require_highlight=True,
-        )
-        self._door_focus_cameras = cameras_highlighted_by_doors(
-            snap.doors,
-            hold_seconds=float(d.ha_hold_seconds),
-            require_autofocus=True,
-        )
+        self._door_active = open_sensor_labels(snap.doors)
         self._apply_door_focus()
 
+    def _begin_door_peek(self, camera: str, now: float) -> None:
+        hold = float(self.display.ha_hold_seconds)
+        if hold <= 0:
+            return
+        if self._encroach_owned_focus or self._menu_open or self._prompt is not None:
+            return
+        if self._zone_edit_name is not None or self._line_edit_name is not None:
+            return
+        index = next((i for i, source in enumerate(self.sources) if source.name == camera), None)
+        if index is None:
+            return
+        self._door_owned_focus = True
+        self._door_peek_until = now + hold
+        self._focus_camera(index, from_alert=True)
+
     def _apply_door_focus(self) -> None:
+        """End a timed peek; never re-lock zoom while the sensor stays open."""
+        if not self._door_owned_focus:
+            return
         if self._encroach_owned_focus:
             return
         if self._menu_open or self._prompt is not None or self._reboot_job is not None:
@@ -3859,25 +3870,11 @@ class MosaicApp:
             return
         if self._weather_place_mode:
             return
-        active_indices = [
-            i
-            for i, source in enumerate(self.sources)
-            if source.name in self._door_focus_cameras
-        ]
-        if active_indices:
-            if self.zoom_index in active_indices:
-                self._door_owned_focus = True
-                return
-            self._door_owned_focus = True
-            self.zoom_index = active_indices[0]
-            self._reset_view()
-            self._cycle_deadline = time.monotonic() + max(
-                1.0, float(self.display.ha_hold_seconds or self.display.cycle_focus_seconds)
-            )
+        if time.monotonic() < self._door_peek_until:
             return
-        if self._door_owned_focus:
-            self._door_owned_focus = False
-            self._go_main_layout()
+        self._door_owned_focus = False
+        self._door_peek_until = 0.0
+        self._go_main_layout()
 
     def _tick_person_events(self) -> None:
         """Rising-edge person capture: snapshot + pre/during/post clip per camera."""
@@ -4176,6 +4173,14 @@ class MosaicApp:
                 else len(self._filtered_ha_entities())
             )
             self._reboot_notice = f"{n} match" + ("es" if n != 1 else "")
+            return
+        if prompt.kind == "ha_label":
+            self._prompt = None
+            draft = self._ha_draft
+            if draft is None:
+                return
+            draft.label = text or draft.display_label
+            self._reboot_notice = f"Name: {draft.display_label}"
             return
         self._prompt = None
 
@@ -5013,7 +5018,10 @@ class MosaicApp:
         )
         return canvas
 
-    def _focus_camera(self, index: int | None) -> None:
+    def _focus_camera(self, index: int | None, *, from_alert: bool = False) -> None:
+        if not from_alert:
+            self._door_owned_focus = False
+            self._door_peek_until = 0.0
         self.zoom_index = index
         self._reset_view()
         self._menu_open = False

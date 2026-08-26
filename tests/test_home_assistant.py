@@ -24,11 +24,13 @@ from security_monitor.home_assistant import (
     draw_door_hud,
     draw_ha_light_panel,
     draw_ha_popups,
+    draw_sensor_chip,
     fetch_door_states,
     filter_entities,
     mask_token,
     merge_camera_door_entities,
     normalize_ha_url,
+    open_sensor_labels,
     parse_door_mappings,
     parse_entity_catalog,
     parse_light_controls,
@@ -137,7 +139,7 @@ def test_fetch_door_states_from_bulk() -> None:
 
 def test_draw_door_hud_smoke() -> None:
     canvas = np.full((240, 480, 3), 40, dtype=np.uint8)
-    snap = HASnapshot(
+    open_snap = HASnapshot(
         ok=True,
         connected=True,
         doors=[
@@ -149,7 +151,10 @@ def test_draw_door_hud_smoke() -> None:
             )
         ],
     )
-    draw_door_hud(canvas, snap)
+    draw_door_hud(canvas, open_snap)
+    assert canvas[20, 30].sum() == 40 * 3
+    err = HASnapshot(ok=False, connected=False, error="Disconnected")
+    draw_door_hud(canvas, err)
     assert canvas[20, 30].sum() != 40 * 3
 
 
@@ -387,3 +392,24 @@ def test_highlight_hold_zero_drops_closed_doors() -> None:
         )
     ]
     assert cameras_highlighted_by_doors(doors, hold_seconds=0.0, now=1000.0) == {}
+
+
+def test_open_sensor_labels_and_chip() -> None:
+    doors = [
+        DoorState(
+            entity_id="binary_sensor.front",
+            label="Front porch",
+            camera="Front Door",
+            open=True,
+        ),
+        DoorState(
+            entity_id="binary_sensor.side",
+            label="Side",
+            camera="Yard",
+            open=False,
+        ),
+    ]
+    assert open_sensor_labels(doors) == {"Front Door": "Front porch"}
+    canvas = np.full((180, 320, 3), 20, dtype=np.uint8)
+    draw_sensor_chip(canvas, "Front porch")
+    assert canvas[18, 20].sum() != 20 * 3
