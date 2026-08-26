@@ -351,10 +351,11 @@ Files land under `~/security-monitor/captures/events/<timestamp>_<camera>/` (`sn
 - **On-screen alarm** — pulsing red mosaic banner + stronger tile border while active
 - **Alarm sound** — double beep on entry, then a reminder beep every few seconds while someone remains in a zone
 - **Cameras included…** — per-camera **encroach** opt-in
-- **Zones & drawing…** — tripwires and polygon ROIs for the focused camera
+- **Zones & drawing…** — pick a camera, then add tripwires and polygon ROIs
+  - Enter a camera name to select it (← → also cycles)
   - **Add tripwire preset** / **Tripwire zone side** / **Draw tripwire** — directed half-plane zones
   - **Add polygon preset** / **Draw polygon ROI** — click corners, **Enter** to finish (≥3 points); Esc cancels
-  - **Clear all zones** — remove every ROI on the focused camera
+  - **Clear all zones** — remove every ROI on the selected camera
 
 A camera can have **multiple zones** (mix of lines and polygons). Any person whose feet land inside a zone triggers highlight + alarm. Zones are stored under `encroach_zones` in `config.yaml` (legacy `encroach_line` still works as a fallback).
 

@@ -11,6 +11,7 @@ from security_monitor.mosaic import (
     magnify,
     menu_section,
     placeholder,
+    resolve_zone_target,
     scale_frame,
     selectable_menu_entries,
     step_menu_index,
@@ -127,3 +128,18 @@ def test_visible_menu_range_keeps_selection() -> None:
     start, end = visible_menu_range(items, selected=3, max_height=80, row_h=40, header_h=20)
     assert start <= 3 < end
     assert end - start < len(items)
+
+
+def test_zone_target_uses_named_camera_not_first() -> None:
+    from security_monitor.config import CameraConfig
+
+    cams = [
+        CameraConfig(name="Front Yard", url="rtsp://a"),
+        CameraConfig(name="Front Door", url="rtsp://b"),
+        CameraConfig(name="Back Door", url="rtsp://c"),
+    ]
+    picked = resolve_zone_target(cams, "Front Door", zoom_index=None)
+    assert picked is not None
+    assert picked.name == "Front Door"
+    assert resolve_zone_target(cams, None, zoom_index=2).name == "Back Door"
+    assert resolve_zone_target(cams, None, zoom_index=None) is None

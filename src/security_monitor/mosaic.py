@@ -387,6 +387,21 @@ def visible_menu_range(
     return start, end
 
 
+def resolve_zone_target(
+    cameras: list[CameraConfig],
+    selected_name: str | None,
+    zoom_index: int | None,
+) -> CameraConfig | None:
+    """Camera used for zone drawing: explicit menu pick, else focused tile."""
+    if selected_name:
+        for cam in cameras:
+            if cam.name == selected_name:
+                return cam
+    if zoom_index is not None and 0 <= zoom_index < len(cameras):
+        return cameras[zoom_index]
+    return None
+
+
 class MosaicApp:
     def __init__(self, config: AppConfig, *, safe_mode: bool = False) -> None:
         self.config = config
@@ -444,6 +459,7 @@ class MosaicApp:
         self._zone_edit_name: str | None = None
         self._zone_edit_mode: str | None = None  # line | polygon
         self._zone_edit_points: list[tuple[float, float]] = []
+        self._zone_target_name: str | None = None
         self._alarm_until = 0.0
         self._alarm_last_beep = 0.0
         self._line_edit_name: str | None = None  # alias kept for older checks
@@ -1775,7 +1791,7 @@ class MosaicApp:
             alarm = "On" if d.encroachment_alarm else "Off"
             sound = "On" if d.encroachment_alarm_sound else "Off"
             cam = self._target_camera()
-            baseline_label = cam.name if cam else "(focus a camera)"
+            baseline_label = cam.name if cam else "(pick a camera)"
             zones = self._camera_zones(cam) if cam else []
             zone_count = len(zones)
             line_label = line_preset_label(cam.encroach_line if cam else None)
@@ -1786,18 +1802,36 @@ class MosaicApp:
                     poly_label = polygon_preset_label(last_poly.points)
             side = (cam.encroach_side if cam else "positive") or "positive"
             if self._menu_page == "detection_zones":
-                return [
-                    menu_section(f"Zones on {baseline_label}"),
-                    ("encroach_zones_info", f"{zone_count} zone(s) — Enter to list"),
-                    ("encroach_preset", f"Add tripwire preset: {line_label}"),
-                    ("encroach_side", f"Tripwire zone side: {side}"),
-                    ("encroach_edit", f"Draw tripwire: {baseline_label}"),
-                    ("encroach_poly_preset", f"Add polygon preset: {poly_label}"),
-                    ("encroach_poly_edit", f"Draw polygon ROI: {baseline_label}"),
-                    ("encroach_clear_zones", f"Clear all zones: {baseline_label}"),
-                    ("set_baseline", f"Set empty-area baseline: {baseline_label}"),
-                    ("detection_zones_back", "Back"),
-                ]
+                items: list[tuple[str, str]] = [menu_section("Camera")]
+                selected = cam.name if cam else None
+                for index, candidate in enumerate(self.cameras):
+                    mark = " ✓" if candidate.name == selected else ""
+                    n = len(self._camera_zones(candidate))
+                    noun = "zone" if n == 1 else "zones"
+                    items.append(
+                        (
+                            f"zone_cam:{index}",
+                            f"{candidate.name}{mark}  ·  {n} {noun}",
+                        )
+                    )
+                if not self.cameras:
+                    items.append(("zone_cam_empty", "(no cameras)"))
+                items.extend(
+                    [
+                        menu_section(f"Draw on {baseline_label}"),
+                        ("encroach_zones_info", f"{zone_count} zone(s) — Enter to list"),
+                        ("encroach_preset", f"Add tripwire preset: {line_label}"),
+                        ("encroach_side", f"Tripwire zone side: {side}"),
+                        ("encroach_edit", f"Draw tripwire: {baseline_label}"),
+                        ("encroach_poly_preset", f"Add polygon preset: {poly_label}"),
+                        ("encroach_poly_edit", f"Draw polygon ROI: {baseline_label}"),
+                        ("encroach_clear_zones", f"Clear all zones: {baseline_label}"),
+                        ("set_baseline", f"Set empty-area baseline: {baseline_label}"),
+                        ("detection_zones_back", "Back"),
+                    ]
+                )
+                return items
+            zoned = sum(1 for candidate in self.cameras if self._camera_zones(candidate))
             return [
                 menu_section("People & objects"),
                 ("people_master", f"People detection: {people}"),
@@ -1810,7 +1844,7 @@ class MosaicApp:
                 ("encroach_sound", f"Alarm sound: {sound}"),
                 (
                     "detection_zones",
-                    f"Zones & drawing… ({zone_count} on {baseline_label})",
+                    f"Zones & drawing… ({zoned}/{len(self.cameras)} cameras)",
                 ),
                 menu_section("Auto capture"),
                 ("auto_person", f"Auto person capture: {auto}"),
@@ -2538,12 +2572,26 @@ class MosaicApp:
             self._menu_page = "detection"
             self._menu_index = 0
         elif action == "detection_zones":
+            self._ensure_zone_target()
             self._menu_page = "detection_zones"
-            self._menu_index = 0
-            self._reboot_notice = "Focus a camera, then add tripwires or polygons"
+            self._menu_index = self._zone_camera_menu_index()
+            cam = self._target_camera()
+            self._reboot_notice = (
+                f"Editing {cam.name} — pick another camera or draw"
+                if cam is not None
+                else "Pick a camera, then draw a tripwire or polygon"
+            )
         elif action == "detection_zones_back":
             self._menu_page = "detection"
             self._menu_index = 0
+        elif action.startswith("zone_cam:"):
+            try:
+                index = int(action.split(":", 1)[1])
+            except ValueError:
+                index = -1
+            self._select_zone_target(index)
+        elif action == "zone_cam_empty":
+            self._reboot_notice = "No cameras to draw on"
         elif action == "people_master":
             self._set_people_detection(not self.display.people_detection)
         elif action == "object_master":
@@ -2581,7 +2629,7 @@ class MosaicApp:
         elif action == "encroach_zones_info":
             cam = self._target_camera()
             if cam is None:
-                self._reboot_notice = "Focus a camera first"
+                self._reboot_notice = "Pick a camera first"
             else:
                 zones = self._camera_zones(cam)
                 names = ", ".join(z.name for z in zones) or "(none)"
@@ -2924,10 +2972,20 @@ class MosaicApp:
             self._activate_menu("encroach_alarm")
         elif action == "encroach_sound":
             self._activate_menu("encroach_sound")
+        elif action.startswith("zone_cam:"):
+            try:
+                index = int(action.split(":", 1)[1])
+            except ValueError:
+                self._cycle_zone_target(step)
+            else:
+                if self.cameras:
+                    self._select_zone_target((index + int(step)) % len(self.cameras))
+                    if self._menu_page == "detection_zones":
+                        self._menu_index = self._zone_camera_menu_index()
         elif action == "encroach_preset":
             cam = self._target_camera()
             if cam is None:
-                self._reboot_notice = "Focus a camera first"
+                self._reboot_notice = "Pick a camera first"
                 return
             coords = next_line_preset(cam.encroach_line, step)
             cam.encroach_line = coords
@@ -2941,7 +2999,7 @@ class MosaicApp:
         elif action == "encroach_side":
             cam = self._target_camera()
             if cam is None:
-                self._reboot_notice = "Focus a camera first"
+                self._reboot_notice = "Pick a camera first"
                 return
             side = "negative" if (cam.encroach_side or "positive") == "positive" else "positive"
             cam.encroach_side = side
@@ -2965,7 +3023,7 @@ class MosaicApp:
         elif action == "encroach_poly_preset":
             cam = self._target_camera()
             if cam is None:
-                self._reboot_notice = "Focus a camera first"
+                self._reboot_notice = "Pick a camera first"
                 return
             last = next((z for z in reversed(cam.encroach_zones) if z.is_polygon), None)
             name, pts = next_polygon_preset(last.points if last else None, step)
@@ -3220,7 +3278,7 @@ class MosaicApp:
     def _clear_camera_zones(self) -> None:
         cam = self._target_camera()
         if cam is None:
-            self._reboot_notice = "Focus a camera first"
+            self._reboot_notice = "Pick a camera first"
             return
         cam.encroach_zones = []
         cam.encroach_line = None
@@ -3253,7 +3311,7 @@ class MosaicApp:
     def _start_zone_edit(self, mode: str) -> None:
         cam = self._target_camera()
         if cam is None:
-            self._reboot_notice = "Focus a camera first"
+            self._reboot_notice = "Pick a camera first"
             return
         index = next((i for i, c in enumerate(self.cameras) if c.name == cam.name), None)
         if index is None:
@@ -3352,12 +3410,59 @@ class MosaicApp:
         self._camera_by_name[cam.name] = cam
         self._apply_buffer_settings(persist=True)
 
-    def _target_camera(self) -> CameraConfig | None:
+    def _ensure_zone_target(self) -> None:
+        if self._zone_target_name and any(
+            cam.name == self._zone_target_name for cam in self.cameras
+        ):
+            return
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.cameras):
-            return self.cameras[self.zoom_index]
+            self._zone_target_name = self.cameras[self.zoom_index].name
+            return
         if self.cameras:
-            return self.cameras[0]
-        return None
+            self._zone_target_name = self.cameras[0].name
+
+    def _select_zone_target(self, index: int) -> None:
+        if index < 0 or index >= len(self.cameras):
+            self._reboot_notice = "Pick a camera first"
+            return
+        cam = self.cameras[index]
+        self._zone_target_name = cam.name
+        zones = self._camera_zones(cam)
+        n = len(zones)
+        noun = "zone" if n == 1 else "zones"
+        self._reboot_notice = f"Editing {cam.name} ({n} {noun})"
+
+    def _cycle_zone_target(self, step: int = 1) -> None:
+        if not self.cameras:
+            self._reboot_notice = "Pick a camera first"
+            return
+        self._ensure_zone_target()
+        names = [cam.name for cam in self.cameras]
+        current = self._zone_target_name
+        try:
+            index = names.index(current) if current else 0
+        except ValueError:
+            index = 0
+        self._select_zone_target((index + int(step)) % len(names))
+        if self._menu_page == "detection_zones":
+            self._menu_index = self._zone_camera_menu_index()
+
+    def _zone_camera_menu_index(self) -> int:
+        items = self._menu_items()
+        cam = self._target_camera()
+        if cam is not None:
+            try:
+                want = f"zone_cam:{next(i for i, c in enumerate(self.cameras) if c.name == cam.name)}"
+            except StopIteration:
+                want = None
+            if want is not None:
+                for i, (action, _label) in enumerate(items):
+                    if action == want:
+                        return i
+        return first_selectable_index(items)
+
+    def _target_camera(self) -> CameraConfig | None:
+        return resolve_zone_target(self.cameras, self._zone_target_name, self.zoom_index)
 
     def _set_baseline_for_target(self) -> None:
         cam = self._target_camera()
@@ -4696,7 +4801,7 @@ class MosaicApp:
         elif self._menu_page == "cameras_arrange":
             footer = "← → move in grid order    Esc back"
         elif self._menu_page == "detection_zones":
-            footer = "Focus a camera first    ← → cycle presets    Esc back"
+            footer = "Enter pick camera    ← → cycle cameras    draw on selected    Esc back"
         elif self._menu_page in _CAMERA_MENU_PAGES or self._menu_page in {
             "detection",
             "detection_cams",
