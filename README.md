@@ -223,7 +223,7 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu also has **Cameras**, **Capture** / **Saved captures**, **Detection**, **Weather HUD**, **Home Assistant**, **Video settings**, and **Reboot cameras**. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu is grouped into **Cameras**, **Media** (capture / saved files / person events), **Alerts** (detection, weather, Home Assistant), **Settings**, and **System** (reconnect / reboot / exit). Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
 
 ### Weather HUD
 
@@ -294,7 +294,7 @@ Changing decode mode or backend reconnects streams. Optional `display.hwaccel_de
 
 ### Person events (auto capture)
 
-`Esc` → **Detection** → **Auto person capture** (also **Person events…** on the root menu):
+`Esc` → **Detection…** → **Auto person capture** (also **Person events…** on the root menu):
 
 - On rising edge (person appears), saves a **snapshot** with person boxes + date/time overlay
 - Records a clip with configurable **pre-roll** (from the rolling buffer), the time the person is present, and **post-roll** after they leave
@@ -335,16 +335,17 @@ Files land under `~/security-monitor/captures/events/<timestamp>_<camera>/` (`sn
 
 ### Encroachment (tripwire + polygon ROIs)
 
-`Esc` → **Detection**:
+`Esc` → **Detection…**:
 
 - **Encroachment** — master switch (also turns on people detection)
 - **Autofocus on encroach** — while a person is in any zone, focus that camera; return to the grid when they leave
 - **On-screen alarm** — pulsing red mosaic banner + stronger tile border while active
 - **Alarm sound** — double beep on entry, then a reminder beep every few seconds while someone remains in a zone
 - **Cameras included…** — per-camera **encroach** opt-in
-- **Add tripwire preset** / **Tripwire zone side** / **Draw tripwire** — directed half-plane zones
-- **Add polygon preset** / **Draw polygon ROI** — click corners, **Enter** to finish (≥3 points); Esc cancels
-- **Clear all zones** — remove every ROI on the focused camera
+- **Zones & drawing…** — tripwires and polygon ROIs for the focused camera
+  - **Add tripwire preset** / **Tripwire zone side** / **Draw tripwire** — directed half-plane zones
+  - **Add polygon preset** / **Draw polygon ROI** — click corners, **Enter** to finish (≥3 points); Esc cancels
+  - **Clear all zones** — remove every ROI on the focused camera
 
 A camera can have **multiple zones** (mix of lines and polygons). Any person whose feet land inside a zone triggers highlight + alarm. Zones are stored under `encroach_zones` in `config.yaml` (legacy `encroach_line` still works as a fallback).
 

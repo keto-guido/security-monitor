@@ -234,6 +234,7 @@ _NESTED_MENU_PAGES = frozenset(
         "capture",
         "detection",
         "detection_cams",
+        "detection_zones",
         "decode_status",
         "weather",
         "weather_place",
@@ -282,6 +283,100 @@ STATUS_COLOR = {
     "error": (40, 40, 220),
 }
 
+MENU_HEADER_PREFIX = "hdr:"
+MENU_ROW_H = 42
+MENU_HEADER_H = 26
+
+
+def menu_section(title: str) -> tuple[str, str]:
+    return (f"{MENU_HEADER_PREFIX}{title}", title)
+
+
+def is_menu_header(action: str) -> bool:
+    return action.startswith(MENU_HEADER_PREFIX)
+
+
+def menu_row_height(
+    action: str, *, row_h: int = MENU_ROW_H, header_h: int = MENU_HEADER_H
+) -> int:
+    return header_h if is_menu_header(action) else row_h
+
+
+def first_selectable_index(items: list[tuple[str, str]], start: int = 0) -> int:
+    if not items:
+        return 0
+    n = len(items)
+    start = min(max(0, start), n - 1)
+    for i in range(start, n):
+        if not is_menu_header(items[i][0]):
+            return i
+    for i in range(start):
+        if not is_menu_header(items[i][0]):
+            return i
+    return start
+
+
+def step_menu_index(items: list[tuple[str, str]], index: int, delta: int) -> int:
+    if not items:
+        return 0
+    n = len(items)
+    index = min(max(0, index), n - 1)
+    if delta == 0:
+        return index
+    direction = 1 if delta > 0 else -1
+    i = index
+    for _ in range(n):
+        i = (i + direction) % n
+        if not is_menu_header(items[i][0]):
+            return i
+    return index
+
+
+def selectable_menu_entries(items: list[tuple[str, str]]) -> list[tuple[int, str]]:
+    """Return ``(item_index, action)`` for rows that can be activated."""
+    return [
+        (i, action)
+        for i, (action, _label) in enumerate(items)
+        if not is_menu_header(action)
+    ]
+
+
+def visible_menu_range(
+    items: list[tuple[str, str]],
+    selected: int,
+    max_height: int,
+    *,
+    row_h: int = MENU_ROW_H,
+    header_h: int = MENU_HEADER_H,
+) -> tuple[int, int]:
+    """Inclusive-start, exclusive-end slice that keeps ``selected`` on screen."""
+    n = len(items)
+    if n == 0:
+        return 0, 0
+    selected = min(max(0, selected), n - 1)
+
+    def height(i: int) -> int:
+        return header_h if is_menu_header(items[i][0]) else row_h
+
+    if sum(height(i) for i in range(n)) <= max_height:
+        return 0, n
+
+    start = selected
+    used = 0
+    budget = max(height(selected), max_height // 2)
+    while start > 0 and used + height(start - 1) <= budget:
+        start -= 1
+        used += height(start)
+    end = selected + 1
+    used = sum(height(i) for i in range(start, end))
+    while end < n and used + height(end) <= max_height:
+        used += height(end)
+        end += 1
+    while start > 0 and used + height(start - 1) <= max_height:
+        start -= 1
+        used += height(start)
+    return start, end
+
 
 class MosaicApp:
     def __init__(self, config: AppConfig) -> None:
@@ -304,7 +399,7 @@ class MosaicApp:
         self._menu_open = False
         self._menu_index = 0
         self._menu_page = "root"
-        self._menu_hitboxes: list[tuple[str, int, int, int, int]] = []
+        self._menu_hitboxes: list[tuple[str, int, int, int, int, int]] = []
         self._reboot_job: RebootJob | None = None
         self._reboot_notice = ""
         self._clip_job: LiveClipJob | None = None
@@ -1248,11 +1343,14 @@ class MosaicApp:
 
     def _handle_menu_key(self, key: int, ch: int) -> None:
         items = self._menu_items()
+        self._ensure_selectable_menu_index(items)
+        if not items:
+            return
         if key in KEY_UP:
-            self._menu_index = (self._menu_index - 1) % len(items)
+            self._menu_index = step_menu_index(items, self._menu_index, -1)
             return
         if key in KEY_DOWN:
-            self._menu_index = (self._menu_index + 1) % len(items)
+            self._menu_index = step_menu_index(items, self._menu_index, 1)
             return
         if key in KEY_LEFT:
             self._adjust_menu_item(items[self._menu_index][0], -1)
@@ -1269,6 +1367,10 @@ class MosaicApp:
                 self._menu_index = 0
                 return
             if self._menu_page == "detection_cams":
+                self._menu_page = "detection"
+                self._menu_index = 0
+                return
+            if self._menu_page == "detection_zones":
                 self._menu_page = "detection"
                 self._menu_index = 0
                 return
@@ -1338,10 +1440,11 @@ class MosaicApp:
             self._activate_menu("exit")
             return
         if ord("1") <= ch <= ord("9"):
+            choices = selectable_menu_entries(items)
             index = ch - ord("1")
-            if index < len(items):
-                self._menu_index = index
-                self._activate_menu(items[index][0])
+            if index < len(choices):
+                self._menu_index = choices[index][0]
+                self._activate_menu(choices[index][1])
 
     def _on_escape(self) -> None:
         if self._weather_place_mode:
@@ -1363,6 +1466,10 @@ class MosaicApp:
             self._menu_index = 0
             return
         if self._menu_open and self._menu_page == "detection_cams":
+            self._menu_page = "detection"
+            self._menu_index = 0
+            return
+        if self._menu_open and self._menu_page == "detection_zones":
             self._menu_page = "detection"
             self._menu_index = 0
             return
@@ -1435,6 +1542,7 @@ class MosaicApp:
             "capture",
             "detection",
             "weather",
+            "ha",
             "cameras",
         }:
             self._menu_page = "root"
@@ -1467,6 +1575,19 @@ class MosaicApp:
         self._door_owned_focus = False
         self._encroach_owned_focus = False
 
+    def _ensure_selectable_menu_index(
+        self, items: list[tuple[str, str]] | None = None
+    ) -> None:
+        rows = items if items is not None else self._menu_items()
+        if not rows:
+            self._menu_index = 0
+            return
+        if self._menu_index < 0 or self._menu_index >= len(rows):
+            self._menu_index = first_selectable_index(rows)
+            return
+        if is_menu_header(rows[self._menu_index][0]):
+            self._menu_index = first_selectable_index(rows, self._menu_index)
+
     def _menu_items(self) -> list[tuple[str, str]]:
         if self._menu_page == "reboot_confirm":
             return [
@@ -1479,14 +1600,17 @@ class MosaicApp:
             rewind = "On" if d.rewind_buffer else "Off"
             decode = decode_mode_label(d.decode_mode, d.hwaccel)
             return [
+                menu_section("Playback"),
                 ("smooth_toggle", f"Smooth buffer: {smooth}"),
                 ("smooth_length", f"Buffer length: {d.smooth_buffer_seconds:g}s"),
                 ("rewind_toggle", f"Rewind buffer: {rewind}"),
                 ("rewind_length", f"Rewind length: {d.rewind_buffer_seconds:g}s"),
+                menu_section("Decode"),
                 ("decode_mode", f"Decode: {d.decode_mode.upper()} — {decode}"),
                 ("hwaccel", f"HW backend: {d.hwaccel}"),
-                ("hud_opacity", f"HUD opacity: {opacity_label(d.hud_opacity)}"),
                 ("decode_status", "Decode status…"),
+                menu_section("Overlay"),
+                ("hud_opacity", f"HUD opacity: {opacity_label(d.hud_opacity)}"),
                 ("video_back", "Back"),
             ]
         if self._menu_page == "decode_status":
@@ -1510,11 +1634,14 @@ class MosaicApp:
             d = self.display
             folder = self._save_dir()
             return [
+                menu_section("Save now"),
                 ("snap_now", "Save snapshot"),
                 ("clip_now", f"Save clip ({d.clip_seconds:g}s)"),
-                ("captures_browse", "Browse saved captures…"),
                 ("clip_length", f"Clip length: {d.clip_seconds:g}s"),
                 ("snap_format", f"Snapshot format: {d.snapshot_format.upper()}"),
+                menu_section("Library"),
+                ("captures_browse", "Browse saved captures…"),
+                menu_section("Storage"),
                 (
                     "retention_days",
                     f"Auto-erase after: {retention_label_days(d.capture_retention_days)}",
@@ -1534,6 +1661,7 @@ class MosaicApp:
             ]
             if self._captures:
                 items.append(("captures_delete_all", "Delete all captures…"))
+                items.append(menu_section("Files"))
             for index, item in enumerate(self._captures):
                 items.append((f"cap:{index}", item.label))
             if not self._captures:
@@ -1566,7 +1694,7 @@ class MosaicApp:
                 ("captures_delete_all_yes", f"Yes, delete all {len(self._captures)} files"),
                 ("captures_delete_all_no", "Cancel"),
             ]
-        if self._menu_page == "detection":
+        if self._menu_page in {"detection", "detection_zones"}:
             d = self.display
             people = "On" if d.people_detection else "Off"
             objects = "On" if d.object_detection else "Off"
@@ -1586,32 +1714,46 @@ class MosaicApp:
                 if last_poly is not None:
                     poly_label = polygon_preset_label(last_poly.points)
             side = (cam.encroach_side if cam else "positive") or "positive"
+            if self._menu_page == "detection_zones":
+                return [
+                    menu_section(f"Zones on {baseline_label}"),
+                    ("encroach_zones_info", f"{zone_count} zone(s) — Enter to list"),
+                    ("encroach_preset", f"Add tripwire preset: {line_label}"),
+                    ("encroach_side", f"Tripwire zone side: {side}"),
+                    ("encroach_edit", f"Draw tripwire: {baseline_label}"),
+                    ("encroach_poly_preset", f"Add polygon preset: {poly_label}"),
+                    ("encroach_poly_edit", f"Draw polygon ROI: {baseline_label}"),
+                    ("encroach_clear_zones", f"Clear all zones: {baseline_label}"),
+                    ("set_baseline", f"Set empty-area baseline: {baseline_label}"),
+                    ("detection_zones_back", "Back"),
+                ]
             return [
+                menu_section("People & objects"),
                 ("people_master", f"People detection: {people}"),
                 ("object_master", f"Object detection: {objects}"),
+                ("detection_cams", "Cameras included…"),
+                menu_section("Encroachment"),
                 ("encroach_master", f"Encroachment: {encroach}"),
                 ("encroach_autofocus", f"Autofocus on encroach: {autofocus}"),
                 ("encroach_alarm", f"On-screen alarm: {alarm}"),
                 ("encroach_sound", f"Alarm sound: {sound}"),
+                (
+                    "detection_zones",
+                    f"Zones & drawing… ({zone_count} on {baseline_label})",
+                ),
+                menu_section("Auto capture"),
                 ("auto_person", f"Auto person capture: {auto}"),
                 ("person_pre", f"Pre-roll: {d.person_pre_roll_seconds:g}s"),
                 ("person_post", f"Post-roll: {d.person_post_roll_seconds:g}s"),
                 ("events_browse", "Person events…"),
-                ("detection_cams", "Cameras included…"),
-                ("encroach_zones_info", f"Zones on {baseline_label}: {zone_count}"),
-                ("encroach_preset", f"Add tripwire preset: {line_label}"),
-                ("encroach_side", f"Tripwire zone side: {side}"),
-                ("encroach_edit", f"Draw tripwire: {baseline_label}"),
-                ("encroach_poly_preset", f"Add polygon preset: {poly_label}"),
-                ("encroach_poly_edit", f"Draw polygon ROI: {baseline_label}"),
-                ("encroach_clear_zones", f"Clear all zones: {baseline_label}"),
-                ("set_baseline", f"Set empty-area baseline: {baseline_label}"),
                 ("detection_back", "Back"),
             ]
         if self._menu_page == "events":
             items: list[tuple[str, str]] = [
                 ("events_refresh", f"Refresh list ({len(self._events)} events)"),
             ]
+            if self._events:
+                items.append(menu_section("Events"))
             for index, item in enumerate(self._events):
                 items.append((f"event:{index}", item.label))
             if not self._events:
@@ -1650,9 +1792,10 @@ class MosaicApp:
                 p = "On" if cam.detect_people else "Off"
                 o = "On" if cam.detect_objects else "Off"
                 e = "On" if cam.detect_encroachment else "Off"
-                items.append((f"cam_people:{index}", f"{cam.name} — people: {p}"))
-                items.append((f"cam_objects:{index}", f"{cam.name} — objects: {o}"))
-                items.append((f"cam_encroach:{index}", f"{cam.name} — encroach: {e}"))
+                items.append(menu_section(cam.name))
+                items.append((f"cam_people:{index}", f"People: {p}"))
+                items.append((f"cam_objects:{index}", f"Objects: {o}"))
+                items.append((f"cam_encroach:{index}", f"Encroach: {e}"))
             items.append(("detection_cams_back", "Back"))
             return items
         if self._menu_page == "weather":
@@ -1666,18 +1809,8 @@ class MosaicApp:
                 else "Auto (IP)"
             )
             return [
+                menu_section("Display"),
                 ("weather_toggle", f"Weather HUD: {enabled}"),
-                ("weather_slot", f"Placement: {slot_label(d.weather_slot)}"),
-                ("weather_place", "Place widget on layout…"),
-                ("weather_opacity", f"Opacity: {opacity_label(d.weather_opacity)}  (← →)"),
-                (
-                    "weather_overlay",
-                    f"Overlay cameras: {'On' if d.weather_overlay else 'Off'}",
-                ),
-                ("weather_nudge_x", f"Fine X: {d.weather_x:+.2f}  (← →)"),
-                ("weather_nudge_y", f"Fine Y: {d.weather_y:+.2f}  (← →)"),
-                ("weather_size_w", f"Width: {d.weather_w:.2f}"),
-                ("weather_size_h", f"Height: {d.weather_h:.2f}"),
                 ("weather_units", f"Temperature units: {units}"),
                 ("weather_temp", f"Show temperature: {'On' if d.weather_show_temp else 'Off'}"),
                 (
@@ -1689,6 +1822,19 @@ class MosaicApp:
                     "weather_lightning",
                     f"Show lightning tracker: {'On' if d.weather_show_lightning else 'Off'}",
                 ),
+                menu_section("Placement"),
+                ("weather_slot", f"Placement: {slot_label(d.weather_slot)}"),
+                ("weather_place", "Place widget on layout…"),
+                ("weather_opacity", f"Opacity: {opacity_label(d.weather_opacity)}  (← →)"),
+                (
+                    "weather_overlay",
+                    f"Overlay cameras: {'On' if d.weather_overlay else 'Off'}",
+                ),
+                ("weather_nudge_x", f"Fine X: {d.weather_x:+.2f}  (← →)"),
+                ("weather_nudge_y", f"Fine Y: {d.weather_y:+.2f}  (← →)"),
+                ("weather_size_w", f"Width: {d.weather_w:.2f}"),
+                ("weather_size_h", f"Height: {d.weather_h:.2f}"),
+                menu_section("Location"),
                 ("weather_refresh", "Refresh weather now"),
                 ("weather_loc", f"Location: {loc[:42]}"),
                 ("weather_back", "Back"),
@@ -1701,19 +1847,22 @@ class MosaicApp:
             doors = self._effective_ha_doors()
             ent_n = len(self._ha.entities)
             return [
+                menu_section("Connection"),
                 ("ha_toggle", f"Home Assistant: {enabled}"),
                 ("ha_url", f"URL: {(d.ha_url or '(not set)')[:42]}"),
                 ("ha_token", f"Token: {mask_token(d.ha_token)}"),
                 ("ha_poll", f"Poll interval: {d.ha_poll_seconds:g}s"),
-                ("ha_hold", f"Hold focus: {d.ha_hold_seconds:g}s"),
-                ("ha_popup", f"Popup duration: {d.ha_popup_seconds:g}s"),
-                ("ha_panel", f"Lights panel: {'On' if d.ha_panel_enabled else 'Off'}"),
-                ("ha_doors", f"Linked sensors… ({len(doors)})"),
-                ("ha_lights", f"Light panel buttons… ({len(d.ha_lights)})"),
-                ("ha_browse", "Browse HA entities…"),
-                ("ha_refresh_entities", f"Refresh entity list ({ent_n})" if ent_n else "Refresh entity list"),
                 ("ha_refresh", "Test connection"),
                 ("ha_status", status[:64]),
+                menu_section("Sensors & alerts"),
+                ("ha_hold", f"Hold focus: {d.ha_hold_seconds:g}s"),
+                ("ha_popup", f"Popup duration: {d.ha_popup_seconds:g}s"),
+                ("ha_doors", f"Linked sensors… ({len(doors)})"),
+                ("ha_browse", "Browse HA entities…"),
+                ("ha_refresh_entities", f"Refresh entity list ({ent_n})" if ent_n else "Refresh entity list"),
+                menu_section("Lights"),
+                ("ha_panel", f"Lights panel: {'On' if d.ha_panel_enabled else 'Off'}"),
+                ("ha_lights", f"Light panel buttons… ({len(d.ha_lights)})"),
                 ("ha_back", "Back"),
             ]
         if self._menu_page == "ha_doors":
@@ -1865,10 +2014,12 @@ class MosaicApp:
             d = self.display
             enabled = sum(1 for cam in self.config.cameras if cam.enabled)
             return [
+                menu_section("Grid"),
                 ("layout", f"Layout: {d.columns}×{d.rows}  ({enabled} shown / {d.tile_count} slots)"),
                 ("cycle_focus", f"Cycle focus: {d.cycle_focus_label}"),
                 ("cameras_arrange", "Arrange tiles…"),
                 ("cameras_toggle", "Show / hide cameras…"),
+                menu_section("Manage"),
                 ("cameras_add", "Add camera…"),
                 ("cameras_remove", "Remove camera…"),
                 ("cameras_back", "Back"),
@@ -1910,20 +2061,27 @@ class MosaicApp:
         return [
             ("resume", "Resume"),
             ("fullscreen", fullscreen),
+            menu_section("Cameras"),
             ("cameras", "Cameras…"),
-            ("capture", "Capture"),
+            menu_section("Media"),
+            ("capture", "Capture…"),
             ("captures_root", "Saved captures…"),
             ("events_root", "Person events…"),
-            ("detection", "Detection"),
+            menu_section("Alerts"),
+            ("detection", "Detection…"),
             ("weather", "Weather HUD…"),
             ("ha", "Home Assistant…"),
-            ("video", "Video settings"),
+            menu_section("Settings"),
+            ("video", "Video settings…"),
+            menu_section("System"),
             ("reconnect", "Reconnect streams"),
             ("reboot", "Reboot cameras"),
             ("exit", "Exit"),
         ]
 
     def _activate_menu(self, action: str) -> None:
+        if is_menu_header(action):
+            return
         if action == "resume":
             self._menu_open = False
             self._menu_page = "root"
@@ -2278,6 +2436,13 @@ class MosaicApp:
         elif action == "detection_cams_back":
             self._menu_page = "detection"
             self._menu_index = 0
+        elif action == "detection_zones":
+            self._menu_page = "detection_zones"
+            self._menu_index = 0
+            self._reboot_notice = "Focus a camera, then add tripwires or polygons"
+        elif action == "detection_zones_back":
+            self._menu_page = "detection"
+            self._menu_index = 0
         elif action == "people_master":
             self._set_people_detection(not self.display.people_detection)
         elif action == "object_master":
@@ -2572,6 +2737,8 @@ class MosaicApp:
             self._running = False
 
     def _adjust_menu_item(self, action: str, step: int) -> None:
+        if is_menu_header(action):
+            return
         if action == "smooth_toggle":
             self._set_smooth_buffer(not self.display.smooth_buffer)
         elif action == "rewind_toggle":
@@ -3512,6 +3679,7 @@ class MosaicApp:
         cam = self.config.cameras.pop(index)
         self._rebuild_sources(persist=True)
         self._menu_index = min(self._menu_index, max(0, len(self._menu_items()) - 1))
+        self._ensure_selectable_menu_index()
         self._reboot_notice = f"Removed {cam.name}"
         print(f"Removed camera {cam.name}")
 
@@ -4223,6 +4391,7 @@ class MosaicApp:
             "capture",
             "detection",
             "detection_cams",
+            "detection_zones",
             "weather",
             "ha",
             "ha_doors",
@@ -4237,26 +4406,24 @@ class MosaicApp:
             *_CAPTURE_BROWSER_PAGES,
             *_EVENT_BROWSER_PAGES,
         }
-        card_w, row_h, pad = (
+        card_w, row_h, header_h, pad = (
             720
             if self._menu_page in {"decode_status", "ha_entities", "ha_doors", "ha_notify"}
             else 600
             if wide
-            else 480
-        ), 46, 20
-        title_h = 56
+            else 520
+        ), MENU_ROW_H, MENU_HEADER_H, 20
+        title_h = 52
         footer_h = 36
         notice_h = 28 if self._reboot_notice else 0
-        # Cap visible rows so huge camera lists still fit; scroll via menu index.
-        max_rows = max(4, min(len(items), max(4, (canvas.shape[0] - 120) // row_h)))
-        start = 0
-        if len(items) > max_rows:
-            start = min(
-                max(0, self._menu_index - max_rows // 2),
-                len(items) - max_rows,
-            )
-        visible = items[start : start + max_rows]
-        card_h = title_h + notice_h + row_h * len(visible) + footer_h
+        self._ensure_selectable_menu_index(items)
+        max_body = max(header_h * 4, canvas.shape[0] - 120 - title_h - footer_h - notice_h)
+        start, end = visible_menu_range(
+            items, self._menu_index, max_body, row_h=row_h, header_h=header_h
+        )
+        visible = items[start:end]
+        body_h = sum(menu_row_height(action, row_h=row_h, header_h=header_h) for action, _ in visible)
+        card_h = title_h + notice_h + body_h + footer_h
         h, w = canvas.shape[:2]
         x0 = max(12, (w - card_w) // 2)
         y0 = max(12, (h - card_h) // 2)
@@ -4274,6 +4441,7 @@ class MosaicApp:
             "capture": "Capture",
             "detection": "Detection",
             "detection_cams": "Cameras for detection",
+            "detection_zones": "Zones & drawing",
             "weather": "Weather HUD",
             "ha": "Home Assistant",
             "ha_doors": "Linked sensors",
@@ -4316,20 +4484,46 @@ class MosaicApp:
                 align="center",
                 valign="top",
             )
+        selectable = selectable_menu_entries(items)
+        index_by_action = {i: n for n, (i, _action) in enumerate(selectable, start=1)}
+        ry = y0 + title_h + notice_h
         for i, (action, label) in enumerate(visible):
             absolute = start + i
-            ry = y0 + title_h + notice_h + i * row_h
-            box = (x0 + pad, ry, x0 + card_w - pad, ry + row_h - 8)
+            row_height = menu_row_height(action, row_h=row_h, header_h=header_h)
+            box = (x0 + pad, ry, x0 + card_w - pad, ry + row_height - 6)
+            if is_menu_header(action):
+                draw_text(
+                    canvas,
+                    label.upper(),
+                    (box[0] + 10, ry + 6),
+                    size=12,
+                    color=(150, 158, 180),
+                    valign="top",
+                )
+                line_y = box[3] - 3
+                cv2.line(
+                    canvas,
+                    (box[0] + 8, line_y),
+                    (box[2] - 8, line_y),
+                    (58, 58, 68),
+                    1,
+                    cv2.LINE_AA,
+                )
+                self._menu_hitboxes.append((action, absolute, *box))
+                ry += row_height
+                continue
             if absolute == self._menu_index:
                 shade_round_rect(canvas, box, color=(56, 120, 78), alpha=0.7, radius=8)
-            draw_text(
-                canvas,
-                f"{absolute + 1}",
-                (box[0] + 14, ry + 8),
-                size=15,
-                color=(180, 180, 180),
-                valign="top",
-            )
+            number = index_by_action.get(absolute)
+            if number is not None:
+                draw_text(
+                    canvas,
+                    f"{number}",
+                    (box[0] + 14, ry + 8),
+                    size=15,
+                    color=(180, 180, 180),
+                    valign="top",
+                )
             draw_text(
                 canvas,
                 label,
@@ -4338,7 +4532,8 @@ class MosaicApp:
                 color=(236, 236, 236),
                 valign="top",
             )
-            self._menu_hitboxes.append((action, *box))
+            self._menu_hitboxes.append((action, absolute, *box))
+            ry += row_height
         if self._menu_page == "reboot_confirm":
             footer = "This will restart every camera"
         elif self._menu_page == "video":
@@ -4383,9 +4578,12 @@ class MosaicApp:
             footer = "Enter open    ← → move    Esc back"
         elif self._menu_page == "cameras_arrange":
             footer = "← → move in grid order    Esc back"
+        elif self._menu_page == "detection_zones":
+            footer = "Focus a camera first    ← → cycle presets    Esc back"
         elif self._menu_page in _CAMERA_MENU_PAGES or self._menu_page in {
             "detection",
             "detection_cams",
+            "detection_zones",
             "capture",
             "weather",
             "ha",
@@ -4671,14 +4869,16 @@ class MosaicApp:
                 return
             step = _wheel_steps(flags)
             if step:
-                self._menu_index = (self._menu_index - step) % len(items)
+                self._menu_index = step_menu_index(items, self._menu_index, -step)
             return
         if event != cv2.EVENT_LBUTTONUP:
             return
         px, py = self._event_to_pixel(x, y)
-        for i, (action, x0, y0, x1, y1) in enumerate(self._menu_hitboxes):
+        for action, absolute, x0, y0, x1, y1 in self._menu_hitboxes:
             if x0 <= px <= x1 and y0 <= py <= y1:
-                self._menu_index = i
+                if is_menu_header(action):
+                    return
+                self._menu_index = absolute
                 self._activate_menu(action)
                 return
         self._menu_open = False

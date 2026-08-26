@@ -6,9 +6,15 @@ import pytest
 from security_monitor.mosaic import (
     clamp_center,
     escape_action,
+    first_selectable_index,
+    is_menu_header,
     magnify,
+    menu_section,
     placeholder,
     scale_frame,
+    selectable_menu_entries,
+    step_menu_index,
+    visible_menu_range,
     zoom_toward,
 )
 from security_monitor.overlay import draw_text
@@ -86,3 +92,38 @@ def test_rotate_frame_swaps_dimensions_for_90() -> None:
     upside = rotate_frame(frame, 180)
     assert upside.shape == frame.shape
     assert tuple(upside[-1, -1]) == (1, 2, 3)
+
+
+def test_menu_sections_are_headers() -> None:
+    action, label = menu_section("Cameras")
+    assert is_menu_header(action)
+    assert label == "Cameras"
+    assert not is_menu_header("cameras")
+
+
+def test_menu_navigation_skips_headers() -> None:
+    items = [
+        menu_section("Cameras"),
+        ("cameras", "Cameras…"),
+        menu_section("Media"),
+        ("capture", "Capture…"),
+        ("exit", "Exit"),
+    ]
+    assert first_selectable_index(items) == 1
+    assert first_selectable_index(items, start=2) == 3
+    assert step_menu_index(items, 1, 1) == 3
+    assert step_menu_index(items, 3, 1) == 4
+    assert step_menu_index(items, 4, 1) == 1
+    assert step_menu_index(items, 1, -1) == 4
+    assert selectable_menu_entries(items) == [
+        (1, "cameras"),
+        (3, "capture"),
+        (4, "exit"),
+    ]
+
+
+def test_visible_menu_range_keeps_selection() -> None:
+    items = [menu_section("A"), ("one", "One"), ("two", "Two"), ("three", "Three")]
+    start, end = visible_menu_range(items, selected=3, max_height=80, row_h=40, header_h=20)
+    assert start <= 3 < end
+    assert end - start < len(items)
