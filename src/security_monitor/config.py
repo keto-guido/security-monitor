@@ -367,9 +367,19 @@ def camera_to_dict(cam: CameraConfig) -> dict[str, Any]:
     if cam.encroach_zones:
         from security_monitor.encroachment import zone_to_dict
 
-        item["encroach_zones"] = [zone_to_dict(z) for z in cam.encroach_zones]
+        zones = []
+        for zone in cam.encroach_zones:
+            if len(zone.points) < 2:
+                continue
+            item_z = zone_to_dict(zone)
+            item_z["points"] = _flow(
+                [_flow([float(x), float(y)]) for x, y in zone.points]
+            )
+            zones.append(item_z)
+        if zones:
+            item["encroach_zones"] = zones
     if cam.encroach_line is not None:
-        item["encroach_line"] = [float(v) for v in cam.encroach_line]
+        item["encroach_line"] = _flow([float(v) for v in cam.encroach_line])
     if cam.encroach_side and cam.encroach_side != "positive":
         item["encroach_side"] = str(cam.encroach_side)
     if cam.ha_door_entity:
@@ -377,6 +387,23 @@ def camera_to_dict(cam: CameraConfig) -> dict[str, Any]:
     if cam.ha_door_label:
         item["ha_door_label"] = str(cam.ha_door_label)
     return item
+
+
+class _FlowList(list):
+    """YAML list dumped as ``[a, b]`` so nested zone points round-trip."""
+
+
+def _flow(values: list) -> _FlowList:
+    seq = _FlowList(values)
+    if not getattr(_FlowList, "_registered", False):
+        def _represent(dumper, data: _FlowList):
+            return dumper.represent_sequence(
+                "tag:yaml.org,2002:seq", list(data), flow_style=True
+            )
+
+        yaml.add_representer(_FlowList, _represent, Dumper=yaml.SafeDumper)
+        _FlowList._registered = True  # type: ignore[attr-defined]
+    return seq
 
 
 def unique_camera_name(cameras: list[CameraConfig], base: str) -> str:
@@ -391,12 +418,43 @@ def unique_camera_name(cameras: list[CameraConfig], base: str) -> str:
     return f"{base} copy"
 
 
-def next_layout_preset(columns: int, rows: int, step: int = 1) -> tuple[int, int]:
+def layout_presets_for_count(enabled_count: int, *, max_extra: int = 2) -> list[tuple[int, int]]:
+    """Grid sizes that fit ``enabled_count`` cameras without a huge empty grid."""
+    n = max(1, int(enabled_count))
+    extra = max(0, int(max_extra))
+    max_slots = n + extra
+    fitting = [
+        preset
+        for preset in LAYOUT_PRESETS
+        if preset[0] * preset[1] >= n and preset[0] * preset[1] <= max_slots
+    ]
+    if not fitting:
+        fitting = [preset for preset in LAYOUT_PRESETS if preset[0] * preset[1] >= n]
+    if not fitting:
+        fitting = [(n, 1)]
+    return fitting
+
+
+def next_layout_preset(
+    columns: int,
+    rows: int,
+    step: int = 1,
+    *,
+    min_tiles: int | None = None,
+    max_extra: int = 2,
+) -> tuple[int, int]:
     current = (int(columns), int(rows))
-    presets = list(LAYOUT_PRESETS)
+    if min_tiles is None:
+        presets = list(LAYOUT_PRESETS)
+        if current not in presets:
+            presets.append(current)
+            presets.sort(key=lambda p: (p[0] * p[1], p[0], p[1]))
+        index = presets.index(current)
+        return presets[(index + int(step)) % len(presets)]
+
+    presets = layout_presets_for_count(min_tiles, max_extra=max_extra)
     if current not in presets:
-        presets.append(current)
-        presets.sort(key=lambda p: (p[0] * p[1], p[0], p[1]))
+        return presets[0] if int(step) >= 0 else presets[-1]
     index = presets.index(current)
     return presets[(index + int(step)) % len(presets)]
 
@@ -789,11 +847,12 @@ def _parse_camera(raw: Any, index: int) -> CameraConfig:
                 f"cameras[{index}].rotate must be one of {VALID_CAMERA_ROTATIONS}"
             )
     encroach_line = None
-    if "encroach_line" in raw and raw.get("encroach_line") is not None:
+    line_raw = raw.get("encroach_line")
+    if line_raw not in (None, [], ()):
         try:
             from security_monitor.encroachment import parse_encroach_line
 
-            encroach_line = parse_encroach_line(raw.get("encroach_line"))
+            encroach_line = parse_encroach_line(line_raw)
         except ValueError as exc:
             raise ConfigError(f"cameras[{index}].{exc}") from exc
     encroach_side = str(raw.get("encroach_side", "positive") or "positive").strip().lower()

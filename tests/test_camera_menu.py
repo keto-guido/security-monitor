@@ -8,6 +8,7 @@ from security_monitor.config import (
     CameraConfig,
     DisplayConfig,
     ensure_layout_fits,
+    layout_presets_for_count,
     move_camera,
     next_layout_preset,
     parse_config,
@@ -19,6 +20,15 @@ from security_monitor.config import (
 def test_next_layout_preset_cycles() -> None:
     assert next_layout_preset(2, 2, 1) == (2, 3)
     assert next_layout_preset(1, 1, -1)[0] * next_layout_preset(1, 1, -1)[1] >= 1
+
+
+def test_next_layout_preset_stays_sized_for_cameras() -> None:
+    assert layout_presets_for_count(4) == [(2, 2), (2, 3), (3, 2)]
+    assert next_layout_preset(2, 2, 1, min_tiles=4) == (2, 3)
+    assert next_layout_preset(2, 3, 1, min_tiles=4) == (3, 2)
+    assert next_layout_preset(3, 2, 1, min_tiles=4) == (2, 2)
+    assert next_layout_preset(4, 4, 1, min_tiles=4) == (2, 2)
+    assert next_layout_preset(2, 2, -1, min_tiles=4) == (3, 2)
 
 
 def test_move_camera_reorders() -> None:

@@ -98,4 +98,6 @@ def test_power_tracker_force_on_off() -> None:
 def test_power_mode_label() -> None:
     assert "Auto" in power_mode_label("auto", threshold=12)
     assert "ON now" in power_mode_label("auto", active=True, threshold=12)
-    assert power_mode_label("off") == "Off"
+    assert "Off" in power_mode_label("off")
+    assert "detection" in power_mode_label("off").lower()
+    assert "HUD" in power_mode_label("on")

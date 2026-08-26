@@ -77,6 +77,44 @@ _TRACK_GRACE_S = 1.25
 _HEAL_SECONDS = 45.0
 _HEAL_ADAPT_TAU_S = 8.0
 
+_threads_configured = False
+
+
+def configure_compute_threads() -> int:
+    """Use extra CPU cores for OpenCV / PyTorch when available.
+
+    Leaves a couple of cores for capture threads and the UI. Safe to call
+    more than once.
+    """
+    global _threads_configured
+    cpu = os.cpu_count() or 1
+    intra = max(1, cpu - 2) if cpu >= 4 else max(1, cpu)
+    if _threads_configured:
+        return intra
+    try:
+        cv2.setNumThreads(intra)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import torch
+
+        torch.set_num_threads(intra)
+        interop = getattr(torch, "set_num_interop_threads", None)
+        if callable(interop):
+            interop(max(1, min(4, intra)))
+    except Exception:  # noqa: BLE001
+        pass
+    _threads_configured = True
+    return intra
+
+
+def detection_worker_count() -> int:
+    """Background detection threads: keep the UI off the YOLO hot path."""
+    cpu = os.cpu_count() or 1
+    if cpu <= 2:
+        return 1
+    return max(1, min(4, cpu // 2))
+
 
 @dataclass(frozen=True)
 class Box:
@@ -183,7 +221,7 @@ class PersonDetector:
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._yolo = None
         self._net = None
         self._hog = None
@@ -268,13 +306,14 @@ class PersonDetector:
         if frame is None or frame.size == 0:
             return [], []
         h, w = frame.shape[:2]
-        if self._backend == "yolov8n" and self._yolo is not None:
-            return self._detect_yolo(frame, w, h, conf_thresh, include_things)
-        if self._backend == "mobilenet-ssd" and self._net is not None:
-            return self._detect_mobilenet(frame, w, h, conf_thresh), []
-        if self._backend == "hog" and self._hog is not None:
-            return self._detect_hog(frame, w, h), []
-        return [], []
+        with self._lock:
+            if self._backend == "yolov8n" and self._yolo is not None:
+                return self._detect_yolo(frame, w, h, conf_thresh, include_things)
+            if self._backend == "mobilenet-ssd" and self._net is not None:
+                return self._detect_mobilenet(frame, w, h, conf_thresh), []
+            if self._backend == "hog" and self._hog is not None:
+                return self._detect_hog(frame, w, h), []
+            return [], []
 
     def _detect_yolo(
         self,
@@ -752,15 +791,52 @@ class DetectionState:
     updated_at: float = 0.0
 
 
-class DetectionEngine:
-    """Runs people + new-object detection with light caching for the UI thread."""
+@dataclass
+class _PendingDetect:
+    frame: np.ndarray
+    detect_people: bool
+    detect_objects: bool
 
-    def __init__(self) -> None:
+
+class DetectionEngine:
+    """People + new-object detection.
+
+    The UI thread only submits the latest frame and reads cached boxes.
+    Inference runs on background workers (or inline when ``workers=0``).
+    """
+
+    def __init__(self, *, workers: int | None = None) -> None:
+        configure_compute_threads()
         self.people = PersonDetector()
         self.objects = NewObjectTracker()
         self._cache: dict[str, DetectionState] = {}
+        self._pending: dict[str, _PendingDetect] = {}
+        self._busy: set[str] = set()
         self._interval = 0.30
         self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._stop = threading.Event()
+        if workers is None:
+            workers = detection_worker_count()
+        self._inline = int(workers) <= 0
+        self._threads: list[threading.Thread] = []
+        if not self._inline:
+            for index in range(max(1, int(workers))):
+                thread = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"detect-{index}",
+                    daemon=True,
+                )
+                thread.start()
+                self._threads.append(thread)
+
+    def close(self) -> None:
+        self._stop.set()
+        with self._cv:
+            self._cv.notify_all()
+        for thread in self._threads:
+            thread.join(timeout=1.5)
+        self._threads.clear()
 
     def ensure_ready(self) -> str:
         """Force backend init; return backend name or error."""
@@ -779,31 +855,88 @@ class DetectionEngine:
         if not detect_people and not detect_objects:
             return []
         now = time.monotonic()
-        with self._lock:
+        with self._cv:
             cached = self._cache.get(camera_name)
-            if cached is not None and now - cached.updated_at < self._interval:
-                return list(cached.boxes)
+            boxes = list(cached.boxes) if cached is not None else []
+            stale = cached is None or now - cached.updated_at >= self._interval
+            if self._inline:
+                need_run = stale
+            else:
+                if stale:
+                    self._pending[camera_name] = _PendingDetect(
+                        frame=frame.copy(),
+                        detect_people=detect_people,
+                        detect_objects=detect_objects,
+                    )
+                    self._cv.notify()
+                return boxes
+        if self._inline and need_run:
+            return self._run_detect(
+                camera_name, frame, detect_people=detect_people, detect_objects=detect_objects
+            )
+        return boxes
 
+    def _pick_job_locked(self) -> tuple[str, _PendingDetect] | None:
+        for name, job in list(self._pending.items()):
+            if name in self._busy:
+                continue
+            del self._pending[name]
+            self._busy.add(name)
+            return name, job
+        return None
+
+    def _worker_loop(self) -> None:
+        while not self._stop.is_set():
+            with self._cv:
+                job_pair = self._pick_job_locked()
+                while job_pair is None and not self._stop.is_set():
+                    self._cv.wait(timeout=0.25)
+                    job_pair = self._pick_job_locked()
+            if job_pair is None:
+                continue
+            name, job = job_pair
+            try:
+                self._run_detect(
+                    name,
+                    job.frame,
+                    detect_people=job.detect_people,
+                    detect_objects=job.detect_objects,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"Detection worker error ({name}): {exc}")
+            finally:
+                with self._cv:
+                    self._busy.discard(name)
+                    if name in self._pending:
+                        self._cv.notify()
+
+    def _run_detect(
+        self,
+        camera_name: str,
+        frame: np.ndarray,
+        *,
+        detect_people: bool,
+        detect_objects: bool,
+    ) -> list[Box]:
         h, w = frame.shape[:2]
         scale = 1.0
         work = frame
         if max(h, w) > 960:
             scale = 960 / max(h, w)
-            work = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            work = cv2.resize(
+                frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA
+            )
 
-        def _unmap(b: Box) -> Box:
+        def _unmap(box: Box) -> Box:
             return Box(
-                int(b.x1 / scale),
-                int(b.y1 / scale),
-                int(b.x2 / scale),
-                int(b.y2 / scale),
-                b.label,
-                b.conf,
+                int(box.x1 / scale),
+                int(box.y1 / scale),
+                int(box.x2 / scale),
+                int(box.y2 / scale),
+                box.label,
+                box.conf,
             ).clip(w, h)
 
-        # One detector pass: people for display/masking, optional "thing" cues
-        # to reinforce package blobs. People are still masked out of the
-        # change map when only object detection is enabled.
         people_boxes: list[Box] = []
         thing_boxes: list[Box] = []
         if detect_people or detect_objects:
@@ -825,8 +958,10 @@ class DetectionEngine:
             )
 
         boxes = [*(people_boxes if detect_people else []), *object_boxes]
-        with self._lock:
-            self._cache[camera_name] = DetectionState(boxes=boxes, updated_at=now)
+        with self._cv:
+            self._cache[camera_name] = DetectionState(
+                boxes=boxes, updated_at=time.monotonic()
+            )
         return boxes
 
 

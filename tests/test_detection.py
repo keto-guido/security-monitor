@@ -124,9 +124,36 @@ def test_draw_boxes_mutates_frame() -> None:
 
 
 def test_detection_engine_people_backend() -> None:
-    eng = DetectionEngine()
-    backend = eng.ensure_ready()
-    assert backend in {"yolov8n", "mobilenet-ssd", "hog", "unavailable"}
+    eng = DetectionEngine(workers=0)
+    try:
+        backend = eng.ensure_ready()
+        assert backend in {"yolov8n", "mobilenet-ssd", "hog", "unavailable"}
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        boxes = eng.process("cam", frame, detect_people=True, detect_objects=False)
+        assert isinstance(boxes, list)
+    finally:
+        eng.close()
+
+
+def test_detection_engine_async_does_not_block() -> None:
+    eng = DetectionEngine(workers=1)
+    try:
+        if eng.ensure_ready() == "unavailable":
+            pytest.skip("no people detector backend")
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        first = eng.process("cam", frame, detect_people=True, detect_objects=False)
+        assert first == []
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            later = eng.process("cam", frame, detect_people=True, detect_objects=False)
+            cached = eng._cache.get("cam")
+            if cached is not None and cached.updated_at > 0:
+                assert isinstance(later, list)
+                return
+            time.sleep(0.05)
+        pytest.fail("async detection worker never updated the cache")
+    finally:
+        eng.close()
 
 
 def test_detection_config_roundtrip(tmp_path: Path) -> None:

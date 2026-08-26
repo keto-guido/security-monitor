@@ -176,10 +176,10 @@ def parse_encroach_zone(raw: object, index: int = 0) -> EncroachZone:
     side = str(raw.get("side") or "positive").strip().lower()
     if side not in VALID_ENCROACH_SIDES:
         raise ValueError(f"zone side must be one of {VALID_ENCROACH_SIDES}")
-    if "points" in raw and raw.get("points") is not None:
+    if "points" in raw and raw.get("points") not in (None, [], ()):
         minimum = 3 if kind == "polygon" else 2
         points = parse_zone_points(raw.get("points"), minimum=minimum)
-    elif "line" in raw and raw.get("line") is not None:
+    elif "line" in raw and raw.get("line") not in (None, [], ()):
         line = parse_encroach_line(raw.get("line"))
         if line is None:
             raise ValueError("zone line is empty")
@@ -200,7 +200,13 @@ def parse_encroach_zones(raw: object) -> list[EncroachZone]:
         return []
     if not isinstance(raw, list):
         raise ValueError("encroach_zones must be a list")
-    return [parse_encroach_zone(item, i) for i, item in enumerate(raw)]
+    zones: list[EncroachZone] = []
+    for i, item in enumerate(raw):
+        if isinstance(item, dict) and not item.get("points") and not item.get("line"):
+            # Empty stub left by a bad YAML dump — skip instead of refusing to start.
+            continue
+        zones.append(parse_encroach_zone(item, i))
+    return zones
 
 
 def zone_to_dict(zone: EncroachZone) -> dict:
@@ -610,11 +616,13 @@ def map_tile_click_to_frame_norm(
     frame_w: int,
     frame_h: int,
     mode: str = "fit",
+    clamp: bool = False,
 ) -> tuple[float, float] | None:
     """
     Map a click inside a scaled tile back to normalized frame coordinates.
 
-    Returns None when the click lands in letterbox padding (fit mode).
+    Returns None when the click lands in letterbox padding (fit mode), unless
+    ``clamp`` is True — then the click is snapped onto the video.
     """
     if tile_w <= 0 or tile_h <= 0 or frame_w <= 0 or frame_h <= 0:
         return None
@@ -637,7 +645,10 @@ def map_tile_click_to_frame_norm(
     x0 = (tile_w - new_w) // 2
     y0 = (tile_h - new_h) // 2
     if px < x0 or py < y0 or px >= x0 + new_w or py >= y0 + new_h:
-        return None
+        if not clamp:
+            return None
+        px = min(max(px, x0), x0 + max(new_w - 1, 0))
+        py = min(max(py, y0), y0 + max(new_h - 1, 0))
     fx = (px - x0) / new_w
     fy = (py - y0) / new_h
     return min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0)

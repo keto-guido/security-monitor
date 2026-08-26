@@ -101,7 +101,7 @@ from security_monitor.decode import (
     probe_hwaccels,
 )
 from security_monitor.alarm import play_alert_beep
-from security_monitor.detection import DetectionEngine, draw_boxes
+from security_monitor.detection import DetectionEngine, configure_compute_threads, draw_boxes
 from security_monitor.encroachment import (
     DEFAULT_ENCROACH_LINE,
     EncroachZone,
@@ -236,6 +236,36 @@ _EVENT_BROWSER_PAGES = frozenset(
         "events_play",
     }
 )
+_MENU_CYCLE_ACTIONS = frozenset(
+    {
+        "layout",
+        "cycle_focus",
+        "smooth_length",
+        "rewind_length",
+        "decode_mode",
+        "hud_opacity",
+        "power_mode",
+        "hwaccel",
+        "clip_length",
+        "retention_days",
+        "retention_gb",
+        "person_pre",
+        "person_post",
+        "encroach_preset",
+        "encroach_side",
+        "encroach_poly_preset",
+        "weather_slot",
+        "weather_opacity",
+        "weather_nudge_x",
+        "weather_nudge_y",
+        "weather_size_w",
+        "weather_size_h",
+        "ha_poll",
+        "ha_hold",
+        "ha_popup",
+    }
+)
+_MENU_CYCLE_PREFIXES = ("arrange:", "zone_cam:", "event:", "cap:")
 _NESTED_MENU_PAGES = frozenset(
     {
         "reboot_confirm",
@@ -303,6 +333,13 @@ def menu_section(title: str) -> tuple[str, str]:
 
 def is_menu_header(action: str) -> bool:
     return action.startswith(MENU_HEADER_PREFIX)
+
+
+def _menu_action_cycles(action: str) -> bool:
+    """True for values that wrap with ← → / right-click, not one-shot commands."""
+    if action in _MENU_CYCLE_ACTIONS:
+        return True
+    return action.startswith(_MENU_CYCLE_PREFIXES)
 
 
 def menu_row_height(
@@ -415,6 +452,7 @@ class MosaicApp:
         )
         self._power.set_mode(self.display.power_mode)
         self._low_power = bool(self._power.low_power)
+        configure_compute_threads()
         self.cameras = config.visible_cameras()
         self._camera_by_name = {cam.name: cam for cam in self.cameras}
         self.sources = build_sources(self.cameras, self.display)
@@ -460,6 +498,8 @@ class MosaicApp:
         self._zone_edit_mode: str | None = None  # line | polygon
         self._zone_edit_points: list[tuple[float, float]] = []
         self._zone_target_name: str | None = None
+        self._zone_edit_ignore_until = 0.0
+        self._menu_activated_by_mouse = False
         self._alarm_until = 0.0
         self._alarm_last_beep = 0.0
         self._line_edit_name: str | None = None  # alias kept for older checks
@@ -805,6 +845,7 @@ class MosaicApp:
         self._stop_event_playback()
         self._weather.stop()
         self._ha.stop()
+        self._detection.close()
         for name, recorder in list(self._person_recorders.items()):
             # Force-complete any open person event so the clip is written.
             recorder.lost_at = time.monotonic() - recorder.post_roll - 1.0
@@ -851,9 +892,10 @@ class MosaicApp:
 
     def _compose(self) -> np.ndarray:
         extras = self._extras_enabled
-        if extras:
+        if not self._safe_mode:
             self._tick_person_events()
             self._update_encroachment_state()
+        if extras:
             self._update_door_state()
         d = self.display
         cell_w, cell_h, width, height = self._sync_layout()
@@ -871,7 +913,6 @@ class MosaicApp:
                 self._draw_zoom_badge(cell)
                 self._draw_buffer_badge(cell, snap)
                 self._feed_clip_job(cell)
-                self._draw_capture_hud(cell)
                 if d.ha_enabled:
                     draw_door_hud(cell, self._ha.snapshot, opacity=d.hud_opacity)
                 self._draw_ha_overlays(cell)
@@ -930,7 +971,6 @@ class MosaicApp:
                 if sample is not None:
                     self._draw_buffer_badge(canvas, sample)
             self._feed_clip_job(canvas)
-            self._draw_capture_hud(canvas)
             if d.ha_enabled and not zoomed:
                 draw_door_hud(canvas, self._ha.snapshot, opacity=d.hud_opacity)
             self._draw_ha_overlays(canvas)
@@ -1060,7 +1100,7 @@ class MosaicApp:
 
     def _finalize_ui(self, canvas: np.ndarray) -> np.ndarray:
         extras = self._extras_enabled
-        if extras and self.display.encroachment_alarm and (
+        if not self._safe_mode and self.display.encroachment_alarm and (
             any(self._encroach_active.values()) or time.monotonic() < self._alarm_until
         ):
             labels = [
@@ -1090,6 +1130,7 @@ class MosaicApp:
             # Playback canvas already painted; keep menu card on top.
             pass
         self._draw_power_badge(canvas)
+        self._draw_capture_hud(canvas)
         return self._draw_prompt(self._draw_menu(self._draw_reboot(self._draw_help(canvas))))
 
     def _paint_capture_preview(
@@ -1170,9 +1211,8 @@ class MosaicApp:
         else:
             frame = snap.frame
             cam = self._camera_by_name.get(name)
-            extras = self._extras_enabled
             want_people = bool(
-                extras
+                not self._safe_mode
                 and cam is not None
                 and (
                     (self.display.people_detection and cam.detect_people)
@@ -1183,7 +1223,7 @@ class MosaicApp:
                 )
             )
             want_objects = bool(
-                extras
+                not self._safe_mode
                 and cam is not None
                 and self.display.object_detection
                 and cam.detect_objects
@@ -1196,11 +1236,16 @@ class MosaicApp:
                     detect_people=want_people,
                     detect_objects=want_objects,
                 )
+            editing_this = self._zone_edit_name == name
             encroach_on = bool(
-                extras
-                and cam is not None
-                and self.display.encroachment_detection
-                and cam.detect_encroachment
+                cam is not None
+                and (
+                    editing_this
+                    or (
+                        self.display.encroachment_detection
+                        and cam.detect_encroachment
+                    )
+                )
             )
             active = bool(self._encroach_active.get(name))
             draft = (
@@ -2185,21 +2230,6 @@ class MosaicApp:
         ]
         if self._safe_mode:
             items.append(("exit_safe_mode", "Exit safe mode (restore extras)"))
-        items.extend(
-            [
-                ("cameras", "Cameras…"),
-                ("capture", "Capture"),
-                ("captures_root", "Saved captures…"),
-                ("events_root", "Person events…"),
-                ("detection", "Detection"),
-                ("weather", "Weather HUD…"),
-                ("ha", "Home Assistant…"),
-                ("video", "Video settings"),
-                ("reconnect", "Reconnect streams"),
-                ("reboot", "Reboot cameras"),
-                ("exit", "Exit"),
-            ]
-        )
         return items
 
     def _activate_menu(self, action: str) -> None:
@@ -2230,10 +2260,8 @@ class MosaicApp:
             self._menu_page = "detection"
             self._menu_index = 0
             self._reboot_notice = ""
-            if not self._extras_enabled:
-                self._reboot_notice = (
-                    "Safe/low power: detection paused (video + HUD only)"
-                )
+            if self._safe_mode:
+                self._reboot_notice = "Safe mode: detection paused (video + HUD only)"
             elif self.display.people_detection:
                 backend = self._detection.ensure_ready()
                 if backend == "unavailable":
@@ -3122,10 +3150,16 @@ class MosaicApp:
         }:
             self._activate_menu(action)
         elif action == "layout":
-            cols, rows = next_layout_preset(self.display.columns, self.display.rows, step)
+            n = max(1, sum(1 for cam in self.config.cameras if cam.enabled))
+            cols, rows = next_layout_preset(
+                self.display.columns,
+                self.display.rows,
+                step,
+                min_tiles=n,
+            )
             self.display.columns = cols
             self.display.rows = rows
-            self._rebuild_sources(persist=True)
+            self._apply_buffer_settings(persist=True)
             self._reboot_notice = f"Layout {cols}×{rows}"
         elif action == "cycle_focus":
             current = (
@@ -3174,9 +3208,21 @@ class MosaicApp:
                         self._menu_index = i
                         break
 
+    def _ensure_included_cameras(self, *, people: bool = False, objects: bool = False) -> None:
+        """Turn on per-camera flags when a master switch is enabled and none are included."""
+        if people and not any(cam.detect_people for cam in self.config.cameras):
+            for cam in self.config.cameras:
+                if cam.enabled:
+                    cam.detect_people = True
+        if objects and not any(cam.detect_objects for cam in self.config.cameras):
+            for cam in self.config.cameras:
+                if cam.enabled:
+                    cam.detect_objects = True
+
     def _set_people_detection(self, enabled: bool) -> None:
         self.display.people_detection = bool(enabled)
         if enabled:
+            self._ensure_included_cameras(people=True)
             backend = self._detection.ensure_ready()
             self._reboot_notice = (
                 "People detector unavailable"
@@ -3188,6 +3234,8 @@ class MosaicApp:
 
     def _set_object_detection(self, enabled: bool) -> None:
         self.display.object_detection = bool(enabled)
+        if enabled:
+            self._ensure_included_cameras(objects=True)
         self._apply_buffer_settings(persist=True)
         print(f"Object detection {'on' if enabled else 'off'}")
 
@@ -3195,6 +3243,7 @@ class MosaicApp:
         self.display.auto_person_capture = bool(enabled)
         if enabled:
             self.display.people_detection = True
+            self._ensure_included_cameras(people=True)
             backend = self._detection.ensure_ready()
             self._reboot_notice = (
                 "Auto capture on — enable cameras under Cameras included"
@@ -3213,6 +3262,7 @@ class MosaicApp:
         self.display.encroachment_detection = bool(enabled)
         if enabled:
             self.display.people_detection = True
+            self._ensure_included_cameras(people=True)
             backend = self._detection.ensure_ready()
             if backend == "unavailable":
                 self._reboot_notice = "People detector unavailable"
@@ -3324,6 +3374,10 @@ class MosaicApp:
         self._line_edit_point = None
         self._menu_open = False
         self._menu_page = "root"
+        # A menu mouse-up must not become the first tripwire point.
+        if self._menu_activated_by_mouse:
+            self._zone_edit_ignore_until = time.monotonic() + 0.35
+        self._menu_activated_by_mouse = False
         self._focus_camera(index)
         if mode == "polygon":
             self._flash_capture(
@@ -3342,6 +3396,7 @@ class MosaicApp:
         self._zone_edit_points = []
         self._line_edit_name = None
         self._line_edit_point = None
+        self._zone_edit_ignore_until = 0.0
         self._flash_capture("Zone edit cancelled")
 
     def _finish_zone_edit(self) -> None:
@@ -3520,7 +3575,7 @@ class MosaicApp:
     def _apply_buffer_settings(self, *, persist: bool = False) -> None:
         history_clip = float(self.display.clip_seconds)
         extras = self._extras_enabled
-        if extras and self.display.auto_person_capture:
+        if self.display.auto_person_capture:
             history_clip = max(history_clip, float(self.display.person_pre_roll_seconds))
         for source in self.sources:
             source.apply_buffer_settings(self.display)
@@ -4818,9 +4873,9 @@ class MosaicApp:
             "ha_lights",
             "ha_light_pick",
         }:
-            footer = "Enter select    ← → adjust    Esc back"
+            footer = "Left click / Enter next    Right-click / ← previous    Esc back"
         else:
-            footer = "Enter to select    Esc to close"
+            footer = "Left click / Enter select    Right-click / ← previous    Esc close"
         draw_text(
             canvas,
             footer,
@@ -5064,6 +5119,8 @@ class MosaicApp:
     def _on_zone_edit_mouse(self, event: int, x: int, y: int) -> None:
         if event != cv2.EVENT_LBUTTONUP:
             return
+        if time.monotonic() < self._zone_edit_ignore_until:
+            return
         name = self._zone_edit_name or self._line_edit_name
         if name is None:
             return
@@ -5085,6 +5142,7 @@ class MosaicApp:
             frame_w=fw,
             frame_h=fh,
             mode=self.display.scale_mode if self.view_zoom <= 1.001 else "fill",
+            clamp=True,
         )
         if mapped is None:
             self._flash_capture("Click on the video (not letterbox)")
@@ -5116,7 +5174,9 @@ class MosaicApp:
             if step:
                 self._menu_index = step_menu_index(items, self._menu_index, -step)
             return
-        if event != cv2.EVENT_LBUTTONUP:
+        right_up = getattr(cv2, "EVENT_RBUTTONUP", -1)
+        ctrl = bool(flags & getattr(cv2, "EVENT_FLAG_CTRLKEY", 8))
+        if event != cv2.EVENT_LBUTTONUP and event != right_up:
             return
         px, py = self._event_to_pixel(x, y)
         for action, absolute, x0, y0, x1, y1 in self._menu_hitboxes:
@@ -5124,7 +5184,13 @@ class MosaicApp:
                 if is_menu_header(action):
                     return
                 self._menu_index = absolute
-                self._activate_menu(action)
+                self._menu_activated_by_mouse = True
+                decrease = event == right_up or (event == cv2.EVENT_LBUTTONUP and ctrl)
+                if decrease and _menu_action_cycles(action):
+                    self._adjust_menu_item(action, -1)
+                else:
+                    self._activate_menu(action)
+                self._menu_activated_by_mouse = False
                 return
         self._menu_open = False
         self._menu_page = "root"

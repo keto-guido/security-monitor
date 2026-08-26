@@ -124,6 +124,12 @@ def test_map_tile_click_fit_letterbox() -> None:
         )
         is None
     )
+    clamped = map_tile_click_to_frame_norm(
+        10, 10, tile_w=200, tile_h=200, frame_w=200, frame_h=100, mode="fit", clamp=True
+    )
+    assert clamped is not None
+    assert 0.0 <= clamped[0] <= 1.0
+    assert 0.0 <= clamped[1] <= 1.0
 
 
 def test_config_encroachment_roundtrip(tmp_path) -> None:
@@ -178,6 +184,26 @@ def test_config_encroachment_roundtrip(tmp_path) -> None:
     assert "detect_encroachment: true" in text
     assert "encroach_zones:" in text
     assert "Porch" in text
+    assert "points: [[" in text
+
+
+def test_empty_zone_stub_is_skipped() -> None:
+    cfg = parse_config(
+        {
+            "cameras": [
+                {
+                    "name": "Yard",
+                    "url": "rtsp://1.2.3.4/x",
+                    "encroach_zones": [
+                        {"name": "Tripwire", "kind": "line", "points": None},
+                    ],
+                    "encroach_line": None,
+                }
+            ]
+        }
+    )
+    assert cfg.cameras[0].encroach_zones == []
+    assert cfg.cameras[0].encroach_line is None
 
 
 def test_config_rejects_bad_encroach_side() -> None:

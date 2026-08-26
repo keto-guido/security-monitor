@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from security_monitor.mosaic import (
+    _menu_action_cycles,
     clamp_center,
     escape_action,
     first_selectable_index,
@@ -100,6 +101,10 @@ def test_menu_sections_are_headers() -> None:
     assert is_menu_header(action)
     assert label == "Cameras"
     assert not is_menu_header("cameras")
+    assert _menu_action_cycles("layout")
+    assert _menu_action_cycles("clip_length")
+    assert not _menu_action_cycles("cameras")
+    assert not _menu_action_cycles("resume")
 
 
 def test_menu_navigation_skips_headers() -> None:

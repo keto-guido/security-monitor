@@ -173,9 +173,9 @@ class PowerTracker:
 def power_mode_label(mode: str, *, active: bool = False, threshold: float = 12.0) -> str:
     key = str(mode).strip().lower()
     if key == "on":
-        return "On (video + HUD only)"
+        return "On — pause extras (video + HUD)"
     if key == "off":
-        return "Off"
+        return "Off — detection and extras run"
     if active:
         return f"Auto — ON now (<{threshold:g} fps)"
     return f"Auto (if UI FPS < {threshold:g})"

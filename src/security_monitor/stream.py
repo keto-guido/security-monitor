@@ -145,7 +145,10 @@ class CameraWorker(threading.Thread):
             last_ok = time.monotonic()
             stamps: list[float] = []
             while not self._stop.is_set() and not self._kick.is_set():
-                ok, frame = cap.read()
+                try:
+                    ok, frame = cap.read()
+                except cv2.error:
+                    ok, frame = False, None
                 now = time.monotonic()
                 if not ok or frame is None:
                     if now - last_ok > max(1.0, self.display.read_timeout_ms / 1000):
