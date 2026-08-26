@@ -133,49 +133,60 @@ class CameraWorker(threading.Thread):
 
     def run(self) -> None:
         while not self._stop.is_set():
-            self._kick.clear()
-            self._set_status("reconnecting", "opening stream")
-            cap = self._open()
-            if cap is None or not cap.isOpened():
-                self._set_status("disconnected", "connect failed")
-                self._wait_retry()
-                continue
-            self._cap = cap
-            self._set_status("live", "connected")
-            last_ok = time.monotonic()
-            stamps: list[float] = []
-            while not self._stop.is_set() and not self._kick.is_set():
+            try:
+                self._run_session()
+            except Exception as exc:  # noqa: BLE001 — OpenCV often raises raw C++ errors
+                print(f"{self.name}: capture error ({exc})")
                 try:
-                    ok, frame = cap.read()
-                except cv2.error:
-                    ok, frame = False, None
-                now = time.monotonic()
-                if not ok or frame is None:
-                    if now - last_ok > max(1.0, self.display.read_timeout_ms / 1000):
-                        self._set_status("error", "stream stalled")
-                        break
-                    continue
-                last_ok = now
-                stamps.append(now)
-                stamps = [t for t in stamps if now - t <= 2.0]
-                fps = (len(stamps) - 1) / (stamps[-1] - stamps[0]) if len(stamps) >= 2 else 0.0
-                frame = rotate_frame(frame, self.camera.rotate)
-                self.history.push(frame, when=now)
-                with self._lock:
-                    self._frame = frame
-                    if self._fps > 0 and fps > 0:
-                        self._fps = self._fps * 0.85 + fps * 0.15
-                    else:
-                        self._fps = fps
-                    self._status = "live"
-                    self._detail = ""
-            immediate = self._kick.is_set()
-            self._release()
-            if self._stop.is_set():
-                break
-            self._set_status("reconnecting", "retrying")
-            if not immediate:
+                    self._release()
+                except Exception:  # noqa: BLE001
+                    pass
+                if self._stop.is_set():
+                    break
+                self._set_status("error", "capture crashed")
                 self._wait_retry()
+
+    def _run_session(self) -> None:
+        self._kick.clear()
+        self._set_status("reconnecting", "opening stream")
+        cap = self._open()
+        if cap is None or not _cap_opened(cap):
+            self._set_status("disconnected", "connect failed")
+            self._wait_retry()
+            return
+        self._cap = cap
+        self._set_status("live", "connected")
+        last_ok = time.monotonic()
+        stamps: list[float] = []
+        while not self._stop.is_set() and not self._kick.is_set():
+            ok, frame = safe_cap_read(cap)
+            now = time.monotonic()
+            if not ok or frame is None:
+                if now - last_ok > max(1.0, self.display.read_timeout_ms / 1000):
+                    self._set_status("error", "stream stalled")
+                    break
+                continue
+            last_ok = now
+            stamps.append(now)
+            stamps = [t for t in stamps if now - t <= 2.0]
+            fps = (len(stamps) - 1) / (stamps[-1] - stamps[0]) if len(stamps) >= 2 else 0.0
+            frame = rotate_frame(frame, self.camera.rotate)
+            self.history.push(frame, when=now)
+            with self._lock:
+                self._frame = frame
+                if self._fps > 0 and fps > 0:
+                    self._fps = self._fps * 0.85 + fps * 0.15
+                else:
+                    self._fps = fps
+                self._status = "live"
+                self._detail = ""
+        immediate = self._kick.is_set()
+        self._release()
+        if self._stop.is_set():
+            return
+        self._set_status("reconnecting", "retrying")
+        if not immediate:
+            self._wait_retry()
 
     def _open(self) -> cv2.VideoCapture | None:
         source = self.camera.capture_source()
@@ -183,11 +194,11 @@ class CameraWorker(threading.Thread):
         if isinstance(source, int):
             try:
                 cap = _create_capture(source)
-            except cv2.error:
+            except Exception:  # noqa: BLE001
                 return None
-            if cap is None or not cap.isOpened():
+            if cap is None or not _cap_opened(cap):
                 if cap is not None:
-                    cap.release()
+                    _safe_release(cap)
                 return None
             with self._lock:
                 self._decode = "cpu/device"
@@ -217,15 +228,12 @@ class CameraWorker(threading.Thread):
                         force_cpu=force_cpu,
                     )
                     cap = _create_capture(source)
-            except cv2.error:
+            except Exception:  # noqa: BLE001
                 cap = None
-            if cap is not None and cap.isOpened():
+            if cap is not None and _cap_opened(cap):
                 # Confirm we can read at least one frame before accepting GPU path.
                 if not force_cpu and not self._smoke_read(cap):
-                    try:
-                        cap.release()
-                    except cv2.error:
-                        pass
+                    _safe_release(cap)
                     continue
                 label = last_label
                 if force_cpu and len(attempts) > 1:
@@ -234,25 +242,22 @@ class CameraWorker(threading.Thread):
                     self._decode = label
                 return self._finish_open(cap)
             if cap is not None:
-                try:
-                    cap.release()
-                except cv2.error:
-                    pass
+                _safe_release(cap)
         with self._lock:
             self._decode = last_label
         return None
 
     def _smoke_read(self, cap: cv2.VideoCapture) -> bool:
         """Return True if the capture can produce a frame (GPU path sanity check)."""
-        try:
-            ok, frame = cap.read()
-        except cv2.error:
-            return False
+        ok, frame = safe_cap_read(cap)
         return bool(ok and frame is not None and getattr(frame, "size", 0) > 0)
 
     def _finish_open(self, cap: cv2.VideoCapture) -> cv2.VideoCapture:
         buf_size = 4 if self.display.smooth_buffer else 1
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, buf_size)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, buf_size)
+        except Exception:  # noqa: BLE001
+            pass
         _try_set(cap, "CAP_PROP_OPEN_TIMEOUT_MSEC", self.display.open_timeout_ms)
         _try_set(cap, "CAP_PROP_READ_TIMEOUT_MSEC", self.display.read_timeout_ms)
         # Best-effort OpenCV HW acceleration property when present.
@@ -269,17 +274,14 @@ class CameraWorker(threading.Thread):
             return
         try:
             cap.set(prop, any_accel)
-        except cv2.error:
+        except Exception:  # noqa: BLE001
             return
 
     def _release(self) -> None:
         cap = self._cap
         self._cap = None
         if cap is not None:
-            try:
-                cap.release()
-            except cv2.error:
-                pass
+            _safe_release(cap)
 
     def _wait_retry(self) -> None:
         self._wake.clear()
@@ -361,49 +363,59 @@ class DemoWorker(threading.Thread):
         interval = 1.0 / max(1, self.display.fps)
         started = time.monotonic()
         while not self._stop.is_set():
-            t = time.monotonic() - started
-            frame = np.zeros((height, width, 3), dtype=np.uint8)
-            frame[:] = (18, 18, 22)
-            band_y = int((np.sin(t + self.index) * 0.5 + 0.5) * (height - 40))
-            frame[band_y : band_y + 24, :] = color
-            cv2.circle(
-                frame,
-                (int((t * 80 + self.index * 40) % width), height // 2),
-                28,
-                color,
-                -1,
-            )
-            label = time.strftime("%H:%M:%S")
-            cv2.putText(
-                frame,
-                f"{self.camera.name}  {label}",
-                (16, 36),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (230, 230, 230),
-                2,
-                cv2.LINE_AA,
-            )
-            frame = rotate_frame(frame, self.camera.rotate)
-            now = time.monotonic()
-            self.history.push(frame, when=now)
-            with self._lock:
-                self._frame = frame
+            try:
+                t = time.monotonic() - started
+                frame = np.zeros((height, width, 3), dtype=np.uint8)
+                frame[:] = (18, 18, 22)
+                band_y = int((np.sin(t + self.index) * 0.5 + 0.5) * (height - 40))
+                frame[band_y : band_y + 24, :] = color
+                cv2.circle(
+                    frame,
+                    (int((t * 80 + self.index * 40) % width), height // 2),
+                    28,
+                    color,
+                    -1,
+                )
+                label = time.strftime("%H:%M:%S")
+                cv2.putText(
+                    frame,
+                    f"{self.camera.name}  {label}",
+                    (16, 36),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (230, 230, 230),
+                    2,
+                    cv2.LINE_AA,
+                )
+                frame = rotate_frame(frame, self.camera.rotate)
+                now = time.monotonic()
+                self.history.push(frame, when=now)
+                with self._lock:
+                    self._frame = frame
+            except Exception as exc:  # noqa: BLE001
+                print(f"{self.name}: demo error ({exc})")
             self._stop.wait(interval)
 
 
 def rotate_frame(frame: np.ndarray, degrees: int) -> np.ndarray:
     """Rotate a BGR frame clockwise by 0/90/180/270 degrees."""
-    degrees = int(degrees) % 360
+    try:
+        degrees = int(degrees) % 360
+    except (TypeError, ValueError):
+        return frame
     if degrees == 0:
         return frame
-    if degrees == 90:
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    if degrees == 180:
-        return cv2.rotate(frame, cv2.ROTATE_180)
-    if degrees == 270:
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return frame
+    flag = {
+        90: getattr(cv2, "ROTATE_90_CLOCKWISE", None),
+        180: getattr(cv2, "ROTATE_180", None),
+        270: getattr(cv2, "ROTATE_90_COUNTERCLOCKWISE", None),
+    }.get(degrees)
+    if flag is None:
+        return frame
+    try:
+        return cv2.rotate(frame, flag)
+    except Exception:  # noqa: BLE001
+        return frame
 
 
 def build_sources(cameras: list[CameraConfig], display: DisplayConfig) -> list[FrameSource]:
@@ -415,6 +427,33 @@ def build_sources(cameras: list[CameraConfig], display: DisplayConfig) -> list[F
         else:
             sources.append(CameraWorker(camera, display))
     return sources
+
+
+def safe_cap_read(cap: object) -> tuple[bool, np.ndarray | None]:
+    """Read one frame; never raise — OpenCV C++ errors must not kill the thread."""
+    try:
+        ok, frame = cap.read()  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        return False, None
+    if not ok or frame is None:
+        return False, None
+    return True, frame
+
+
+def _cap_opened(cap: cv2.VideoCapture | None) -> bool:
+    if cap is None:
+        return False
+    try:
+        return bool(cap.isOpened())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _safe_release(cap: cv2.VideoCapture) -> None:
+    try:
+        cap.release()
+    except Exception:  # noqa: BLE001
+        return
 
 
 def _create_capture(source: str | int) -> cv2.VideoCapture:
@@ -432,5 +471,5 @@ def _try_set(cap: cv2.VideoCapture, attr: str, value: int) -> None:
         return
     try:
         cap.set(prop, value)
-    except cv2.error:
+    except Exception:  # noqa: BLE001
         return

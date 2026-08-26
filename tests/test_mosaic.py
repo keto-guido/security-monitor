@@ -7,6 +7,7 @@ from security_monitor.mosaic import (
     _menu_action_cycles,
     clamp_center,
     escape_action,
+    fallback_canvas,
     first_selectable_index,
     is_menu_header,
     magnify,
@@ -28,6 +29,11 @@ def test_scale_modes_output_cell_size() -> None:
     for mode in ("fit", "fill", "stretch"):
         out = scale_frame(frame, 320, 180, mode)
         assert out.shape == (180, 320, 3)
+
+
+def test_scale_frame_swallows_malformed_input() -> None:
+    out = scale_frame(np.zeros((0, 0, 3), dtype=np.uint8), 80, 45, "fit")
+    assert out.shape == (45, 80, 3)
 
 
 def test_placeholder_size() -> None:
@@ -94,6 +100,24 @@ def test_rotate_frame_swaps_dimensions_for_90() -> None:
     upside = rotate_frame(frame, 180)
     assert upside.shape == frame.shape
     assert tuple(upside[-1, -1]) == (1, 2, 3)
+
+
+def test_rotate_frame_returns_original_if_opencv_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = np.zeros((40, 80, 3), dtype=np.uint8)
+    frame[0, 0] = (1, 2, 3)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("Unknown C++ exception")
+
+    monkeypatch.setattr("security_monitor.stream.cv2.rotate", boom)
+    assert rotate_frame(frame, 90) is frame
+
+
+def test_fallback_canvas_reuses_last_frame() -> None:
+    previous = np.ones((10, 20, 3), dtype=np.uint8)
+    assert fallback_canvas(previous, (640, 360)) is previous
+    blank = fallback_canvas(None, (64, 36))
+    assert blank.shape == (36, 64, 3)
 
 
 def test_menu_sections_are_headers() -> None:

@@ -78,6 +78,12 @@ def test_maybe_apply_skips_none() -> None:
     assert maybe_apply_config_rotation("none") is None
 
 
+def test_maybe_apply_invalid_rotation_does_not_raise() -> None:
+    message = maybe_apply_config_rotation("clockwise")
+    assert message is not None
+    assert "failed" in message
+
+
 def test_maybe_apply_swallows_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "security_monitor.display_setup.apply_screen_rotate",

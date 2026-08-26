@@ -281,7 +281,12 @@ def maybe_apply_config_rotation(rotation: str, output: str | None = None) -> str
     Apply config screen_rotate on Linux. Returns a log line, or None if skipped.
     Never raises — startup should still open the mosaic if xrandr fails.
     """
-    key = normalize_rotation(rotation) if rotation else "none"
+    try:
+        key = normalize_rotation(rotation) if rotation else "none"
+    except DisplaySetupError as exc:
+        return f"screen_rotate failed: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"screen_rotate failed: {exc}"
     if key == "none":
         return None
     if not is_linux():

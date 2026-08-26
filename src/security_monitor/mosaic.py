@@ -99,6 +99,8 @@ from security_monitor.decode import (
     next_hwaccel,
     opencv_decode_summary,
     probe_hwaccels,
+    resolve_decode_request,
+    sanitize_hwaccel,
 )
 from security_monitor.alarm import play_alert_beep
 from security_monitor.detection import DetectionEngine, configure_compute_threads, draw_boxes
@@ -450,6 +452,13 @@ class MosaicApp:
     def __init__(self, config: AppConfig, *, safe_mode: bool = False) -> None:
         self.config = config
         self.display = config.display
+        safe_hw = sanitize_hwaccel(self.display.hwaccel)
+        if safe_hw != self.display.hwaccel:
+            print(
+                f"HW backend {self.display.hwaccel!r} is not usable on this machine "
+                f"— using {safe_hw}"
+            )
+            self.display.hwaccel = safe_hw
         self._safe_mode = bool(safe_mode)
         self._power = PowerTracker(
             PowerPolicy(
@@ -806,26 +815,32 @@ class MosaicApp:
             keep = getattr(cv2, "WINDOW_KEEPRATIO", 0)
             flags |= keep
             cv2.namedWindow(self.window, flags)
-        except cv2.error:
+        except Exception as exc:  # noqa: BLE001
             print(
                 "OpenCV could not create a window. Install the GUI build:\n"
                 "  pip install opencv-python\n"
-                "(not opencv-python-headless)",
+                f"(not opencv-python-headless)\n({exc})",
                 file=sys.stderr,
             )
             self._shutdown()
             return 1
 
         width, height = self.display.canvas_size
-        cv2.resizeWindow(self.window, width, height)
+        try:
+            cv2.resizeWindow(self.window, width, height)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             aspect = getattr(cv2, "WND_PROP_ASPECT_RATIO", None)
             keep = getattr(cv2, "WINDOW_KEEPRATIO", None)
             if aspect is not None and keep is not None:
                 cv2.setWindowProperty(self.window, aspect, keep)
-        except cv2.error:
+        except Exception:  # noqa: BLE001
             pass
-        cv2.setMouseCallback(self.window, self._on_mouse)
+        try:
+            cv2.setMouseCallback(self.window, self._on_mouse_safe)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Mouse callback unavailable: {exc}")
         self._apply_fullscreen()
         print(
             "Controls: Esc back/options | q quit | f fullscreen | 1-9 focus | "
@@ -838,27 +853,51 @@ class MosaicApp:
 
         delay = max(1, int(1000 / self.display.fps))
         stamps: list[float] = []
+        last_canvas: np.ndarray | None = None
         try:
             while self._running:
-                if self._extras_enabled:
-                    self._tick_cycle_focus()
-                    self._maybe_purge_media()
-                canvas = self._compose()
-                cv2.imshow(self.window, canvas)
+                try:
+                    if self._extras_enabled:
+                        self._tick_cycle_focus()
+                        self._maybe_purge_media()
+                    canvas = self._compose()
+                    if canvas is None or getattr(canvas, "size", 0) == 0:
+                        raise ValueError("empty canvas")
+                    last_canvas = canvas
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Compose error: {exc}")
+                    canvas = fallback_canvas(last_canvas, self.display.canvas_size)
+                try:
+                    cv2.imshow(self.window, canvas)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Display error: {exc}")
+                    time.sleep(delay / 1000.0)
+                    continue
                 now = time.monotonic()
                 stamps.append(now)
                 stamps = [t for t in stamps if now - t <= 1.5]
                 if len(stamps) >= 2:
                     self._ui_fps = (len(stamps) - 1) / (stamps[-1] - stamps[0])
-                self._tick_power_mode(now)
+                try:
+                    self._tick_power_mode(now)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Power policy error: {exc}")
                 wait = getattr(cv2, "waitKeyEx", cv2.waitKey)
-                key = wait(delay)
+                try:
+                    key = wait(delay)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Input error: {exc}")
+                    time.sleep(delay / 1000.0)
+                    continue
                 if key >= 0:
-                    self._handle_key(key)
+                    try:
+                        self._handle_key(key)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"Key handler error: {exc}")
                 try:
                     if cv2.getWindowProperty(self.window, cv2.WND_PROP_VISIBLE) < 1:
                         break
-                except cv2.error:
+                except Exception:  # noqa: BLE001
                     break
         except KeyboardInterrupt:
             print("\nInterrupted")
@@ -889,7 +928,10 @@ class MosaicApp:
             self._person_recorders.pop(name, None)
         for source in self.sources:
             source.stop()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _screen_size(self) -> tuple[int, int] | None:
         from security_monitor.display_setup import screen_size
@@ -899,7 +941,7 @@ class MosaicApp:
     def _reported_window_size(self) -> tuple[int, int] | None:
         try:
             _x, _y, ww, wh = cv2.getWindowImageRect(self.window)
-        except cv2.error:
+        except Exception:  # noqa: BLE001
             return None
         if ww < 1 or wh < 1:
             return None
@@ -3002,10 +3044,16 @@ class MosaicApp:
         elif action == "decode_mode":
             previous = self.display.decode_mode
             self.display.decode_mode = next_decode_mode(self.display.decode_mode, step)
-            self._apply_buffer_settings(persist=True)
-            self._reboot_notice = decode_mode_label(
+            accel, _label = resolve_decode_request(
                 self.display.decode_mode, self.display.hwaccel
             )
+            self._apply_buffer_settings(persist=True)
+            if self.display.decode_mode == "gpu" and accel is None:
+                self._reboot_notice = "GPU requested — no usable backend here, using CPU"
+            else:
+                self._reboot_notice = decode_mode_label(
+                    self.display.decode_mode, self.display.hwaccel
+                )
             if previous != self.display.decode_mode:
                 self._reconnect_all()
         elif action == "hud_opacity":
@@ -3031,9 +3079,14 @@ class MosaicApp:
             )
         elif action == "hwaccel":
             previous = self.display.hwaccel
-            self.display.hwaccel = next_hwaccel(self.display.hwaccel, step)
+            requested = next_hwaccel(self.display.hwaccel, step)
+            safe = sanitize_hwaccel(requested)
+            self.display.hwaccel = safe
             self._apply_buffer_settings(persist=True)
-            self._reboot_notice = f"HW backend: {self.display.hwaccel}"
+            if safe != requested:
+                self._reboot_notice = f"{requested} not available here — using {safe}"
+            else:
+                self._reboot_notice = f"HW backend: {self.display.hwaccel}"
             if previous != self.display.hwaccel:
                 self._reconnect_all()
         elif action == "clip_length":
@@ -4777,7 +4830,10 @@ class MosaicApp:
     def _reconnect_all(self) -> None:
         print("Reconnecting all cameras...")
         for source in self.sources:
-            source.reconnect()
+            try:
+                source.reconnect()
+            except Exception as exc:  # noqa: BLE001
+                print(f"{source.name}: reconnect failed ({exc})")
 
     def _draw_menu(self, canvas: np.ndarray) -> np.ndarray:
         self._menu_hitboxes = []
@@ -5126,22 +5182,25 @@ class MosaicApp:
         mode_normal = getattr(cv2, "WINDOW_NORMAL", 0)
         if prop is None:
             return
-        if self.fullscreen:
-            screen = self._screen_size()
-            if screen is not None:
+        try:
+            if self.fullscreen:
+                screen = self._screen_size()
+                if screen is not None:
+                    try:
+                        cv2.resizeWindow(self.window, screen[0], screen[1])
+                        cv2.moveWindow(self.window, 0, 0)
+                    except Exception:  # noqa: BLE001
+                        pass
+                cv2.setWindowProperty(self.window, prop, mode_full)
+            else:
+                cv2.setWindowProperty(self.window, prop, mode_normal)
                 try:
-                    cv2.resizeWindow(self.window, screen[0], screen[1])
-                    cv2.moveWindow(self.window, 0, 0)
-                except cv2.error:
+                    width, height = self.display.canvas_size
+                    cv2.resizeWindow(self.window, width, height)
+                except Exception:  # noqa: BLE001
                     pass
-            cv2.setWindowProperty(self.window, prop, mode_full)
-        else:
-            cv2.setWindowProperty(self.window, prop, mode_normal)
-            try:
-                width, height = self.display.canvas_size
-                cv2.resizeWindow(self.window, width, height)
-            except cv2.error:
-                pass
+        except Exception as exc:  # noqa: BLE001
+            print(f"Fullscreen change failed: {exc}")
 
     def _toggle_ha_panel(self) -> None:
         if not self.display.ha_enabled or not self.display.ha_panel_enabled:
@@ -5171,6 +5230,12 @@ class MosaicApp:
             else:
                 state = self._ha.entity_state(entity_id) or "toggled"
                 self._flash_capture(f"{light.display_label}: {state}", seconds=2.0)
+
+    def _on_mouse_safe(self, event: int, x: int, y: int, flags: int, userdata: object) -> None:
+        try:
+            self._on_mouse(event, x, y, flags, userdata)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Mouse handler error: {exc}")
 
     def _on_mouse(self, event: int, x: int, y: int, flags: int, _userdata: object) -> None:
         if self._reboot_job is not None:
@@ -5342,6 +5407,13 @@ class MosaicApp:
 
 
 def scale_frame(frame: np.ndarray, cell_w: int, cell_h: int, mode: str) -> np.ndarray:
+    try:
+        return _scale_frame(frame, cell_w, cell_h, mode)
+    except Exception:  # noqa: BLE001
+        return placeholder(cell_w, cell_h, "", "BAD FRAME")
+
+
+def _scale_frame(frame: np.ndarray, cell_w: int, cell_h: int, mode: str) -> np.ndarray:
     if frame.ndim == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     elif frame.shape[2] == 4:
@@ -5466,9 +5538,30 @@ def draw_status_bar(
 def run_monitor(config: AppConfig, *, safe_mode: bool = False) -> int:
     with CrashGuard() as guard:
         app = MosaicApp(config, safe_mode=safe_mode)
-        code = app.run()
+        try:
+            code = app.run()
+        except KeyboardInterrupt:
+            print("\nInterrupted")
+            code = 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"Mosaic crashed: {exc}", file=sys.stderr)
+            try:
+                app._shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            return 1
         guard.disarm()
         return code
+
+
+def fallback_canvas(
+    previous: np.ndarray | None, size: tuple[int, int]
+) -> np.ndarray:
+    """Keep showing the last good frame if compose fails."""
+    if previous is not None and getattr(previous, "size", 0) > 0:
+        return previous
+    width, height = size
+    return np.zeros((max(1, int(height)), max(1, int(width)), 3), dtype=np.uint8)
 
 
 def escape_action(*, menu_open: bool, on_main_layout: bool) -> str:

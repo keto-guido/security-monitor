@@ -19,6 +19,45 @@ _WINDOWS_PREF = ("d3d11va", "qsv", "cuda")
 _MAC_PREF = ("videotoolbox",)
 
 
+def platform_hwaccels() -> tuple[str, ...]:
+    """Backends that are even theoretically valid on this OS."""
+    system = platform.system().lower()
+    if system == "windows":
+        return _WINDOWS_PREF
+    if system == "darwin":
+        return _MAC_PREF
+    return _LINUX_PREF
+
+
+def hwaccel_menu_choices() -> tuple[str, ...]:
+    """Decode backends the UI should offer — probed + this OS, never a foreign GPU API."""
+    found = set(probe_hwaccels())
+    extras = [name for name in platform_hwaccels() if name in found]
+    return ("auto", "none", *extras)
+
+
+def sanitize_hwaccel(hwaccel: str) -> str:
+    """
+    Map a saved/requested backend to something this machine can try.
+
+    Foreign APIs (D3D on Linux, VAAPI on Windows) and backends the probe did
+    not see become ``auto`` so OpenCV/FFmpeg is not asked to open them.
+    """
+    choice = (hwaccel or "auto").strip().lower()
+    if choice in {"none", "off", "cpu"}:
+        return "none"
+    if choice in {"", "auto"}:
+        return "auto"
+    if choice not in platform_hwaccels():
+        return "auto"
+    available = set(probe_hwaccels())
+    if available and choice not in available:
+        return "auto"
+    if not available:
+        return "auto"
+    return choice
+
+
 def decode_mode_label(mode: str, hwaccel: str) -> str:
     mode = (mode or "auto").lower()
     hwaccel = (hwaccel or "auto").lower()
@@ -43,12 +82,20 @@ def next_decode_mode(current: str, step: int = 1) -> str:
     return values[(index + int(step)) % len(values)]
 
 
-def next_hwaccel(current: str, step: int = 1) -> str:
-    values = list(VALID_HWACCELS)
-    try:
-        index = values.index((current or "auto").lower())
-    except ValueError:
+def next_hwaccel(
+    current: str,
+    step: int = 1,
+    *,
+    choices: tuple[str, ...] | None = None,
+) -> str:
+    values = list(choices if choices is not None else hwaccel_menu_choices())
+    if not values:
+        values = ["auto", "none"]
+    key = (current or "auto").lower()
+    if key not in values:
         index = 0
+        return values[(index + int(step)) % len(values)] if step else values[0]
+    index = values.index(key)
     return values[(index + int(step)) % len(values)]
 
 
@@ -94,8 +141,14 @@ def probe_hwaccels() -> tuple[str, ...]:
             found.add("d3d11va")
     except Exception:  # noqa: BLE001
         pass
-    # Always allow explicit none/cpu path.
-    ordered = [name for name in ("cuda", "qsv", "vaapi", "d3d11va", "videotoolbox") if name in found]
+    # Only advertise backends this OS can actually request. OpenCV build
+    # strings often mention D3D/VideoToolbox on every platform.
+    allowed = set(platform_hwaccels())
+    ordered = [
+        name
+        for name in ("cuda", "qsv", "vaapi", "d3d11va", "videotoolbox")
+        if name in found and name in allowed
+    ]
     return tuple(ordered)
 
 
@@ -120,53 +173,38 @@ def opencv_decode_summary() -> str:
 
 def preferred_hwaccel(hwaccel: str = "auto") -> str | None:
     """Resolve which hwaccel name to request, or None for software decode."""
-    choice = (hwaccel or "auto").lower()
+    choice = sanitize_hwaccel(hwaccel)
     if choice in {"none", "off", "cpu"}:
         return None
     available = set(probe_hwaccels())
     if choice != "auto":
-        # Still request even if probe missed it — FFmpeg may support it.
+        if available and choice not in available:
+            return None
+        if choice not in platform_hwaccels():
+            return None
         return choice
-    prefs: tuple[str, ...]
-    system = platform.system().lower()
-    if system == "windows":
-        prefs = _WINDOWS_PREF
-    elif system == "darwin":
-        prefs = _MAC_PREF
-    else:
-        prefs = _LINUX_PREF
-    for name in prefs:
+    for name in platform_hwaccels():
         if name in available:
             return name
-    # Prefer first platform default even if probe empty (request → fallback).
-    return prefs[0] if prefs else None
+    return None
 
 
 def resolve_decode_request(decode_mode: str, hwaccel: str) -> tuple[str | None, str]:
     """
     Return ``(hwaccel_or_none, human_label)`` for the next open attempt.
 
-    ``None`` means software/CPU decode options only.
+    ``None`` means software/CPU decode options only. Never force a backend
+    this OS / probe does not support — that path crashes OpenCV on Linux.
     """
     mode = (decode_mode or "auto").lower()
-    hw = (hwaccel or "auto").lower()
+    hw = sanitize_hwaccel(hwaccel)
     if mode == "cpu" or hw in {"none", "off", "cpu"}:
         return None, "cpu"
-    accel = preferred_hwaccel(hwaccel)
-    if mode == "gpu":
-        if accel is None:
-            # Force a platform default request even if probe found nothing.
-            system = platform.system().lower()
-            if system == "windows":
-                accel = "d3d11va"
-            elif system == "darwin":
-                accel = "videotoolbox"
-            else:
-                accel = "vaapi"
-        return accel, f"gpu/{accel}"
-    # auto: try GPU when we have a candidate, else CPU
+    accel = preferred_hwaccel(hw)
     if accel is None:
         return None, "cpu"
+    if mode == "gpu":
+        return accel, f"gpu/{accel}"
     return accel, f"auto/{accel}"
 
 

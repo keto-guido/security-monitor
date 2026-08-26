@@ -8,13 +8,16 @@ import pytest
 
 from security_monitor.config import ConfigError, parse_config, save_display_settings
 from security_monitor.decode import (
+    VALID_HWACCELS,
     apply_ffmpeg_capture_options,
     decode_mode_label,
     ffmpeg_option_pairs,
     format_ffmpeg_capture_options,
+    hwaccel_menu_choices,
     next_decode_mode,
     next_hwaccel,
     resolve_decode_request,
+    sanitize_hwaccel,
 )
 
 
@@ -26,9 +29,54 @@ def test_next_decode_mode_cycles() -> None:
 
 
 def test_next_hwaccel_cycles() -> None:
+    assert next_hwaccel("auto", 1, choices=VALID_HWACCELS) == "none"
+    assert next_hwaccel("none", -1, choices=VALID_HWACCELS) == "auto"
+    assert next_hwaccel("vaapi", 1, choices=VALID_HWACCELS) == "d3d11va"
+
+
+def test_next_hwaccel_uses_platform_menu(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "security_monitor.decode.hwaccel_menu_choices",
+        lambda: ("auto", "none", "vaapi"),
+    )
     assert next_hwaccel("auto", 1) == "none"
-    assert next_hwaccel("none", -1) == "auto"
-    assert next_hwaccel("vaapi", 1) == "d3d11va"
+    assert next_hwaccel("vaapi", 1) == "auto"
+    # Foreign/saved backends snap onto the local menu instead of requesting D3D.
+    assert next_hwaccel("d3d11va", 1) == "none"
+
+
+def test_hwaccel_menu_omits_foreign_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "security_monitor.decode.platform_hwaccels",
+        lambda: ("vaapi", "cuda", "qsv"),
+    )
+    monkeypatch.setattr(
+        "security_monitor.decode.probe_hwaccels",
+        lambda: ("vaapi", "d3d11va", "videotoolbox"),
+    )
+    assert hwaccel_menu_choices() == ("auto", "none", "vaapi")
+
+
+def test_sanitize_hwaccel_rejects_foreign_and_unprobed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "security_monitor.decode.platform_hwaccels",
+        lambda: ("vaapi", "cuda", "qsv"),
+    )
+    monkeypatch.setattr("security_monitor.decode.probe_hwaccels", lambda: ("vaapi",))
+    assert sanitize_hwaccel("d3d11va") == "auto"
+    assert sanitize_hwaccel("videotoolbox") == "auto"
+    assert sanitize_hwaccel("vaapi") == "vaapi"
+    assert sanitize_hwaccel("none") == "none"
+
+
+def test_resolve_gpu_without_probe_uses_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("security_monitor.decode.platform_hwaccels", lambda: ("vaapi",))
+    monkeypatch.setattr("security_monitor.decode.probe_hwaccels", lambda: ())
+    assert resolve_decode_request("gpu", "auto") == (None, "cpu")
+    assert resolve_decode_request("gpu", "vaapi") == (None, "cpu")
+    assert resolve_decode_request("gpu", "d3d11va") == (None, "cpu")
 
 
 def test_decode_mode_label() -> None:
@@ -56,7 +104,12 @@ def test_ffmpeg_option_pairs_cpu_omits_hwaccel() -> None:
     assert "hwaccel" not in keys
 
 
-def test_ffmpeg_option_pairs_gpu_requests_hwaccel() -> None:
+def test_ffmpeg_option_pairs_gpu_requests_hwaccel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "security_monitor.decode.platform_hwaccels",
+        lambda: ("vaapi", "cuda", "qsv"),
+    )
+    monkeypatch.setattr("security_monitor.decode.probe_hwaccels", lambda: ("vaapi",))
     pairs = ffmpeg_option_pairs(
         "tcp",
         decode_mode="gpu",
@@ -68,6 +121,22 @@ def test_ffmpeg_option_pairs_gpu_requests_hwaccel() -> None:
     text = format_ffmpeg_capture_options(pairs)
     assert "hwaccel;vaapi" in text
     assert "rtsp_transport;tcp" in text
+
+
+def test_ffmpeg_pairs_never_request_foreign_hwaccel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "security_monitor.decode.platform_hwaccels",
+        lambda: ("vaapi", "cuda", "qsv"),
+    )
+    monkeypatch.setattr("security_monitor.decode.probe_hwaccels", lambda: ("vaapi",))
+    pairs = ffmpeg_option_pairs("tcp", decode_mode="gpu", hwaccel="d3d11va")
+    assert ("hwaccel", "d3d11va") not in pairs
+    # Linux with a probed VAAPI backend may still request that, never D3D.
+    keys = dict(pairs)
+    if "hwaccel" in keys:
+        assert keys["hwaccel"] in {"vaapi", "cuda", "qsv"}
 
 
 def test_apply_ffmpeg_capture_options_sets_env(monkeypatch: pytest.MonkeyPatch) -> None:
