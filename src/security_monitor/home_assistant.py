@@ -17,9 +17,10 @@ import numpy as np
 from security_monitor.overlay import draw_text, shade_round_rect
 
 HA_POLL_CHOICES: tuple[float, ...] = (1.0, 2.0, 3.0, 5.0, 10.0)
-HA_HOLD_CHOICES: tuple[float, ...] = (5.0, 10.0, 15.0, 20.0, 30.0, 60.0)
-HA_POPUP_CHOICES: tuple[float, ...] = (3.0, 5.0, 8.0, 12.0, 20.0)
+HA_HOLD_CHOICES: tuple[float, ...] = (0.0, 5.0, 8.0, 12.0, 20.0)
+HA_POPUP_CHOICES: tuple[float, ...] = (2.0, 3.0, 5.0, 8.0)
 DEFAULT_OPEN_STATES: tuple[str, ...] = ("on", "open", "unlocked")
+HA_TOAST_MAX_SECONDS = 8.0
 # Domains that commonly map to doors / openings / occupancy alerts.
 HA_BROWSE_DOMAINS: tuple[str, ...] = (
     "binary_sensor",
@@ -92,6 +93,7 @@ class HAPopup:
     message: str
     until: float
     accent: tuple[int, int, int] = (40, 120, 255)
+    entity_id: str = ""
 
 
 @dataclass
@@ -829,32 +831,77 @@ def cameras_highlighted_by_doors(
     return active
 
 
+def open_sensor_labels(doors: list[DoorState]) -> dict[str, str]:
+    """Camera name → friendly label for sensors that are still tripped."""
+    active: dict[str, str] = {}
+    for door in doors:
+        if not door.open:
+            continue
+        camera = (door.camera or "").strip()
+        if not camera:
+            continue
+        active[camera] = door.label or door.entity_id
+    return active
+
+
+def draw_sensor_chip(
+    tile: np.ndarray,
+    label: str,
+    *,
+    opacity: float = 0.82,
+) -> None:
+    """Quiet per-tile note that a linked sensor is still open."""
+    text = (label or "").strip()
+    if tile is None or tile.size == 0 or not text:
+        return
+    text = text[:36]
+    h, w = tile.shape[:2]
+    if h < 48 or w < 80:
+        return
+    size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    box_w = min(w - 12, size[0] + 16)
+    box_h = 22
+    x0, y0 = 8, 8
+    opacity = max(0.35, min(1.0, float(opacity)))
+    layer = tile[y0 : y0 + box_h, x0 : x0 + box_w].copy()
+    shade_round_rect(
+        layer,
+        (0, 0, box_w, box_h),
+        color=(22, 24, 32),
+        alpha=0.88,
+        radius=8,
+    )
+    draw_text(
+        layer,
+        text,
+        (8, box_h // 2),
+        size=13,
+        color=(200, 210, 230),
+        valign="center",
+    )
+    base = tile[y0 : y0 + box_h, x0 : x0 + box_w].astype(np.float32)
+    top = layer.astype(np.float32)
+    tile[y0 : y0 + box_h, x0 : x0 + box_w] = (
+        base * (1.0 - opacity) + top * opacity
+    ).astype(np.uint8)
+
+
 def draw_door_hud(
     canvas: np.ndarray,
     snap: HASnapshot,
     *,
     opacity: float = 0.88,
 ) -> None:
-    """Paint a compact door-status strip near the top of the mosaic."""
+    """Paint HA connection errors. Open sensors use the per-tile chip instead."""
     if canvas is None or canvas.size == 0:
         return
-    opens = [d for d in snap.open_doors if d.notify_hud]
-    if opens:
-        title = "DOOR OPEN"
-        detail = " · ".join(d.label for d in opens[:4])
-        if len(opens) > 4:
-            detail += f" +{len(opens) - 4}"
-        accent = (40, 90, 255)
-        panel = (24, 20, 18)
-    elif snap.connected and snap.ok:
-        # Quiet connected state — skip HUD clutter unless something is open
-        # or there is an error worth showing.
+    if snap.connected and snap.ok:
         return
-    else:
-        title = "Home Assistant"
-        detail = snap.error or "Disconnected"
-        accent = (70, 140, 220)
-        panel = (22, 24, 32)
+    opens: list[DoorState] = []
+    title = "Home Assistant"
+    detail = snap.error or "Disconnected"
+    accent = (70, 140, 220)
+    panel = (22, 24, 32)
 
     h, w = canvas.shape[:2]
     box_w = min(w - 24, max(280, int(w * 0.42)))
@@ -893,9 +940,67 @@ def draw_door_hud(
     ).astype(np.uint8)
 
 
-def prune_popups(popups: list[HAPopup], *, now: float | None = None) -> list[HAPopup]:
+def door_open_edges(
+    previous: dict[str, bool],
+    doors: list[DoorState],
+    *,
+    snapshot_ok: bool,
+) -> tuple[list[DoorState], list[DoorState], dict[str, bool]]:
+    """
+    Rising/falling edges for door alerts.
+
+    First observation of an entity is a baseline (no toast) so already-open
+    sensors at connect, or after a failed poll, do not spam the mosaic.
+    Failed snapshots leave ``previous`` unchanged.
+    """
+    if not snapshot_ok:
+        return [], [], dict(previous)
+    opened: list[DoorState] = []
+    closed: list[DoorState] = []
+    nxt = dict(previous)
+    for door in doors:
+        key = door.entity_id.lower()
+        was = previous.get(key)
+        if was is None:
+            nxt[key] = bool(door.open)
+            continue
+        if door.open and not was:
+            opened.append(door)
+        elif (not door.open) and was:
+            closed.append(door)
+        nxt[key] = bool(door.open)
+    return opened, closed, nxt
+
+
+def toast_seconds(requested: float) -> float:
+    return max(1.5, min(HA_TOAST_MAX_SECONDS, float(requested)))
+
+
+def upsert_popup(popups: list[HAPopup], popup: HAPopup) -> list[HAPopup]:
+    """Replace any existing toast for the same entity, then append."""
+    entity = (popup.entity_id or "").strip().lower()
+    if entity:
+        popups = [p for p in popups if (p.entity_id or "").strip().lower() != entity]
+    popups.append(popup)
+    return popups
+
+
+def prune_popups(
+    popups: list[HAPopup],
+    *,
+    now: float | None = None,
+    closed_entity_ids: set[str] | None = None,
+) -> list[HAPopup]:
     now = time.monotonic() if now is None else float(now)
-    return [p for p in popups if p.until > now]
+    closed = {e.strip().lower() for e in (closed_entity_ids or set()) if e}
+    out: list[HAPopup] = []
+    for popup in popups:
+        if popup.until <= now:
+            continue
+        if closed and (popup.entity_id or "").strip().lower() in closed:
+            continue
+        out.append(popup)
+    return out
 
 
 def draw_ha_popups(

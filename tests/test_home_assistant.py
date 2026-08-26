@@ -20,6 +20,7 @@ from security_monitor.home_assistant import (
     cameras_highlighted_by_doors,
     default_trigger_states,
     domain_counts,
+    door_open_edges,
     draw_door_hud,
     draw_ha_light_panel,
     draw_ha_popups,
@@ -33,7 +34,9 @@ from security_monitor.home_assistant import (
     parse_light_controls,
     prune_popups,
     suggested_states_for_entity,
+    toast_seconds,
     toggle_open_state,
+    upsert_popup,
 )
 
 
@@ -277,6 +280,8 @@ def test_entity_catalog_helpers() -> None:
     doors = filter_entities(entities, domain="binary_sensor")
     assert len(doors) == 1
     assert doors[0].display_name == "Front Door"
+    assert filter_entities(entities, query="garage")[0].entity_id == "cover.garage"
+    assert filter_entities(entities, query="FRONT", domain="binary_sensor")
     counts = dict(domain_counts(entities))
     assert counts["binary_sensor"] == 1
     assert counts["cover"] == 1
@@ -324,3 +329,61 @@ def test_config_rejects_bad_ha_poll() -> None:
                 "cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}],
             }
         )
+
+
+def _door(entity: str, *, open: bool, camera: str = "Cam") -> DoorState:
+    return DoorState(entity_id=entity, label=entity.split(".")[-1], camera=camera, open=open)
+
+
+def test_door_open_edges_ignore_first_seen_and_failed_poll() -> None:
+    already_open = _door("binary_sensor.front", open=True)
+    opened, closed, prev = door_open_edges({}, [already_open], snapshot_ok=True)
+    assert opened == []
+    assert closed == []
+    assert prev["binary_sensor.front"] is True
+
+    opened, closed, prev = door_open_edges(prev, [already_open], snapshot_ok=True)
+    assert opened == []
+
+    closed_door = _door("binary_sensor.front", open=False)
+    opened, closed, prev = door_open_edges(prev, [closed_door], snapshot_ok=True)
+    assert [d.entity_id for d in closed] == ["binary_sensor.front"]
+
+    reopened = _door("binary_sensor.front", open=True)
+    opened, closed, prev = door_open_edges(prev, [reopened], snapshot_ok=True)
+    assert [d.entity_id for d in opened] == ["binary_sensor.front"]
+
+    opened, closed, same = door_open_edges(prev, [], snapshot_ok=False)
+    assert opened == []
+    assert closed == []
+    assert same == prev
+
+
+def test_popups_replace_and_dismiss_on_close() -> None:
+    now = 100.0
+    first = HAPopup(message="Front", until=now + 20, entity_id="binary_sensor.front")
+    popups = upsert_popup([], first)
+    popups = upsert_popup(
+        popups, HAPopup(message="Front again", until=now + 5, entity_id="binary_sensor.front")
+    )
+    assert len(popups) == 1
+    assert popups[0].message == "Front again"
+    assert prune_popups(popups, now=now + 1) == popups
+    assert prune_popups(popups, now=now + 6) == []
+    lingering = [HAPopup(message="Front", until=now + 20, entity_id="binary_sensor.front")]
+    assert prune_popups(lingering, now=now, closed_entity_ids={"binary_sensor.front"}) == []
+    assert toast_seconds(20) == 8.0
+    assert toast_seconds(3) == 3.0
+
+
+def test_highlight_hold_zero_drops_closed_doors() -> None:
+    doors = [
+        DoorState(
+            entity_id="binary_sensor.a",
+            label="A",
+            camera="Cam A",
+            open=False,
+            last_opened_at=990.0,
+        )
+    ]
+    assert cameras_highlighted_by_doors(doors, hold_seconds=0.0, now=1000.0) == {}
