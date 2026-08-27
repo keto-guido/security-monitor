@@ -10,7 +10,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Sequence
 
 import cv2
 import numpy as np
@@ -27,6 +26,12 @@ VALID_WEATHER_SLOTS = (
 VALID_WEATHER_UNITS = ("f", "c")
 WEATHER_OPACITY_CHOICES: tuple[float, ...] = (0.25, 0.40, 0.55, 0.70, 0.85, 1.0)
 HUD_OPACITY_CHOICES: tuple[float, ...] = (0.35, 0.50, 0.65, 0.80, 0.90, 1.0)
+# How far to look for nearby thunderstorms (miles). Menu cycles these.
+LIGHTNING_RADIUS_MILES_CHOICES: tuple[int, ...] = (5, 10, 15, 25, 50, 100)
+DEFAULT_LIGHTNING_RADIUS_MILES = 25
+# Upcoming hourly slots shown when forecast is enabled (+hours from now).
+_FORECAST_OFFSETS_H = (1, 3, 6)
+_EARTH_RADIUS_KM = 6371.0
 
 # WMO weather interpretation codes (Open-Meteo) that imply thunder / lightning risk.
 _THUNDER_CODES = frozenset({95, 96, 97, 98, 99})
@@ -74,6 +79,8 @@ class WeatherSnapshot:
     storm_warning: str = ""
     lightning_risk: str = ""  # None / Low / Elevated / High
     lightning_detail: str = ""
+    lightning_distance_km: float | None = None  # nearest thunder; None if unknown/none
+    forecast_lines: tuple[str, ...] = ()
     latitude: float | None = None
     longitude: float | None = None
     place: str = ""
@@ -91,6 +98,38 @@ class WeatherSnapshot:
             return f"{self.temperature_c:.0f}°C"
         f = self.temperature_c * 9.0 / 5.0 + 32.0
         return f"{f:.0f}°F"
+
+
+def miles_to_km(miles: float) -> float:
+    return float(miles) * 1.609344
+
+
+def km_to_miles(km: float) -> float:
+    return float(km) / 1.609344
+
+
+def format_distance(km: float | None, *, units: str = "f") -> str:
+    if km is None:
+        return "—"
+    if (units or "f").lower().startswith("c"):
+        return f"{km:.0f} km"
+    return f"{km_to_miles(km):.0f} mi"
+
+
+def lightning_radius_label(miles: float, *, units: str = "f") -> str:
+    miles_i = int(round(float(miles)))
+    if (units or "f").lower().startswith("c"):
+        return f"{miles_to_km(miles_i):.0f} km"
+    return f"{miles_i} mi"
+
+
+def next_lightning_radius_miles(current: float, step: int = 1) -> int:
+    values = list(LIGHTNING_RADIUS_MILES_CHOICES)
+    try:
+        index = min(range(len(values)), key=lambda i: abs(values[i] - float(current)))
+    except ValueError:
+        index = values.index(DEFAULT_LIGHTNING_RADIUS_MILES)
+    return int(values[(index + int(step)) % len(values)])
 
 
 @dataclass
@@ -179,6 +218,240 @@ def _lightning_from_code(code: int | None, precip_mm: float | None) -> tuple[str
     return "None", ""
 
 
+def _offset_latlon(lat: float, lon: float, distance_km: float, bearing_deg: float) -> tuple[float, float]:
+    """Destination point given distance (km) and bearing (degrees) from lat/lon."""
+    if distance_km <= 0:
+        return lat, lon
+    br = math.radians(bearing_deg)
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+    ang = distance_km / _EARTH_RADIUS_KM
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(ang) + math.cos(lat1) * math.sin(ang) * math.cos(br)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(br) * math.sin(ang) * math.cos(lat1),
+        math.cos(ang) - math.sin(lat1) * math.sin(lat2),
+    )
+    return math.degrees(lat2), ((math.degrees(lon2) + 540.0) % 360.0) - 180.0
+
+
+def _bearing_label(bearing_deg: float) -> str:
+    dirs = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    idx = int((bearing_deg % 360.0) / 45.0 + 0.5) % 8
+    return dirs[idx]
+
+
+def _probe_points(lat: float, lon: float, radius_km: float) -> list[tuple[float, float, float, float]]:
+    """
+    Nearby sample points for storm scan.
+
+    Returns (lat, lon, distance_km, bearing_deg). Local point is not included.
+    """
+    radius_km = max(1.0, float(radius_km))
+    points: list[tuple[float, float, float, float]] = []
+    half = max(1.0, radius_km * 0.5)
+    # 4 mid-ring bearings + 8 outer-ring bearings keeps the multi-location request small.
+    for bearing in (45.0, 135.0, 225.0, 315.0):
+        plat, plon = _offset_latlon(lat, lon, half, bearing)
+        points.append((plat, plon, half, bearing))
+    for bearing in (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0):
+        plat, plon = _offset_latlon(lat, lon, radius_km, bearing)
+        points.append((plat, plon, radius_km, bearing))
+    return points
+
+
+def _nearest_thunder(
+    lat: float,
+    lon: float,
+    radius_km: float,
+    local_code: int | None,
+) -> tuple[float | None, float | None, int | None]:
+    """
+    Find nearest thunderstorm weather_code within radius_km.
+
+    Returns (distance_km, bearing_deg, weather_code). distance 0 = overhead.
+    """
+    if local_code is not None and int(local_code) in _THUNDER_CODES:
+        return 0.0, None, int(local_code)
+
+    probes = _probe_points(lat, lon, radius_km)
+    if not probes:
+        return None, None, None
+    lats = ",".join(f"{p[0]:.4f}" for p in probes)
+    lons = ",".join(f"{p[1]:.4f}" for p in probes)
+    try:
+        qs = urllib.parse.urlencode(
+            {
+                "latitude": lats,
+                "longitude": lons,
+                "current": "weather_code",
+                "timezone": "auto",
+            }
+        )
+        data = _http_json(f"https://api.open-meteo.com/v1/forecast?{qs}", timeout=8)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
+        return None, None, None
+
+    # Multi-location responses are a list; single stays a dict.
+    entries = data if isinstance(data, list) else [data]
+    best_dist: float | None = None
+    best_bearing: float | None = None
+    best_code: int | None = None
+    best_is_thunder = False
+    for entry, probe in zip(entries, probes):
+        if not isinstance(entry, dict):
+            continue
+        current = entry.get("current") or {}
+        code = current.get("weather_code")
+        if code is None:
+            continue
+        code_i = int(code)
+        is_thunder = code_i in _THUNDER_CODES
+        is_stormy = code_i in _STORMY_CODES
+        if not is_thunder and not is_stormy:
+            continue
+        dist, bearing = probe[2], probe[3]
+        better = False
+        if best_dist is None:
+            better = True
+        elif is_thunder and not best_is_thunder:
+            better = True
+        elif is_thunder == best_is_thunder and dist < best_dist:
+            better = True
+        if better:
+            best_dist = dist
+            best_bearing = bearing
+            best_code = code_i
+            best_is_thunder = is_thunder
+    if best_dist is None or best_code is None:
+        return None, None, None
+    return best_dist, best_bearing, best_code
+
+
+def _assess_lightning(
+    *,
+    local_code: int | None,
+    precip_mm: float | None,
+    lat: float,
+    lon: float,
+    radius_miles: float,
+    units: str = "f",
+) -> tuple[str, str, float | None]:
+    """
+    Lightning risk gated by distance threshold.
+
+    Nearby thunder within the radius elevates risk; storms beyond it are ignored.
+    """
+    radius_km = miles_to_km(max(1.0, float(radius_miles)))
+    base_risk, base_detail = _lightning_from_code(local_code, precip_mm)
+
+    dist_km, bearing, near_code = _nearest_thunder(lat, lon, radius_km, local_code)
+
+    if dist_km is not None and near_code is not None:
+        if dist_km <= 0.5:
+            return "High", wmo_label(near_code), 0.0
+        compass = _bearing_label(bearing or 0.0)
+        dist_label = format_distance(dist_km, units=units)
+        if near_code in _THUNDER_CODES:
+            risk = "High" if dist_km <= radius_km * 0.5 else "Elevated"
+            return risk, f"~{dist_label} {compass}", dist_km
+        return "Elevated", f"Storm ~{dist_label} {compass}", dist_km
+
+    # No nearby thunder inside the scan radius.
+    if base_risk in {"High", "Elevated"} and (
+        local_code is None or int(local_code) not in _THUNDER_CODES
+    ):
+        # Local showers/stormy without confirmed nearby thunder → softer signal.
+        return "Low", base_detail or "Outside scan radius", None
+    if base_risk == "Low":
+        return "Low", base_detail, None
+    return "None", f"None within {lightning_radius_label(radius_miles, units=units)}", None
+
+
+def _parse_iso_hour(stamp: str) -> time.struct_time | None:
+    text = (stamp or "").strip()
+    if not text:
+        return None
+    # Open-Meteo returns "2024-06-01T15:00" (local, no tz suffix when timezone=auto).
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return time.strptime(text[:19], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _hour_label(stamp: str) -> str:
+    parsed = _parse_iso_hour(stamp)
+    if parsed is None:
+        return stamp[11:16] if len(stamp) >= 16 else stamp
+    hour = parsed.tm_hour
+    suffix = "am" if hour < 12 else "pm"
+    h12 = hour % 12 or 12
+    return f"{h12}{suffix}"
+
+
+def _temp_short(temp_c: float | None, units: str) -> str:
+    if temp_c is None:
+        return ""
+    if (units or "f").lower().startswith("c"):
+        return f"{temp_c:.0f}°"
+    return f"{(temp_c * 9.0 / 5.0 + 32.0):.0f}°"
+
+
+def _build_forecast_lines(
+    hourly: dict,
+    *,
+    units: str = "f",
+    max_lines: int = 3,
+) -> tuple[str, ...]:
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    codes = hourly.get("weather_code") or []
+    probs = hourly.get("precipitation_probability") or []
+    if not isinstance(times, list) or not times:
+        return ()
+
+    now_struct = time.localtime()
+    now_iso = time.strftime("%Y-%m-%dT%H:00", now_struct)
+
+    start_idx = 0
+    for i, stamp in enumerate(times):
+        if str(stamp) >= now_iso:
+            start_idx = i
+            break
+
+    lines: list[str] = []
+    for offset in _FORECAST_OFFSETS_H:
+        idx = start_idx + int(offset)
+        if idx >= len(times):
+            break
+        stamp = str(times[idx])
+        code = codes[idx] if idx < len(codes) else None
+        temp = temps[idx] if idx < len(temps) else None
+        prob = probs[idx] if idx < len(probs) else None
+        code_i = int(code) if code is not None else None
+        temp_f = float(temp) if temp is not None else None
+        label = _hour_label(stamp)
+        cond = wmo_label(code_i)
+        temp_s = _temp_short(temp_f, units)
+        parts = [label, cond]
+        if temp_s:
+            parts.append(temp_s)
+        if prob is not None:
+            try:
+                p = int(prob)
+            except (TypeError, ValueError):
+                p = None
+            if p is not None and p >= 20:
+                parts.append(f"{p}%")
+        lines.append(" ".join(parts))
+        if len(lines) >= max_lines:
+            break
+    return tuple(lines)
+
+
 def _fetch_warnings(lat: float, lon: float) -> str:
     """Open-Meteo warnings API (regional coverage varies)."""
     try:
@@ -214,8 +487,10 @@ def fetch_weather(
     longitude: float | None,
     *,
     place: str = "",
+    units: str = "f",
+    lightning_radius_miles: float = DEFAULT_LIGHTNING_RADIUS_MILES,
 ) -> WeatherSnapshot:
-    """Fetch current conditions (+ warnings) from Open-Meteo."""
+    """Fetch current conditions, short forecast, and nearby lightning scan."""
     loc_place = place
     try:
         if latitude is None or longitude is None:
@@ -225,6 +500,8 @@ def fetch_weather(
                 "latitude": f"{float(latitude):.4f}",
                 "longitude": f"{float(longitude):.4f}",
                 "current": "temperature_2m,weather_code,precipitation,wind_speed_10m",
+                "hourly": "temperature_2m,weather_code,precipitation_probability",
+                "forecast_hours": "12",
                 "wind_speed_unit": "kmh",
                 "timezone": "auto",
             }
@@ -239,12 +516,21 @@ def fetch_weather(
         code_i = int(code) if code is not None else None
         precip_f = float(precip) if precip is not None else None
         wind_f = float(wind) if wind is not None else None
-        risk, detail = _lightning_from_code(code_i, precip_f)
+        radius = float(lightning_radius_miles or DEFAULT_LIGHTNING_RADIUS_MILES)
+        risk, detail, dist_km = _assess_lightning(
+            local_code=code_i,
+            precip_mm=precip_f,
+            lat=float(latitude),
+            lon=float(longitude),
+            radius_miles=radius,
+            units=units,
+        )
         warning = _fetch_warnings(float(latitude), float(longitude))
         if not warning and code_i in _THUNDER_CODES:
             warning = f"Thunderstorm conditions ({wmo_label(code_i)})"
         elif not warning and code_i in _STORMY_CODES:
             warning = f"Stormy weather ({wmo_label(code_i)})"
+        forecast = _build_forecast_lines(data.get("hourly") or {}, units=units)
         return WeatherSnapshot(
             temperature_c=temp_f,
             weather_code=code_i,
@@ -254,6 +540,8 @@ def fetch_weather(
             storm_warning=warning,
             lightning_risk=risk,
             lightning_detail=detail,
+            lightning_distance_km=dist_km,
+            forecast_lines=forecast,
             latitude=float(latitude),
             longitude=float(longitude),
             place=loc_place or place or "Local",
@@ -275,6 +563,8 @@ class WeatherService:
         self._lat: float | None = None
         self._lon: float | None = None
         self._place = ""
+        self._units = "f"
+        self._lightning_radius_miles = float(DEFAULT_LIGHTNING_RADIUS_MILES)
         self._enabled = False
 
     @property
@@ -290,11 +580,17 @@ class WeatherService:
         longitude: float | None,
         place: str = "",
         refresh_seconds: float = 300.0,
+        units: str = "f",
+        lightning_radius_miles: float = DEFAULT_LIGHTNING_RADIUS_MILES,
     ) -> None:
         self._enabled = bool(enabled)
         self._lat = latitude
         self._lon = longitude
         self._place = place or ""
+        self._units = (units or "f").lower()[:1] or "f"
+        self._lightning_radius_miles = float(
+            lightning_radius_miles or DEFAULT_LIGHTNING_RADIUS_MILES
+        )
         self._interval = max(60.0, float(refresh_seconds))
         if enabled and (self._thread is None or not self._thread.is_alive()):
             self.start()
@@ -315,7 +611,13 @@ class WeatherService:
     def _refresh_once(self) -> None:
         if not self._enabled:
             return
-        snap = fetch_weather(self._lat, self._lon, place=self._place)
+        snap = fetch_weather(
+            self._lat,
+            self._lon,
+            place=self._place,
+            units=self._units,
+            lightning_radius_miles=self._lightning_radius_miles,
+        )
         with self._lock:
             self._snapshot = snap
 
@@ -474,6 +776,7 @@ def draw_weather_widget(
     show_conditions: bool = True,
     show_storm: bool = True,
     show_lightning: bool = True,
+    show_forecast: bool = False,
     opacity: float = 0.88,
     editing: bool = False,
 ) -> None:
@@ -550,12 +853,21 @@ def draw_weather_widget(
         elif risk == "Elevated":
             color = (60, 170, 240)
         detail = f" — {snap.lightning_detail}" if snap.lightning_detail else ""
-        lines.append((f"Lightning: {risk}{detail}"[:44], color))
+        lines.append((f"Lightning: {risk}{detail}"[:48], color))
+    if show_forecast:
+        if snap.forecast_lines:
+            lines.append(("Forecast", (160, 170, 185)))
+            for entry in snap.forecast_lines[:3]:
+                lines.append((entry[:44], (175, 185, 195)))
+        elif snap.ok:
+            lines.append(("Forecast: —", (120, 130, 140)))
 
     for text, color in lines:
         if cursor_y > oy + h - 16:
             break
         size = max(13, min(28 if show_temp and text == lines[0][0] else 15, h // 7))
+        if show_forecast and text == "Forecast":
+            size = max(12, min(14, h // 9))
         draw_text(layer, text, (ox + pad, cursor_y), size=size, color=color, valign="top")
         cursor_y += size + max(4, h // 28)
 

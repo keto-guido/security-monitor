@@ -235,7 +235,8 @@ The options menu is grouped into **Cameras**, **Media** (capture / saved files /
 - **Placement** — bottom left/right, between columns, between rows, or custom
 - **Place widget on layout…** — still frame of the mosaic; drag the widget (←→↑↓ nudge, Enter save, Esc cancel)
 - Fine X/Y and width/height for precise positioning
-- Toggle each line independently: temperature, conditions, storm warnings, lightning tracker
+- Toggle each line independently: temperature, conditions, storm warnings, lightning tracker, upcoming forecast
+- **Lightning range** — how far to scan for nearby thunderstorms (← →; 5–100 mi / km with units)
 - **Opacity** — blend the weather panel (← →); lower values let the camera show through
 - **Overlay cameras** — paint on top of full tiles instead of shrinking them around the widget
 - °F / °C units; optional `weather_latitude` / `weather_longitude` in config (blank = IP auto-locate)

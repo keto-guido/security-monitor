@@ -181,6 +181,8 @@ from security_monitor.weather import (
     WeatherService,
     compute_tile_rects,
     draw_weather_widget,
+    lightning_radius_label,
+    next_lightning_radius_miles,
     next_opacity,
     next_weather_slot,
     nudge_norm,
@@ -262,6 +264,7 @@ _MENU_CYCLE_ACTIONS = frozenset(
         "encroach_poly_preset",
         "weather_slot",
         "weather_opacity",
+        "weather_lightning_radius",
         "weather_nudge_x",
         "weather_nudge_y",
         "weather_size_w",
@@ -585,6 +588,8 @@ class MosaicApp:
             longitude=d.weather_longitude,
             place=d.weather_place or "",
             refresh_seconds=float(d.weather_refresh_seconds or 300),
+            units=d.weather_units,
+            lightning_radius_miles=float(d.weather_lightning_miles or 25),
         )
 
     def _configure_ha_service(self) -> None:
@@ -1125,6 +1130,7 @@ class MosaicApp:
             show_conditions=d.weather_show_conditions,
             show_storm=d.weather_show_storm,
             show_lightning=d.weather_show_lightning,
+            show_forecast=d.weather_show_forecast,
             opacity=d.weather_opacity,
             editing=editing,
         )
@@ -2055,6 +2061,14 @@ class MosaicApp:
                     "weather_lightning",
                     f"Show lightning tracker: {'On' if d.weather_show_lightning else 'Off'}",
                 ),
+                (
+                    "weather_lightning_radius",
+                    f"Lightning range: {lightning_radius_label(d.weather_lightning_miles, units=d.weather_units)}  (← →)",
+                ),
+                (
+                    "weather_forecast",
+                    f"Show upcoming forecast: {'On' if d.weather_show_forecast else 'Off'}",
+                ),
                 menu_section("Placement"),
                 ("weather_slot", f"Placement: {slot_label(d.weather_slot)}"),
                 ("weather_place", "Place widget on layout…"),
@@ -2678,6 +2692,7 @@ class MosaicApp:
             self._adjust_menu_item(action, 1)
         elif action == "weather_units":
             self.display.weather_units = "c" if self.display.weather_units == "f" else "f"
+            self._configure_weather_service()
             self._apply_buffer_settings(persist=True)
         elif action == "weather_temp":
             self.display.weather_show_temp = not self.display.weather_show_temp
@@ -2691,6 +2706,11 @@ class MosaicApp:
         elif action == "weather_lightning":
             self.display.weather_show_lightning = not self.display.weather_show_lightning
             self._apply_buffer_settings(persist=True)
+        elif action == "weather_forecast":
+            self.display.weather_show_forecast = not self.display.weather_show_forecast
+            self._apply_buffer_settings(persist=True)
+        elif action == "weather_lightning_radius":
+            self._adjust_menu_item("weather_lightning_radius", 1)
         elif action == "weather_refresh":
             self._configure_weather_service()
             self._reboot_notice = "Refreshing weather…"
@@ -3212,6 +3232,16 @@ class MosaicApp:
             )
             self._apply_buffer_settings(persist=True)
             self._reboot_notice = f"Weather opacity {opacity_label(self.display.weather_opacity)}"
+        elif action == "weather_lightning_radius":
+            self.display.weather_lightning_miles = float(
+                next_lightning_radius_miles(self.display.weather_lightning_miles, step)
+            )
+            self._configure_weather_service()
+            self._apply_buffer_settings(persist=True)
+            label = lightning_radius_label(
+                self.display.weather_lightning_miles, units=self.display.weather_units
+            )
+            self._reboot_notice = f"Lightning range {label}"
         elif action == "weather_nudge_x":
             self.display.weather_x = nudge_norm(self.display.weather_x, 0.02 * step)
             if self.display.weather_slot != "custom":
@@ -3278,6 +3308,7 @@ class MosaicApp:
             "weather_conditions",
             "weather_storm",
             "weather_lightning",
+            "weather_forecast",
             "weather_overlay",
         }:
             self._activate_menu(action)

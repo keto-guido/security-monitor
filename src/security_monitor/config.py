@@ -182,6 +182,9 @@ class DisplayConfig:
     weather_show_conditions: bool = True
     weather_show_storm: bool = True
     weather_show_lightning: bool = True
+    weather_show_forecast: bool = False
+    # Scan radius for nearby thunderstorms (miles). Menu: 5–100.
+    weather_lightning_miles: float = 25.0
     # Weather widget blend (1.0 = solid). Useful when overlaying a camera feed.
     weather_opacity: float = 0.85
     # When true, cameras keep full tiles and the widget paints on top (see-through).
@@ -544,6 +547,8 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["weather_show_conditions"] = bool(d.weather_show_conditions)
     display["weather_show_storm"] = bool(d.weather_show_storm)
     display["weather_show_lightning"] = bool(d.weather_show_lightning)
+    display["weather_show_forecast"] = bool(d.weather_show_forecast)
+    display["weather_lightning_miles"] = float(d.weather_lightning_miles)
     display["weather_opacity"] = float(d.weather_opacity)
     display["weather_overlay"] = bool(d.weather_overlay)
     display["hud_opacity"] = float(d.hud_opacity)
@@ -713,6 +718,21 @@ def _parse_display(raw: Any) -> DisplayConfig:
     data.weather_show_lightning = _bool(
         raw, "weather_show_lightning", data.weather_show_lightning
     )
+    data.weather_show_forecast = _bool(
+        raw, "weather_show_forecast", data.weather_show_forecast
+    )
+    if "weather_lightning_miles" in raw and raw.get("weather_lightning_miles") is not None:
+        try:
+            data.weather_lightning_miles = float(raw.get("weather_lightning_miles"))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("display.weather_lightning_miles must be a number") from exc
+    if "weather_lightning_km" in raw and raw.get("weather_lightning_km") is not None:
+        try:
+            data.weather_lightning_miles = float(raw.get("weather_lightning_km")) / 1.609344
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("display.weather_lightning_km must be a number") from exc
+    if not (1.0 <= data.weather_lightning_miles <= 200.0):
+        raise ConfigError("display.weather_lightning_miles must be between 1 and 200")
     data.weather_opacity = float(raw.get("weather_opacity", data.weather_opacity) or data.weather_opacity)
     if data.weather_opacity > 1.0 and data.weather_opacity <= 100.0:
         data.weather_opacity = data.weather_opacity / 100.0

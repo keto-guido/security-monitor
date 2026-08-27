@@ -9,8 +9,14 @@ from security_monitor.config import ConfigError, parse_config, save_display_sett
 from security_monitor.weather import (
     WeatherRect,
     WeatherSnapshot,
+    _build_forecast_lines,
+    _lightning_from_code,
+    _offset_latlon,
     compute_tile_rects,
     draw_weather_widget,
+    format_distance,
+    lightning_radius_label,
+    next_lightning_radius_miles,
     next_opacity,
     next_weather_slot,
     opacity_label,
@@ -94,6 +100,45 @@ def test_slot_cycle_and_labels() -> None:
     assert wmo_label(95) == "Thunderstorm"
 
 
+def test_lightning_radius_cycle_and_labels() -> None:
+    assert next_lightning_radius_miles(25, 1) == 50
+    assert next_lightning_radius_miles(100, 1) == 5
+    assert lightning_radius_label(25, units="f") == "25 mi"
+    assert "km" in lightning_radius_label(25, units="c")
+    assert format_distance(16.09344, units="f") == "10 mi"
+    risk, detail = _lightning_from_code(95, 0.0)
+    assert risk == "High"
+    assert "Thunder" in detail
+
+
+def test_offset_latlon_moves_north() -> None:
+    lat, lon = _offset_latlon(30.0, -97.0, 10.0, 0.0)
+    assert lat > 30.0
+    assert abs(lon - (-97.0)) < 0.05
+
+
+def test_build_forecast_lines() -> None:
+    hourly = {
+        "time": [
+            "2099-01-01T10:00",
+            "2099-01-01T11:00",
+            "2099-01-01T12:00",
+            "2099-01-01T13:00",
+            "2099-01-01T14:00",
+            "2099-01-01T15:00",
+            "2099-01-01T16:00",
+            "2099-01-01T17:00",
+        ],
+        "temperature_2m": [20, 21, 22, 23, 24, 25, 26, 27],
+        "weather_code": [0, 0, 61, 0, 95, 3, 0, 0],
+        "precipitation_probability": [0, 10, 40, 5, 80, 20, 0, 0],
+    }
+    # Far-future stamps are always >= local now, so start_idx is 0.
+    lines = _build_forecast_lines(hourly, units="f")
+    assert len(lines) == 3
+    assert any(ch in lines[0] for ch in ("am", "pm", "Rain", "Clear", "°"))
+
+
 def test_draw_weather_widget_smoke() -> None:
     canvas = np.zeros((360, 640, 3), dtype=np.uint8)
     snap = WeatherSnapshot(
@@ -102,18 +147,21 @@ def test_draw_weather_widget_smoke() -> None:
         condition="Thunderstorm",
         storm_warning="Severe Thunderstorm Warning",
         lightning_risk="High",
-        lightning_detail="Thunderstorm",
+        lightning_detail="~10 mi NE",
+        lightning_distance_km=16.0,
+        forecast_lines=("3pm Rain 74°", "5pm Clear 71°"),
         place="Testville",
         updated_at=1.0,
     )
     draw_weather_widget(
         canvas,
-        WeatherRect(400, 240, 220, 110),
+        WeatherRect(400, 200, 220, 150),
         snap,
         show_temp=True,
         show_conditions=True,
         show_storm=True,
         show_lightning=True,
+        show_forecast=True,
     )
     assert canvas[250, 420].sum() > 0
 
@@ -158,6 +206,8 @@ def test_config_weather_roundtrip(tmp_path) -> None:
                 "weather_show_conditions": False,
                 "weather_show_storm": True,
                 "weather_show_lightning": False,
+                "weather_show_forecast": True,
+                "weather_lightning_miles": 15,
                 "weather_opacity": 0.55,
                 "weather_overlay": True,
                 "hud_opacity": 0.40,
@@ -174,6 +224,8 @@ def test_config_weather_roundtrip(tmp_path) -> None:
     assert cfg.display.weather_units == "c"
     assert cfg.display.weather_show_conditions is False
     assert cfg.display.weather_show_lightning is False
+    assert cfg.display.weather_show_forecast is True
+    assert cfg.display.weather_lightning_miles == pytest.approx(15.0)
     assert cfg.display.weather_opacity == pytest.approx(0.55)
     assert cfg.display.weather_overlay is True
     assert cfg.display.hud_opacity == pytest.approx(0.40)
@@ -183,6 +235,8 @@ def test_config_weather_roundtrip(tmp_path) -> None:
     assert "weather_enabled: true" in text
     assert "weather_slot: between_v" in text
     assert "weather_show_lightning: false" in text
+    assert "weather_show_forecast: true" in text
+    assert "weather_lightning_miles: 15" in text
     assert "weather_opacity: 0.55" in text
     assert "weather_overlay: true" in text
     assert "hud_opacity: 0.4" in text or "hud_opacity: 0.40" in text
@@ -215,6 +269,16 @@ def test_config_rejects_bad_opacity() -> None:
         parse_config(
             {
                 "display": {"weather_opacity": 0.05},
+                "cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}],
+            }
+        )
+
+
+def test_config_rejects_bad_lightning_miles() -> None:
+    with pytest.raises(ConfigError, match="weather_lightning_miles"):
+        parse_config(
+            {
+                "display": {"weather_lightning_miles": 0},
                 "cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}],
             }
         )
