@@ -76,5 +76,4 @@ def test_demo_worker_pause_freezes_last_frame() -> None:
         assert moved
     finally:
         worker.stop()
-        worker.join(timeout=2.0)
 
