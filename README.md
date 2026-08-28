@@ -31,21 +31,26 @@ These are in `main` (merged via PRs #1–#4). Nothing below is “coming later.�
 
 Python 3.10+ and a desktop session (Windows, or Linux X11/Wayland) are required.
 
-One-line install (recommended):
+### Ubuntu / Debian (one line, install or update)
+
+Ubuntu 23.04+ and Debian 12 block `pip install` into the system Python (`externally-managed-environment`). Install into a **venv** instead — same command both times:
+
+```bash
+sudo apt install -y python3-venv fonts-dejavu-core libgl1 libglib2.0-0 && python3 -m venv ~/.venvs/security-monitor && ~/.venvs/security-monitor/bin/pip install -U "git+https://github.com/keto-guido/security-monitor.git" && mkdir -p ~/.local/bin && ln -sfn ~/.venvs/security-monitor/bin/security-monitor ~/.local/bin/security-monitor
+```
+
+Then (new terminal if `~/.local/bin` is not on PATH yet):
+
+```bash
+security-monitor
+```
+
+Rerun that one line whenever you want the latest from GitHub `main`.
+
+### Windows (one line, install or update)
 
 ```bash
 python -m pip install -U "git+https://github.com/keto-guido/security-monitor.git"
-```
-
-That installs the `security-monitor` command and all Python dependencies (`opencv-python`, etc.).
-
-### Ubuntu system packages
-
-On Ubuntu Desktop, install these once before the pip line (venv optional if you use `--user`):
-
-```bash
-sudo apt update && sudo apt install -y python3-pip python3-venv \
-  fonts-dejavu-core libgl1 libglib2.0-0
 ```
 
 ### Editable / from a clone
@@ -53,7 +58,8 @@ sudo apt update && sudo apt install -y python3-pip python3-venv \
 ```bash
 git clone https://github.com/keto-guido/security-monitor.git
 cd security-monitor
-python -m pip install -e .
+python3 -m venv .venv && source .venv/bin/activate   # Windows: py -m venv .venv && .venv\Scripts\activate
+pip install -e ".[dev]"
 ```
 
 ## Quick start
@@ -418,7 +424,8 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 ## Troubleshooting
 
 - **NO SIGNAL / connect failed** — verify the URL in VLC first, then try `transport: tcp`.
-- **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python`.
+- **`externally-managed-environment`** — do not use `python3 -m pip install` on Ubuntu/Debian. Use the venv one-liner in [Install](#ubuntu--debian-one-line-install-or-update).
+- **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python` (inside the venv, not system pip).
 - **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost. Try `decode_mode: cpu` if a bad GPU path stalls opens.
 - **Choppy mosaic / low FPS** — Video settings → **Low power: Auto** (default). Extras pause until the UI is above ~15 fps. Use **On** to lock video+HUD only.
 - **Started in SAFE MODE** — previous run did not exit cleanly. Esc → Exit safe mode, or `--no-safe-mode`.
