@@ -21,7 +21,8 @@ These are in `main` (merged via PRs #1–#4). Nothing below is “coming later.�
 - **Weather HUD** — Open-Meteo widget, placeable on the mosaic, per-line toggles, opacity
 - **Home Assistant** — local door/sensor links (popup, HUD, highlight, autofocus, sound) and a right-side lights panel (`]`)
 - GPU/CPU **decode** controls (`auto` / `cpu` / `gpu`, VAAPI/CUDA/QSV/D3D11/VideoToolbox) plus decode status
-- **Low power** — if UI FPS stays below 12, extras pause and only video + HUD keep running (`Esc` → Video settings)
+- **Options menu** — grouped Live / Library / Alerts / Display / System; camera decode pauses while it is open (last frame stays on screen) so the menu stays snappy
+- **Low power** — if UI FPS stays below 12, extras pause and only video + HUD keep running (`Esc` → Video & decode)
 - **Safe mode** — after a crash, the next start is video + HUD only until you choose Exit safe mode
 - Reboot Ubiquiti (SSH) or Reolink / Amcrest / Dahua (HTTP) from the menu or CLI
 - Ubuntu login autostart (XDG `.desktop` or systemd user unit) and Windows Startup folder
@@ -231,7 +232,7 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu is grouped into **Cameras**, **Media** (capture / saved files / person events), **Alerts** (detection, weather, Home Assistant), **Settings**, and **System** (reconnect / reboot / exit). Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu is grouped into **Live** (resume, fullscreen, cameras & layout), **Library** (capture / saved files / person events), **Alerts** (detection, weather, Home Assistant), **Display** (video & decode), and **System** (reconnect / reboot / exit). Opening it pauses camera decode on a still of the mosaic so navigation stays responsive; preview pages for saved captures and person events keep playing. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
 
 ### Weather HUD
 
@@ -247,7 +248,7 @@ The options menu is grouped into **Cameras**, **Media** (capture / saved files /
 - **Overlay cameras** — paint on top of full tiles instead of shrinking them around the widget
 - °F / °C units; optional `weather_latitude` / `weather_longitude` in config (blank = IP auto-locate)
 
-By default, camera tiles **shrink around** the widget so they never draw under it. When placed between two feeds, both cameras lose a shared strip. Turn on **Overlay cameras** (and lower **Opacity**) if you prefer a translucent HUD on top of the feed instead. Camera name/status strip opacity is under **Video settings** → **HUD opacity**.
+By default, camera tiles **shrink around** the widget so they never draw under it. When placed between two feeds, both cameras lose a shared strip. Turn on **Overlay cameras** (and lower **Opacity**) if you prefer a translucent HUD on top of the feed instead. Camera name/status strip opacity is under **Video & decode** → **HUD opacity**.
 
 ### Home Assistant (door sensors)
 
@@ -292,7 +293,7 @@ display:
 
 ### Video decode (GPU / CPU)
 
-`Esc` → **Video settings**:
+`Esc` → **Video & decode**:
 
 - **Decode** — `auto` (prefer GPU, fall back to CPU), `cpu`, or `gpu`
 - **HW backend** — `auto`, `none`, or a specific FFmpeg accel (`cuda`, `qsv`, `vaapi`, `d3d11va`, `videotoolbox`)
@@ -310,7 +311,7 @@ Changing decode mode or backend reconnects streams. Optional `display.hwaccel_de
 
 ### Person events (auto capture)
 
-`Esc` → **Detection…** → **Auto person capture** (also **Person events…** on the root menu):
+`Esc` → **Detection & zones…** → **Auto person capture** (also **Person events…** on the root menu):
 
 - On rising edge (person appears), saves a **snapshot** with person boxes + date/time overlay
 - Records a clip with configurable **pre-roll** (from the rolling buffer), the time the person is present, and **post-roll** after they leave
@@ -340,7 +341,7 @@ Files land under `~/security-monitor/captures/events/<timestamp>_<camera>/` (`sn
 
 ### Cameras menu
 
-`Esc` → **Cameras…** updates `config.yaml` without hand-editing:
+`Esc` → **Cameras & layout…** updates `config.yaml` without hand-editing:
 
 - **Layout** — cycle grid size (1×1 … 4×4); empty slots show placeholders
 - **Cycle focus** — Off / 5s / 10s / 30s / 60s auto-advance (`n` / `p` also step manually)
@@ -351,7 +352,7 @@ Files land under `~/security-monitor/captures/events/<timestamp>_<camera>/` (`sn
 
 ### Encroachment (tripwire + polygon ROIs)
 
-`Esc` → **Detection…**:
+`Esc` → **Detection & zones…**:
 
 - **Encroachment** — master switch (also turns on people detection)
 - **Autofocus on encroach** — while a person is in any zone, focus that camera; return to the grid when they leave
@@ -403,7 +404,7 @@ python -m security_monitor       # same as security-monitor
 
 Each camera is read on its own thread and only the latest frame is kept (plus optional history), so a slow stream does not stall the others. The UI thread composites a grid, letterboxes (or crops) each tile, and draws name / status / FPS. Dropped streams retry on `reconnect_seconds`.
 
-OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-python`, not `opencv-python-headless`. Decode mode (`display.decode_mode` / Video settings) sets `OPENCV_FFMPEG_CAPTURE_OPTIONS` (`hwaccel=…`) when opening RTSP streams and falls back to software decode if the GPU path fails a smoke read.
+OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-python`, not `opencv-python-headless`. Decode mode (`display.decode_mode` / Video & decode) sets `OPENCV_FFMPEG_CAPTURE_OPTIONS` (`hwaccel=…`) when opening RTSP streams and falls back to software decode if the GPU path fails a smoke read.
 
 | Path | Role |
 | --- | --- |
@@ -427,9 +428,9 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 - **`externally-managed-environment`** — do not use `python3 -m pip install` on Ubuntu/Debian. Use the venv one-liner in [Install](#ubuntu--debian-one-line-install-or-update).
 - **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python` (inside the venv, not system pip).
 - **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost. Try `decode_mode: cpu` if a bad GPU path stalls opens.
-- **Choppy mosaic / low FPS** — Video settings → **Low power: Auto** (default). Extras pause until the UI is above ~15 fps. Use **On** to lock video+HUD only.
+- **Choppy mosaic / low FPS** — Video & decode → **Low power: Auto** (default). Extras pause until the UI is above ~15 fps. Use **On** to lock video+HUD only.
 - **Started in SAFE MODE** — previous run did not exit cleanly. Esc → Exit safe mode, or `--no-safe-mode`.
-- **Want GPU decode** — set `decode_mode: gpu` (or `auto`) and pick a backend under Video settings. Confirm with **Decode status…** or `security-monitor check`. Pip wheels frequently lack working CUDA/VAAPI decode; a custom OpenCV/FFmpeg build may be required.
+- **Want GPU decode** — set `decode_mode: gpu` (or `auto`) and pick a backend under Video & decode. Confirm with **Decode status…** or `security-monitor check`. Pip wheels frequently lack working CUDA/VAAPI decode; a custom OpenCV/FFmpeg build may be required.
 - **Linux display** — needs an X11/Wayland session. SSH needs X forwarding or a desktop.
 - **Squished / stretched mosaic on Linux** — OpenCV’s Qt window backend often reports the wrong window size (especially fullscreen). This build ignores bad rects and paints at the real screen size from `xrandr`. Update to the latest package, then:
   ```bash

@@ -244,6 +244,16 @@ _EVENT_BROWSER_PAGES = frozenset(
         "events_play",
     }
 )
+# Menu pages that still need live (or file) video under the card.
+_MENU_LIVE_PAGES = frozenset(
+    {
+        "captures_view",
+        "captures_delete",
+        "events_view",
+        "events_delete",
+        "events_play",
+    }
+)
 _MENU_CYCLE_ACTIONS = frozenset(
     {
         "layout",
@@ -436,6 +446,49 @@ def visible_menu_range(
     return start, end
 
 
+def menu_should_pause_decode(
+    *,
+    menu_open: bool,
+    page: str,
+    zone_editing: bool = False,
+    recording: bool = False,
+    prompt_open: bool = False,
+    overlay_blocking: bool = False,
+) -> bool:
+    """Pause camera grabbers while the options menu is up (keeps last frame)."""
+    if not menu_open or zone_editing or recording or prompt_open or overlay_blocking:
+        return False
+    return page not in _MENU_LIVE_PAGES
+
+
+def root_menu_items(*, fullscreen: bool, safe_mode: bool) -> list[tuple[str, str]]:
+    """Top-level options: Live / Library / Alerts / Display / System."""
+    mode = "Windowed mode" if fullscreen else "Fullscreen"
+    items = [
+        ("resume", "Resume live view"),
+        menu_section("Live"),
+        ("fullscreen", mode),
+        ("cameras", "Cameras & layout…"),
+        menu_section("Library"),
+        ("capture", "Capture…"),
+        ("captures_root", "Saved captures…"),
+        ("events_root", "Person events…"),
+        menu_section("Alerts"),
+        ("detection", "Detection & zones…"),
+        ("weather", "Weather HUD…"),
+        ("ha", "Home Assistant…"),
+        menu_section("Display"),
+        ("video", "Video & decode…"),
+        menu_section("System"),
+        ("reconnect", "Reconnect streams"),
+        ("reboot", "Reboot cameras"),
+        ("exit", "Exit"),
+    ]
+    if safe_mode:
+        items.append(("exit_safe_mode", "Exit safe mode (restore extras)"))
+    return items
+
+
 def resolve_zone_target(
     cameras: list[CameraConfig],
     selected_name: str | None,
@@ -490,6 +543,10 @@ class MosaicApp:
         self._menu_index = 0
         self._menu_page = "root"
         self._menu_hitboxes: list[tuple[str, int, int, int, int, int]] = []
+        self._menu_backdrop: np.ndarray | None = None
+        self._menu_backdrop_size: tuple[int, int] = (0, 0)
+        self._menu_card_cache: tuple[object, np.ndarray, int, int] | None = None
+        self._decode_paused = False
         self._reboot_job: RebootJob | None = None
         self._reboot_notice = ""
         self._clip_job: LiveClipJob | None = None
@@ -557,6 +614,32 @@ class MosaicApp:
     def _extras_enabled(self) -> bool:
         """Detection, weather, HA, events, rewind — off in safe mode or low power."""
         return not self._safe_mode and not self._low_power
+
+    def _menu_pauses_decode(self) -> bool:
+        recording = self._clip_job is not None and not getattr(self._clip_job, "finished", True)
+        return menu_should_pause_decode(
+            menu_open=self._menu_open,
+            page=self._menu_page,
+            zone_editing=self._zone_edit_name is not None or self._line_edit_name is not None,
+            recording=recording,
+            prompt_open=self._prompt is not None,
+            overlay_blocking=self._reboot_job is not None or self._weather_place_mode,
+        )
+
+    def _sync_decode_pause(self) -> None:
+        paused = self._menu_pauses_decode()
+        if paused == self._decode_paused:
+            return
+        self._decode_paused = paused
+        for source in self.sources:
+            setter = getattr(source, "set_paused", None)
+            if callable(setter):
+                setter(paused)
+        self._invalidate_menu_backdrop()
+
+    def _invalidate_menu_backdrop(self) -> None:
+        self._menu_backdrop = None
+        self._menu_card_cache = None
 
     def _sync_power_services(self) -> None:
         self._apply_buffer_settings(persist=False)
@@ -862,7 +945,8 @@ class MosaicApp:
         try:
             while self._running:
                 try:
-                    if self._extras_enabled:
+                    self._sync_decode_pause()
+                    if self._extras_enabled and not self._menu_pauses_decode():
                         self._tick_cycle_focus()
                         self._maybe_purge_media()
                     canvas = self._compose()
@@ -888,8 +972,10 @@ class MosaicApp:
                 except Exception as exc:  # noqa: BLE001
                     print(f"Power policy error: {exc}")
                 wait = getattr(cv2, "waitKeyEx", cv2.waitKey)
+                # Snappier keys while the frozen menu is up (no live decode cost).
+                ui_delay = 16 if self._menu_pauses_decode() else delay
                 try:
-                    key = wait(delay)
+                    key = wait(ui_delay)
                 except Exception as exc:  # noqa: BLE001
                     print(f"Input error: {exc}")
                     time.sleep(delay / 1000.0)
@@ -975,12 +1061,21 @@ class MosaicApp:
 
     def _compose(self) -> np.ndarray:
         extras = self._extras_enabled
-        if not self._safe_mode:
+        pause_decode = self._menu_pauses_decode()
+        d = self.display
+        cell_w, cell_h, width, height = self._sync_layout()
+        if (
+            pause_decode
+            and self._menu_backdrop is not None
+            and self._menu_backdrop_size == (width, height)
+        ):
+            return self._finalize_ui(
+                self._menu_backdrop.copy(), dim_menu_background=False
+            )
+        if not pause_decode and not self._safe_mode:
             self._tick_person_events()
             self._update_encroachment_state()
             self._update_door_state()
-        d = self.display
-        cell_w, cell_h, width, height = self._sync_layout()
         if extras and self._weather_place_mode and self._weather_place_still is not None:
             return self._finalize_ui(self._paint_weather_place_editor(width, height))
         if extras and self._event_playback is not None:
@@ -994,11 +1089,13 @@ class MosaicApp:
             if extras:
                 self._draw_zoom_badge(cell)
                 self._draw_buffer_badge(cell, snap)
-                self._feed_clip_job(cell)
+                if not pause_decode:
+                    self._feed_clip_job(cell)
                 if d.ha_enabled:
                     draw_door_hud(cell, self._ha.snapshot, opacity=d.hud_opacity)
-                self._draw_ha_overlays(cell)
-            return self._finalize_ui(cell)
+                if not pause_decode:
+                    self._draw_ha_overlays(cell)
+            return self._finish_compose(cell)
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
         canvas[:] = (12, 12, 14)
@@ -1052,11 +1149,24 @@ class MosaicApp:
                 sample = self.sources[0].snapshot() if self.sources else None
                 if sample is not None:
                     self._draw_buffer_badge(canvas, sample)
-            self._feed_clip_job(canvas)
+            if not pause_decode:
+                self._feed_clip_job(canvas)
             if d.ha_enabled and not zoomed:
                 draw_door_hud(canvas, self._ha.snapshot, opacity=d.hud_opacity)
-            self._draw_ha_overlays(canvas)
-        return self._finalize_ui(canvas)
+            if not pause_decode:
+                self._draw_ha_overlays(canvas)
+        return self._finish_compose(canvas)
+
+    def _finish_compose(self, canvas: np.ndarray) -> np.ndarray:
+        """Dim once into a still when the menu pauses decode; otherwise live UI."""
+        if self._menu_pauses_decode():
+            dimmed = np.clip(canvas.astype(np.float32) * 0.36, 0, 255).astype(np.uint8)
+            self._menu_backdrop = dimmed
+            self._menu_backdrop_size = (int(dimmed.shape[1]), int(dimmed.shape[0]))
+            return self._finalize_ui(dimmed.copy(), dim_menu_background=False)
+        if self._menu_backdrop is not None:
+            self._invalidate_menu_backdrop()
+        return self._finalize_ui(canvas, dim_menu_background=True)
 
     def _draw_ha_overlays(self, canvas: np.ndarray) -> None:
         """Optional right-side lights panel (toasts are drawn in _finalize_ui)."""
@@ -1179,25 +1289,29 @@ class MosaicApp:
         )
         return canvas
 
-    def _finalize_ui(self, canvas: np.ndarray) -> np.ndarray:
+    def _finalize_ui(
+        self, canvas: np.ndarray, *, dim_menu_background: bool = True
+    ) -> np.ndarray:
         now = time.monotonic()
-        self._ha_popups = prune_popups(self._ha_popups, now=now)
-        if self._ha_popups and not self._safe_mode:
-            draw_ha_popups(
-                canvas, self._ha_popups, opacity=max(0.7, self.display.hud_opacity)
-            )
-        if not self._safe_mode and self.display.encroachment_alarm and (
-            any(self._encroach_active.values()) or now < self._alarm_until
-        ):
-            labels = [
-                name
-                for name, on in self._encroach_active.items()
-                if on
-            ]
-            if not labels:
-                labels = ["alert"]
-            pulse = 0.55 + 0.45 * abs(math.sin(now * 7.0))
-            draw_alarm_banner(canvas, labels, pulse=pulse)
+        frozen = self._menu_pauses_decode()
+        if not frozen:
+            self._ha_popups = prune_popups(self._ha_popups, now=now)
+            if self._ha_popups and not self._safe_mode:
+                draw_ha_popups(
+                    canvas, self._ha_popups, opacity=max(0.7, self.display.hud_opacity)
+                )
+            if not self._safe_mode and self.display.encroachment_alarm and (
+                any(self._encroach_active.values()) or now < self._alarm_until
+            ):
+                labels = [
+                    name
+                    for name, on in self._encroach_active.items()
+                    if on
+                ]
+                if not labels:
+                    labels = ["alert"]
+                pulse = 0.55 + 0.45 * abs(math.sin(now * 7.0))
+                draw_alarm_banner(canvas, labels, pulse=pulse)
         if self._menu_open and self._menu_page in {"captures_view", "captures_delete"}:
             if self._capture_preview is not None:
                 canvas = self._paint_capture_preview(
@@ -1213,7 +1327,12 @@ class MosaicApp:
             pass
         self._draw_power_badge(canvas)
         self._draw_capture_hud(canvas)
-        return self._draw_prompt(self._draw_menu(self._draw_reboot(self._draw_help(canvas))))
+        return self._draw_prompt(
+            self._draw_menu(
+                self._draw_reboot(self._draw_help(canvas)),
+                dim_background=dim_menu_background,
+            )
+        )
 
     def _paint_capture_preview(
         self, width: int, height: int, frame: np.ndarray
@@ -2310,30 +2429,7 @@ class MosaicApp:
                 items.append((f"remove:{index}", f"Remove {cam.name}"))
             items.append(("cameras_remove_back", "Back"))
             return items
-        fullscreen = "Windowed mode" if self.fullscreen else "Fullscreen"
-        items = [
-            ("resume", "Resume"),
-            ("fullscreen", fullscreen),
-            menu_section("Cameras"),
-            ("cameras", "Cameras…"),
-            menu_section("Media"),
-            ("capture", "Capture…"),
-            ("captures_root", "Saved captures…"),
-            ("events_root", "Person events…"),
-            menu_section("Alerts"),
-            ("detection", "Detection…"),
-            ("weather", "Weather HUD…"),
-            ("ha", "Home Assistant…"),
-            menu_section("Settings"),
-            ("video", "Video settings…"),
-            menu_section("System"),
-            ("reconnect", "Reconnect streams"),
-            ("reboot", "Reboot cameras"),
-            ("exit", "Exit"),
-        ]
-        if self._safe_mode:
-            items.append(("exit_safe_mode", "Exit safe mode (restore extras)"))
-        return items
+        return root_menu_items(fullscreen=self.fullscreen, safe_mode=self._safe_mode)
 
     def _activate_menu(self, action: str) -> None:
         if is_menu_header(action):
@@ -4866,7 +4962,7 @@ class MosaicApp:
             except Exception as exc:  # noqa: BLE001
                 print(f"{source.name}: reconnect failed ({exc})")
 
-    def _draw_menu(self, canvas: np.ndarray) -> np.ndarray:
+    def _draw_menu(self, canvas: np.ndarray, *, dim_background: bool = True) -> np.ndarray:
         self._menu_hitboxes = []
         if not self._menu_open or self._reboot_job is not None or self._prompt is not None:
             return canvas
@@ -4877,8 +4973,8 @@ class MosaicApp:
             "events_delete",
             "events_play",
         }
-        if self._menu_page not in preview_pages:
-            canvas[:] = (canvas.astype(np.float32) * 0.38).astype(np.uint8)
+        if dim_background and self._menu_page not in preview_pages:
+            canvas[:] = (canvas.astype(np.float32) * 0.36).astype(np.uint8)
         items = self._menu_items()
         wide = self._menu_page in {
             "video",
@@ -4922,16 +5018,9 @@ class MosaicApp:
         h, w = canvas.shape[:2]
         x0 = max(12, (w - card_w) // 2)
         y0 = max(12, (h - card_h) // 2)
-        shade_round_rect(
-            canvas,
-            (x0, y0, x0 + card_w, y0 + card_h),
-            color=(18, 18, 22),
-            alpha=0.92,
-            radius=16,
-        )
         heading = {
             "reboot_confirm": "Confirm reboot",
-            "video": "Video settings",
+            "video": "Video & decode",
             "decode_status": "Decode status",
             "capture": "Capture",
             "detection": "Detection",
@@ -4947,7 +5036,7 @@ class MosaicApp:
             "ha_notify": "Notifications",
             "ha_lights": "Light panel",
             "ha_light_pick": "Add lights",
-            "cameras": "Cameras",
+            "cameras": "Cameras & layout",
             "cameras_arrange": "Arrange tiles",
             "cameras_toggle": "Show / hide",
             "cameras_add": "Add camera",
@@ -4961,121 +5050,117 @@ class MosaicApp:
             "events_delete": "Delete event",
             "events_play": "Playing recording",
         }.get(self._menu_page, "Options")
-        draw_text(
-            canvas,
+        footer = self._menu_footer_hint()
+        cache_key = (
+            self._menu_page,
+            self._menu_index,
+            start,
+            end,
+            card_w,
+            card_h,
             heading,
-            (x0 + card_w // 2, y0 + 16),
-            size=22,
-            align="center",
-            valign="top",
+            footer,
+            self._reboot_notice,
+            tuple(visible),
         )
-        if self._reboot_notice:
-            draw_text(
+        cached = self._menu_card_cache
+        use_cache = not dim_background
+        cache_hit = (
+            use_cache
+            and cached is not None
+            and cached[0] == cache_key
+            and cached[1].shape[0] == card_h
+            and cached[1].shape[1] == card_w
+        )
+        if cache_hit:
+            img, ox, oy = cached[1], cached[2], cached[3]
+            y1 = min(canvas.shape[0], oy + img.shape[0])
+            x1 = min(canvas.shape[1], ox + img.shape[1])
+            if y1 > oy and x1 > ox:
+                canvas[oy:y1, ox:x1] = img[: y1 - oy, : x1 - ox]
+        else:
+            self._paint_menu_card(
                 canvas,
-                self._reboot_notice,
-                (x0 + card_w // 2, y0 + 44),
-                size=13,
-                color=(70, 90, 220),
-                align="center",
-                valign="top",
+                visible=visible,
+                start=start,
+                items=items,
+                x0=x0,
+                y0=y0,
+                card_w=card_w,
+                card_h=card_h,
+                pad=pad,
+                title_h=title_h,
+                notice_h=notice_h,
+                heading=heading,
+                footer=footer,
             )
-        selectable = selectable_menu_entries(items)
-        index_by_action = {i: n for n, (i, _action) in enumerate(selectable, start=1)}
+            if use_cache:
+                y1 = min(canvas.shape[0], y0 + card_h)
+                x1 = min(canvas.shape[1], x0 + card_w)
+                if y1 > y0 and x1 > x0:
+                    self._menu_card_cache = (
+                        cache_key,
+                        canvas[y0:y1, x0:x1].copy(),
+                        x0,
+                        y0,
+                    )
         ry = y0 + title_h + notice_h
-        for i, (action, label) in enumerate(visible):
+        for i, (action, _label) in enumerate(visible):
             absolute = start + i
             row_height = menu_row_height(action, row_h=row_h, header_h=header_h)
             box = (x0 + pad, ry, x0 + card_w - pad, ry + row_height - 6)
-            if is_menu_header(action):
-                draw_text(
-                    canvas,
-                    label.upper(),
-                    (box[0] + 10, ry + 6),
-                    size=12,
-                    color=(150, 158, 180),
-                    valign="top",
-                )
-                line_y = box[3] - 3
-                cv2.line(
-                    canvas,
-                    (box[0] + 8, line_y),
-                    (box[2] - 8, line_y),
-                    (58, 58, 68),
-                    1,
-                    cv2.LINE_AA,
-                )
-                self._menu_hitboxes.append((action, absolute, *box))
-                ry += row_height
-                continue
-            if absolute == self._menu_index:
-                shade_round_rect(canvas, box, color=(56, 120, 78), alpha=0.7, radius=8)
-            number = index_by_action.get(absolute)
-            if number is not None:
-                draw_text(
-                    canvas,
-                    f"{number}",
-                    (box[0] + 14, ry + 8),
-                    size=15,
-                    color=(180, 180, 180),
-                    valign="top",
-                )
-            draw_text(
-                canvas,
-                label,
-                (box[0] + 44, ry + 8),
-                size=17,
-                color=(236, 236, 236),
-                valign="top",
-            )
             self._menu_hitboxes.append((action, absolute, *box))
             ry += row_height
+        return canvas
+
+    def _menu_footer_hint(self) -> str:
         if self._menu_page == "reboot_confirm":
-            footer = "This will restart every camera"
-        elif self._menu_page == "video":
-            footer = "Enter toggle/cycle    ← → adjust    Esc back"
-        elif self._menu_page == "decode_status":
-            footer = "Per-camera decode path    Esc back"
-        elif self._menu_page == "weather":
-            footer = "Place on layout…    ← → adjust    Esc back"
-        elif self._menu_page == "ha":
-            footer = "Add / search devices    ← → timing    Esc back"
-        elif self._menu_page == "ha_doors":
-            footer = "Enter edit    Add sensor to search    Esc back"
-        elif self._menu_page == "ha_domains":
-            footer = "Pick a type    Esc back"
-        elif self._menu_page == "ha_entities":
-            footer = "Type to search    / prompt    Enter link    Esc back"
-        elif self._menu_page == "ha_event":
-            footer = "Toggle trigger states    Next → camera"
-        elif self._menu_page == "ha_camera":
-            footer = "Enter choose camera    Esc back"
-        elif self._menu_page == "ha_notify":
-            footer = "Toggle notifications    Save link"
-        elif self._menu_page == "ha_lights":
-            footer = "Add lights for the right-side panel    Esc back"
-        elif self._menu_page == "ha_light_pick":
-            footer = "Type to search    Enter add/remove    Esc back"
-        elif self._menu_page == "capture":
-            footer = "s snapshot  c clip    ← → length    Esc back"
-        elif self._menu_page == "events_play":
-            footer = "Esc stop playback"
-        elif self._menu_page == "events_view":
-            footer = "Enter play recording    ← → browse    Esc back"
-        elif self._menu_page == "events_delete":
-            footer = "Enter confirm    Esc cancel"
-        elif self._menu_page == "events":
-            footer = "Enter open snapshot    Esc back"
-        elif self._menu_page == "captures_view":
-            footer = "← → browse files    Enter select    Esc back"
-        elif self._menu_page in {"captures_delete", "captures_delete_all"}:
-            footer = "Enter confirm    Esc cancel"
-        elif self._menu_page == "captures":
-            footer = "Enter open    ← → move    Esc back"
-        elif self._menu_page == "cameras_arrange":
-            footer = "← → move in grid order    Esc back"
-        elif self._menu_page == "detection_zones":
-            footer = "Enter pick camera    ← → cycle cameras    draw on selected    Esc back"
-        elif self._menu_page in _CAMERA_MENU_PAGES or self._menu_page in {
+            return "This will restart every camera"
+        if self._menu_page == "video":
+            return "Enter toggle/cycle    ← → adjust    Esc back"
+        if self._menu_page == "decode_status":
+            return "Per-camera decode path    Esc back"
+        if self._menu_page == "weather":
+            return "Place on layout…    ← → adjust    Esc back"
+        if self._menu_page == "ha":
+            return "Add / search devices    ← → timing    Esc back"
+        if self._menu_page == "ha_doors":
+            return "Enter edit    Add sensor to search    Esc back"
+        if self._menu_page == "ha_domains":
+            return "Pick a type    Esc back"
+        if self._menu_page == "ha_entities":
+            return "Type to search    / prompt    Enter link    Esc back"
+        if self._menu_page == "ha_event":
+            return "Toggle trigger states    Next → camera"
+        if self._menu_page == "ha_camera":
+            return "Enter choose camera    Esc back"
+        if self._menu_page == "ha_notify":
+            return "Toggle notifications    Save link"
+        if self._menu_page == "ha_lights":
+            return "Add lights for the right-side panel    Esc back"
+        if self._menu_page == "ha_light_pick":
+            return "Type to search    Enter add/remove    Esc back"
+        if self._menu_page == "capture":
+            return "s snapshot  c clip    ← → length    Esc back"
+        if self._menu_page == "events_play":
+            return "Esc stop playback"
+        if self._menu_page == "events_view":
+            return "Enter play recording    ← → browse    Esc back"
+        if self._menu_page == "events_delete":
+            return "Enter confirm    Esc cancel"
+        if self._menu_page == "events":
+            return "Enter open snapshot    Esc back"
+        if self._menu_page == "captures_view":
+            return "← → browse files    Enter select    Esc back"
+        if self._menu_page in {"captures_delete", "captures_delete_all"}:
+            return "Enter confirm    Esc cancel"
+        if self._menu_page == "captures":
+            return "Enter open    ← → move    Esc back"
+        if self._menu_page == "cameras_arrange":
+            return "← → move in grid order    Esc back"
+        if self._menu_page == "detection_zones":
+            return "Enter pick camera    ← → cycle cameras    draw on selected    Esc back"
+        if self._menu_page in _CAMERA_MENU_PAGES or self._menu_page in {
             "detection",
             "detection_cams",
             "detection_zones",
@@ -5091,19 +5176,139 @@ class MosaicApp:
             "ha_lights",
             "ha_light_pick",
         }:
-            footer = "Left click / Enter next    Right-click / ← previous    Esc back"
-        else:
-            footer = "Left click / Enter select    Right-click / ← previous    Esc close"
+            return "Left click / Enter next    Right-click / ← previous    Esc back"
+        return "Left click / Enter select    Right-click / ← previous    Esc close"
+
+    def _paint_menu_card(
+        self,
+        canvas: np.ndarray,
+        *,
+        visible: list[tuple[str, str]],
+        start: int,
+        items: list[tuple[str, str]],
+        x0: int,
+        y0: int,
+        card_w: int,
+        card_h: int,
+        pad: int,
+        title_h: int,
+        notice_h: int,
+        heading: str,
+        footer: str,
+    ) -> None:
+        shade_round_rect(
+            canvas,
+            (x0, y0, x0 + card_w, y0 + card_h),
+            color=(16, 20, 30),
+            alpha=0.94,
+            radius=18,
+        )
+        cv2.rectangle(
+            canvas,
+            (x0, y0),
+            (x0 + card_w - 1, y0 + card_h - 1),
+            (96, 114, 150),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.rectangle(
+            canvas,
+            (x0 + 1, y0 + 1),
+            (x0 + card_w - 2, y0 + card_h - 2),
+            (42, 50, 68),
+            1,
+            cv2.LINE_AA,
+        )
+        accent_y0, accent_y1 = y0 + 3, y0 + 7
+        cv2.rectangle(
+            canvas,
+            (x0 + 18, accent_y0),
+            (x0 + card_w - 18, accent_y1),
+            (64, 168, 220),
+            -1,
+        )
+        draw_text(
+            canvas,
+            heading,
+            (x0 + pad + 6, y0 + 16),
+            size=22,
+            color=(236, 242, 250),
+            valign="top",
+        )
+        if self._reboot_notice:
+            draw_text(
+                canvas,
+                self._reboot_notice,
+                (x0 + pad + 6, y0 + 44),
+                size=13,
+                color=(90, 150, 230),
+                valign="top",
+            )
+        selectable = selectable_menu_entries(items)
+        index_by_action = {i: n for n, (i, _action) in enumerate(selectable, start=1)}
+        ry = y0 + title_h + notice_h
+        for i, (action, label) in enumerate(visible):
+            absolute = start + i
+            row_height = menu_row_height(action, row_h=MENU_ROW_H, header_h=MENU_HEADER_H)
+            box = (x0 + pad, ry, x0 + card_w - pad, ry + row_height - 6)
+            if is_menu_header(action):
+                draw_text(
+                    canvas,
+                    label.upper(),
+                    (box[0] + 10, ry + 6),
+                    size=12,
+                    color=(150, 158, 180),
+                    valign="top",
+                )
+                line_y = box[3] - 3
+                cv2.line(
+                    canvas,
+                    (box[0] + 8, line_y),
+                    (box[2] - 8, line_y),
+                    (58, 64, 82),
+                    1,
+                    cv2.LINE_AA,
+                )
+                ry += row_height
+                continue
+            selected = absolute == self._menu_index
+            if selected:
+                shade_round_rect(canvas, box, color=(48, 86, 168), alpha=0.78, radius=9)
+                cv2.rectangle(
+                    canvas,
+                    (box[0], box[1]),
+                    (box[0] + 4, box[3]),
+                    (64, 168, 220),
+                    -1,
+                )
+            number = index_by_action.get(absolute)
+            if number is not None:
+                draw_text(
+                    canvas,
+                    f"{number}",
+                    (box[0] + 14, ry + 8),
+                    size=15,
+                    color=(210, 220, 236) if selected else (168, 176, 192),
+                    valign="top",
+                )
+            draw_text(
+                canvas,
+                label,
+                (box[0] + 44, ry + 8),
+                size=17,
+                color=(255, 255, 255) if selected else (220, 226, 236),
+                valign="top",
+            )
+            ry += row_height
         draw_text(
             canvas,
             footer,
             (x0 + card_w // 2, y0 + card_h - 28),
             size=13,
-            color=(150, 150, 150),
+            color=(148, 156, 170),
             align="center",
             valign="top",
         )
-        return canvas
 
     def _focus_camera(self, index: int | None, *, from_alert: bool = False) -> None:
         if not from_alert:

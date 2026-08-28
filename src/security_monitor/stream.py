@@ -40,6 +40,7 @@ class FrameSource(Protocol):
     def snapshot(self) -> Snapshot: ...
     def reconnect(self) -> None: ...
     def apply_buffer_settings(self, display: DisplayConfig) -> None: ...
+    def set_paused(self, paused: bool) -> None: ...
 
 
 def apply_ffmpeg_defaults(
@@ -74,6 +75,7 @@ class CameraWorker(threading.Thread):
         self._stop = threading.Event()
         self._kick = threading.Event()
         self._wake = threading.Event()
+        self._pause = threading.Event()
         self._lock = threading.Lock()
         self._frame: np.ndarray | None = None
         self._status: Status = "disconnected"
@@ -98,10 +100,19 @@ class CameraWorker(threading.Thread):
             super().start()
 
     def stop(self) -> None:
+        self._pause.clear()
         self._stop.set()
         self._kick.set()
         self._wake.set()
         self._release()
+
+    def set_paused(self, paused: bool) -> None:
+        """Stop grabbing new frames; snapshot() still returns the last picture."""
+        if paused:
+            self._pause.set()
+            return
+        self._pause.clear()
+        self._wake.set()
 
     def reconnect(self) -> None:
         self._kick.set()
@@ -159,6 +170,11 @@ class CameraWorker(threading.Thread):
         last_ok = time.monotonic()
         stamps: list[float] = []
         while not self._stop.is_set() and not self._kick.is_set():
+            if self._pause.is_set():
+                self._wake.wait(0.2)
+                self._wake.clear()
+                last_ok = time.monotonic()
+                continue
             ok, frame = safe_cap_read(cap)
             now = time.monotonic()
             if not ok or frame is None:
@@ -315,6 +331,7 @@ class DemoWorker(threading.Thread):
         self.name = camera.name  # type: ignore[assignment]
         self.history = FrameHistory()
         self._stop = threading.Event()
+        self._pause = threading.Event()
         self._lock = threading.Lock()
         self._frame: np.ndarray | None = None
         self._fps = float(display.fps)
@@ -336,7 +353,14 @@ class DemoWorker(threading.Thread):
             super().start()
 
     def stop(self) -> None:
+        self._pause.clear()
         self._stop.set()
+
+    def set_paused(self, paused: bool) -> None:
+        if paused:
+            self._pause.set()
+        else:
+            self._pause.clear()
 
     def reconnect(self) -> None:
         self.history.clear()
@@ -363,6 +387,10 @@ class DemoWorker(threading.Thread):
         interval = 1.0 / max(1, self.display.fps)
         started = time.monotonic()
         while not self._stop.is_set():
+            if self._pause.is_set():
+                while self._pause.is_set() and not self._stop.is_set():
+                    self._stop.wait(0.05)
+                continue
             try:
                 t = time.monotonic() - started
                 frame = np.zeros((height, width, 3), dtype=np.uint8)
