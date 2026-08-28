@@ -12,8 +12,10 @@ from security_monitor.mosaic import (
     is_menu_header,
     magnify,
     menu_section,
+    menu_should_pause_decode,
     placeholder,
     resolve_zone_target,
+    root_menu_items,
     scale_frame,
     selectable_menu_entries,
     step_menu_index,
@@ -172,3 +174,44 @@ def test_zone_target_uses_named_camera_not_first() -> None:
     assert picked.name == "Front Door"
     assert resolve_zone_target(cams, None, zoom_index=2).name == "Back Door"
     assert resolve_zone_target(cams, None, zoom_index=None) is None
+
+
+def test_menu_pauses_decode_except_live_preview_pages() -> None:
+    assert menu_should_pause_decode(menu_open=True, page="root")
+    assert menu_should_pause_decode(menu_open=True, page="video")
+    assert menu_should_pause_decode(menu_open=True, page="detection")
+    assert not menu_should_pause_decode(menu_open=False, page="root")
+    assert not menu_should_pause_decode(menu_open=True, page="captures_view")
+    assert not menu_should_pause_decode(menu_open=True, page="events_play")
+    assert not menu_should_pause_decode(menu_open=True, page="root", zone_editing=True)
+    assert not menu_should_pause_decode(menu_open=True, page="root", recording=True)
+    assert not menu_should_pause_decode(menu_open=True, page="root", prompt_open=True)
+    assert not menu_should_pause_decode(menu_open=True, page="root", overlay_blocking=True)
+
+
+def test_root_menu_groups_and_keeps_actions() -> None:
+    items = root_menu_items(fullscreen=False, safe_mode=False)
+    actions = [action for action, _label in items]
+    headers = [label for action, label in items if is_menu_header(action)]
+    assert headers == ["Live", "Library", "Alerts", "Display", "System"]
+    for action in (
+        "resume",
+        "fullscreen",
+        "cameras",
+        "capture",
+        "captures_root",
+        "events_root",
+        "detection",
+        "weather",
+        "ha",
+        "video",
+        "reconnect",
+        "reboot",
+        "exit",
+    ):
+        assert action in actions
+    assert first_selectable_index(items) == 0
+    assert items[0] == ("resume", "Resume live view")
+    safe = root_menu_items(fullscreen=True, safe_mode=True)
+    assert ("fullscreen", "Windowed mode") in safe
+    assert ("exit_safe_mode", "Exit safe mode (restore extras)") in safe
