@@ -94,6 +94,7 @@ class HAPopup:
     until: float
     accent: tuple[int, int, int] = (40, 120, 255)
     entity_id: str = ""
+    badge: str = "HA"
 
 
 @dataclass
@@ -1038,7 +1039,7 @@ def draw_ha_popups(
         cv2.rectangle(layer, (8, 8), (12, box_h - 8), popup.accent, -1)
         draw_text(
             layer,
-            "HA",
+            (popup.badge or "HA")[:4],
             (20, 8),
             size=12,
             color=popup.accent,

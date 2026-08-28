@@ -20,6 +20,7 @@ These are in `main` (merged via PRs #1–#4). Nothing below is “coming later.�
 - **Encroachment** — tripwire and polygon ROIs, alarm banner/sound, optional autofocus
 - **Weather HUD** — Open-Meteo widget, placeable on the mosaic, per-line toggles, opacity
 - **Home Assistant** — local door/sensor links (popup, HUD, highlight, autofocus, sound) and a right-side lights panel (`]`)
+- **Webhooks** — receive HTTP POSTs as HA-style alerts; send POSTs on person / encroachment / HA door / capture events
 - GPU/CPU **decode** controls (`auto` / `cpu` / `gpu`, VAAPI/CUDA/QSV/D3D11/VideoToolbox) plus decode status
 - **Options menu** — grouped Live / Library / Alerts / Display / System; camera decode pauses while it is open (last frame stays on screen) so the menu stays snappy
 - **Low power** — if UI FPS stays below 12, extras pause and only video + HUD keep running (`Esc` → Video & decode)
@@ -232,7 +233,7 @@ Put credentials in `username` / `password` instead of the URL. Typical manufactu
 | `h` | Toggle on-screen help |
 | Click a tile | Focus camera (click again for grid; click while zoomed resets zoom) |
 
-The options menu is grouped into **Live** (resume, fullscreen, cameras & layout), **Library** (capture / saved files / person events), **Alerts** (detection, weather, Home Assistant), **Display** (video & decode), and **System** (reconnect / reboot / exit). Opening it pauses camera decode on a still of the mosaic so navigation stays responsive; preview pages for saved captures and person events keep playing. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
+The options menu is grouped into **Live** (resume, fullscreen, cameras & layout), **Library** (capture / saved files / person events), **Alerts** (detection, weather, Home Assistant, webhooks), **Display** (video & decode), and **System** (reconnect / reboot / exit). Opening it pauses camera decode on a still of the mosaic so navigation stays responsive; preview pages for saved captures and person events keep playing. Changes are saved back into `config.yaml`. Files go to `~/security-monitor/captures` by default (override with `display.save_directory`). Baselines are stored under `~/.config/security-monitor/baselines/` (or `%APPDATA%\security-monitor\baselines` on Windows). Reboot uses each camera's `type`, host, and credentials from `config.yaml` (Ubiquiti over SSH, Reolink/Amcrest/Dahua over HTTP). You will be asked to confirm. Progress shows in the window; when it finishes, streams reconnect.
 
 ### Weather HUD
 
@@ -289,6 +290,46 @@ display:
   ha_lights:
     - entity_id: light.kitchen
       label: Kitchen
+```
+
+### Webhooks
+
+`Esc` → **Webhooks…** (local LAN HTTP):
+
+**Incoming** — `POST /webhook/<path>` is treated like a Home Assistant sensor trip: the same popup toast, tile HUD chip, optional camera peek, and alarm sound.
+
+```bash
+curl -X POST http://127.0.0.1:8765/webhook/front_door \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"open"}'
+```
+
+- Empty body or `{"state":"trigger"}` pulses open, then auto-clears after **Pulse length**
+- `{"state":"closed"}` / `"off"` clears the HUD chip and dismisses the toast
+- Optional shared secret: `Authorization: Bearer …`, `X-Webhook-Secret`, or `?token=`
+
+**Outgoing** — POSTs JSON to other systems when this app sees a person, encroachment, HA door, incoming webhook, or capture.
+
+Example:
+
+```yaml
+display:
+  webhook_enabled: true
+  webhook_listen_port: 8765
+  webhook_secret: ""
+  webhook_pulse_seconds: 8
+  webhook_incoming:
+    - path: front_door
+      label: Front door
+      camera: Front Door
+      notify_popup: true
+      notify_hud: true
+      notify_highlight: true
+      notify_autofocus: true
+      notify_sound: true
+  webhook_outgoing:
+    - url: http://192.168.1.50:8123/api/webhook/sm_alert
+      events: [person, encroachment, ha_door, capture]
 ```
 
 ### Video decode (GPU / CPU)
