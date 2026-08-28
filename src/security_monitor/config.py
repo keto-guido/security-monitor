@@ -23,6 +23,14 @@ from security_monitor.home_assistant import (
     parse_door_mappings,
     parse_light_controls,
 )
+from security_monitor.webhooks import (
+    OutgoingWebhook,
+    WebhookMapping,
+    outgoing_webhook_to_dict,
+    parse_incoming_webhooks,
+    parse_outgoing_webhooks,
+    webhook_mapping_to_dict,
+)
 
 VALID_SCALE_MODES = ("fit", "fill", "stretch")
 VALID_TRANSPORTS = ("tcp", "udp", "auto")
@@ -209,6 +217,14 @@ class DisplayConfig:
     ha_panel_enabled: bool = True
     ha_doors: list[HADoorMapping] = field(default_factory=list)
     ha_lights: list[HALightControl] = field(default_factory=list)
+    # Incoming HTTP webhooks (same popup/HUD/peek/sound path as HA sensors).
+    webhook_enabled: bool = False
+    webhook_listen_host: str = "0.0.0.0"
+    webhook_listen_port: int = 8765
+    webhook_secret: str = ""
+    webhook_pulse_seconds: float = 8.0
+    webhook_incoming: list[WebhookMapping] = field(default_factory=list)
+    webhook_outgoing: list[OutgoingWebhook] = field(default_factory=list)
     # Low-power: skip extras (detection, weather, HA, rewind) when the UI FPS drops.
     power_mode: str = "auto"  # auto | on | off
     low_power_fps: float = 12.0
@@ -571,6 +587,13 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["ha_panel_enabled"] = bool(d.ha_panel_enabled)
     display["ha_doors"] = [door_mapping_to_dict(door) for door in d.ha_doors]
     display["ha_lights"] = [light_control_to_dict(light) for light in d.ha_lights]
+    display["webhook_enabled"] = bool(d.webhook_enabled)
+    display["webhook_listen_host"] = str(d.webhook_listen_host or "0.0.0.0")
+    display["webhook_listen_port"] = int(d.webhook_listen_port)
+    display["webhook_secret"] = str(d.webhook_secret or "")
+    display["webhook_pulse_seconds"] = float(d.webhook_pulse_seconds)
+    display["webhook_incoming"] = [webhook_mapping_to_dict(item) for item in d.webhook_incoming]
+    display["webhook_outgoing"] = [outgoing_webhook_to_dict(item) for item in d.webhook_outgoing]
     display["power_mode"] = str(d.power_mode)
     display["low_power_fps"] = float(d.low_power_fps)
     display["safe_mode_on_crash"] = bool(d.safe_mode_on_crash)
@@ -785,6 +808,33 @@ def _parse_display(raw: Any) -> DisplayConfig:
         raise ConfigError(f"display.{exc}") from exc
     try:
         data.ha_lights = parse_light_controls(raw.get("ha_lights", data.ha_lights))
+    except ValueError as exc:
+        raise ConfigError(f"display.{exc}") from exc
+    data.webhook_enabled = _bool(raw, "webhook_enabled", data.webhook_enabled)
+    data.webhook_listen_host = str(
+        raw.get("webhook_listen_host", data.webhook_listen_host) or "0.0.0.0"
+    ).strip() or "0.0.0.0"
+    data.webhook_listen_port = _positive_int(
+        raw, "webhook_listen_port", data.webhook_listen_port, minimum=1
+    )
+    if data.webhook_listen_port > 65535:
+        raise ConfigError("display.webhook_listen_port must be between 1 and 65535")
+    data.webhook_secret = str(raw.get("webhook_secret", data.webhook_secret) or "").strip()
+    data.webhook_pulse_seconds = float(
+        raw.get("webhook_pulse_seconds", data.webhook_pulse_seconds) or data.webhook_pulse_seconds
+    )
+    if not (1.0 <= data.webhook_pulse_seconds <= 120.0):
+        raise ConfigError("display.webhook_pulse_seconds must be between 1 and 120")
+    try:
+        data.webhook_incoming = parse_incoming_webhooks(
+            raw.get("webhook_incoming", data.webhook_incoming)
+        )
+    except ValueError as exc:
+        raise ConfigError(f"display.{exc}") from exc
+    try:
+        data.webhook_outgoing = parse_outgoing_webhooks(
+            raw.get("webhook_outgoing", data.webhook_outgoing)
+        )
     except ValueError as exc:
         raise ConfigError(f"display.{exc}") from exc
     data.power_mode = str(raw.get("power_mode", data.power_mode)).strip().lower() or "auto"

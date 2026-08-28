@@ -204,6 +204,7 @@ def test_root_menu_groups_and_keeps_actions() -> None:
         "detection",
         "weather",
         "ha",
+        "webhooks",
         "video",
         "reconnect",
         "reboot",
