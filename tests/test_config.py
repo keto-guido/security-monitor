@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from security_monitor.config import (
     ConfigError,
@@ -12,6 +13,7 @@ from security_monitor.config import (
     load_config,
     parse_config,
     redact_url,
+    save_display_settings,
 )
 
 
@@ -180,3 +182,66 @@ def test_invalid_screen_rotate_rejected() -> None:
 def test_invalid_camera_rotate_rejected() -> None:
     with pytest.raises(ConfigError, match="rotate"):
         parse_config({"cameras": [{"name": "A", "url": "rtsp://192.168.1.10/live", "rotate": 45}]})
+
+
+def test_performance_settings_default_to_auto() -> None:
+    cfg = parse_config({"cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}]})
+    assert cfg.display.frame_history == "auto"
+    assert cfg.display.hud_quality == "auto"
+    assert cfg.display.adaptive_render is True
+
+
+def test_performance_settings_parse() -> None:
+    cfg = parse_config(
+        {
+            "display": {
+                "frame_history": "Lite",
+                "hud_quality": "FAST",
+                "adaptive_render": False,
+            },
+            "cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}],
+        }
+    )
+    assert cfg.display.frame_history == "lite"
+    assert cfg.display.hud_quality == "fast"
+    assert cfg.display.adaptive_render is False
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [("frame_history", "medium"), ("hud_quality", "ultra")],
+)
+def test_performance_settings_reject_unknown_values(key: str, value: str) -> None:
+    with pytest.raises(ConfigError):
+        parse_config(
+            {
+                "display": {key: value},
+                "cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}],
+            }
+        )
+
+
+def test_save_display_settings_persists_performance_settings(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "display:\n  columns: 2\ncameras:\n  - name: A\n    url: rtsp://1.2.3.4/x\n",
+        encoding="utf-8",
+    )
+    cfg = parse_config(
+        {"cameras": [{"name": "A", "url": "rtsp://1.2.3.4/x"}]},
+        path=path,
+    )
+    cfg.display.frame_history = "lite"
+    cfg.display.hud_quality = "fast"
+    cfg.display.adaptive_render = False
+    cfg.display.fps = 15
+    assert save_display_settings(cfg) == path
+    text = path.read_text(encoding="utf-8")
+    assert "frame_history: lite" in text
+    assert "hud_quality: fast" in text
+    assert "adaptive_render: false" in text
+    assert "fps: 15" in text
+    # And it must load back cleanly.
+    reloaded = parse_config(yaml.safe_load(text), path=path)
+    assert reloaded.display.frame_history == "lite"
+    assert reloaded.display.fps == 15

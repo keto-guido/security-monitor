@@ -18,12 +18,26 @@ display:
   fullscreen: false
   show_labels: true
   show_fps: true
-  # Target UI refresh rate. Camera capture runs independently.
+  # Target UI refresh rate. Camera capture runs independently, so the tile
+  # HUD shows "shown/decoded" whenever the window cannot keep up with a feed.
+  # On an older machine, a target the loop can actually hit (12-15) looks far
+  # smoother than a 25 it misses by a varying amount.
   fps: 25
   # Low power: auto = drop extras if UI FPS stays below low_power_fps; on = always; off = never.
   power_mode: auto            # auto | on | off
   low_power_fps: 12
   safe_mode_on_crash: true    # next start is video+HUD only after an unclean exit
+  # --- Performance (Esc → Video & decode → Performance) ---------------------
+  # Rolling clip/pre-roll buffer. Every camera JPEG-encodes frames into this on
+  # its capture thread, so on a weak CPU it is often the largest background
+  # cost. auto picks lite on 4 cores or fewer.
+  #   full = best clip quality   lite = softer clips, much cheaper
+  #   off  = no pre-roll; "Save clip" records forward from the keypress only
+  frame_history: auto         # auto | full | lite | off
+  # HUD text/shape rendering. fast drops supersampling and the shadow blur.
+  hud_quality: auto           # auto | high | fast
+  # Skip repainting a tile whose camera has not produced a new frame.
+  adaptive_render: true
   reconnect_seconds: 5
   # tcp is usually more reliable through routers/NAT; udp is lower latency.
   default_transport: tcp

@@ -170,6 +170,101 @@ class PowerTracker:
         return False
 
 
+@dataclass
+class RateMeter:
+    """
+    Sliding-window "events per second" estimate.
+
+    Used for the rate that actually reaches the screen, so it has to fall to
+    zero when nothing is being shown — a meter anchored to the last two events
+    would happily keep reporting 25 fps through a stall.
+    """
+
+    window: float = 2.0
+    _stamps: list[float] = field(default_factory=list)
+    _started: float | None = None
+
+    def reset(self) -> None:
+        self._stamps.clear()
+        self._started = None
+
+    def mark(self, now: float) -> None:
+        if self._started is None:
+            self._started = now
+        self._stamps.append(now)
+        self._trim(now)
+
+    def _trim(self, now: float) -> None:
+        cutoff = now - self.window
+        stamps = self._stamps
+        while stamps and stamps[0] < cutoff:
+            stamps.pop(0)
+
+    def rate(self, now: float) -> float:
+        """Events per second over the trailing window, anchored at ``now``."""
+        if self._started is None:
+            return 0.0
+        self._trim(now)
+        span = min(self.window, now - self._started)
+        if span < 0.25 or not self._stamps:
+            return 0.0
+        return len(self._stamps) / span
+
+
+@dataclass
+class FramePacer:
+    """
+    Deadline-based pacing for the render loop.
+
+    Sleeping a fixed ``1/fps`` *after* composing makes the real period
+    ``compose + 1/fps``, so a 25 fps target with a 40 ms compose actually runs
+    at 12.5 fps — and wobbles with every change in compose cost, which is what
+    a viewer reads as jerky. Pacing to a moving deadline spends the slack that
+    is left instead, and stays on the same phase frame to frame.
+    """
+
+    target_fps: float = 25.0
+    # Frames of lateness tolerated before giving up on catching up. Without
+    # this, a long stall (menu, window resize, reconnect storm) leaves a
+    # backlog of missed deadlines that the loop sprints through at zero wait.
+    max_catch_up: float = 2.0
+    _deadline: float | None = None
+
+    @property
+    def period(self) -> float:
+        return 1.0 / max(1.0, float(self.target_fps))
+
+    def set_target_fps(self, fps: float) -> None:
+        fps = max(1.0, float(fps))
+        if fps != self.target_fps:
+            self.target_fps = fps
+            self._deadline = None
+
+    def reset(self) -> None:
+        self._deadline = None
+
+    def wait_seconds(self, now: float) -> float:
+        """Time to idle before the next frame is due. Advances the deadline."""
+        period = self.period
+        if self._deadline is None:
+            self._deadline = now + period
+            return period
+        remaining = self._deadline - now
+        if remaining < -period * self.max_catch_up:
+            self._deadline = now + period
+            return 0.0
+        self._deadline += period
+        return max(0.0, remaining)
+
+    def wait_ms(self, now: float, *, minimum: int = 1) -> int:
+        """``wait_seconds`` as whole milliseconds, never 0.
+
+        OpenCV reads ``waitKey(0)`` as "block until a key is pressed", so the
+        floor matters: returning 0 here would freeze the video.
+        """
+        return max(int(minimum), int(round(self.wait_seconds(now) * 1000.0)))
+
+
 def power_mode_label(mode: str, *, active: bool = False, threshold: float = 12.0) -> str:
     key = str(mode).strip().lower()
     if key == "on":

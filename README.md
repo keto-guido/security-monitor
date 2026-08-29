@@ -24,6 +24,7 @@ These are in `main` (merged via PRs #1–#4). Nothing below is “coming later.�
 - GPU/CPU **decode** controls (`auto` / `cpu` / `gpu`, VAAPI/CUDA/QSV/D3D11/VideoToolbox) plus decode status
 - **Options menu** — grouped Live / Library / Alerts / Display / System; camera decode pauses while it is open (last frame stays on screen) so the menu stays snappy
 - **Low power** — if UI FPS stays below 12, extras pause and only video + HUD keep running (`Esc` → Video & decode)
+- **Performance controls** — deadline-paced rendering, per-tile *shown vs decoded* FPS, tunable clip-buffer and HUD cost for older CPUs (`Esc` → Video & decode → Performance)
 - **Safe mode** — after a crash, the next start is video + HUD only until you choose Exit safe mode
 - Reboot Ubiquiti (SSH) or Reolink / Amcrest / Dahua (HTTP) from the menu or CLI
 - Ubuntu login autostart (XDG `.desktop` or systemd user unit) and Windows Startup folder
@@ -344,6 +345,31 @@ display:
 
 On a slow PC, Auto keeps camera tiles and the name/status HUD and skips detection, weather, Home Assistant, person events, and rewind encoding until FPS recovers. A **LOW POWER** badge shows while that is active.
 
+### Performance on older machines
+
+`Esc` → **Video & decode** → **Performance**. These tune render cost without
+removing any feature; everything stays available on a capable machine.
+
+| Setting | Choices | What it trades |
+| --- | --- | --- |
+| **Target FPS** | 8–30 (`display.fps`) | The render loop paces to a deadline, so a target it can actually hit looks *smoother* than a higher one it misses by a varying amount. If the tile HUD reads `10/25`, set the target near 10–12. |
+| **Clip buffer** | `auto` \| `full` \| `lite` \| `off` (`display.frame_history`) | Every camera JPEG-encodes frames on its capture thread to back **Save clip** and person-event pre-roll. `lite` halves the resolution and sample rate; `off` keeps no pre-roll at all (clips then record forward from the keypress). `auto` picks `lite` on four cores or fewer. |
+| **HUD quality** | `auto` \| `high` \| `fast` (`display.hud_quality`) | `fast` drops glyph supersampling and the soft shadow blur on the tile labels. `auto` picks `fast` on four cores or fewer. |
+| **Skip idle repaints** | on / off (`display.adaptive_render`) | Reuses a tile whose camera has not produced a new frame instead of rescaling it again. Leave on; turn off only to rule it out while diagnosing. |
+| **Rendering status…** | — | Live per-camera **shown vs decoded** frame rate, plus the window rate and which HUD/clip-buffer profile is in effect. |
+
+Tiles with detection boxes, encroachment zones or an active alarm are always
+repainted, so none of this changes what those show.
+
+#### Reading the tile FPS
+
+The number on a tile is now the rate that camera is **being painted at**, not
+the rate its decoder is producing. When the two differ it reads
+`shown/decoded` — `10/25 fps` means the camera is delivering 25 but the window
+is only managing 10. That gap is what looks jerky, and it is the number to
+watch when tuning the settings above. A single figure means the window is
+keeping up.
+
 ### Safe mode (after a crash)
 
 If the app is killed or raises, the next launch starts in **safe mode**: same video+HUD-only path, with a **SAFE MODE** badge. Use `Esc` → **Exit safe mode (restore extras)** or `security-monitor --no-safe-mode`. Force it with `--safe-mode`. Disable the auto-recover behavior with `display.safe_mode_on_crash: false`.
@@ -469,7 +495,8 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 - **`externally-managed-environment`** — do not use `python3 -m pip install` on Ubuntu/Debian. Use the venv one-liner in [Install](#ubuntu--debian-one-line-install-or-update).
 - **Window never appears** — `pip uninstall opencv-python-headless` then `pip install opencv-python` (inside the venv, not system pip).
 - **High latency** — `tcp` is stable but buffered; `udp` is snappier. Cell size also drives decode cost. Try `decode_mode: cpu` if a bad GPU path stalls opens.
-- **Choppy mosaic / low FPS** — Video & decode → **Low power: Auto** (default). Extras pause until the UI is above ~15 fps. Use **On** to lock video+HUD only.
+- **Choppy mosaic / low FPS** — open Video & decode → **Rendering status…** and compare *shown* against *decoded* per camera. If shown is well under decoded, the window is the bottleneck, not the cameras: lower **Target FPS** to something the machine can hold, set **Clip buffer** to `lite` or `off`, and set **HUD quality** to `fast`. **Low power: Auto** (default) additionally pauses detection, weather and Home Assistant below ~15 fps; **On** locks video+HUD only.
+- **Tile says 25 fps but looks jerky** — that reading used to be the decoder’s rate. It now shows `shown/decoded` whenever they diverge; see [Performance on older machines](#performance-on-older-machines).
 - **Started in SAFE MODE** — previous run did not exit cleanly. Esc → Exit safe mode, or `--no-safe-mode`.
 - **Want GPU decode** — set `decode_mode: gpu` (or `auto`) and pick a backend under Video & decode. Confirm with **Decode status…** or `security-monitor check`. Pip wheels frequently lack working CUDA/VAAPI decode; a custom OpenCV/FFmpeg build may be required.
 - **Linux display** — needs an X11/Wayland session. SSH needs X forwarding or a desktop.

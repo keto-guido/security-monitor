@@ -21,14 +21,30 @@ _OPEN_LOCK = threading.Lock()
 
 @dataclass
 class Snapshot:
+    """One camera's current picture plus how it got here.
+
+    ``fps`` is the **source** rate: how fast frames are coming off the stream
+    and into this worker. It is not what the mosaic is painting — a decoder
+    happily producing 25 fps tells you nothing about whether the window is
+    keeping up. Use ``seq``/``stamp`` to identify the picture and measure the
+    rate actually reaching the screen.
+    """
+
     frame: np.ndarray | None
     status: Status
-    fps: float = 0.0
+    fps: float = 0.0  # source/decode rate, not the displayed rate
     detail: str = ""
     behind: float = 0.0
     buffered: float = 0.0
     rewinding: bool = False
     decode: str = ""  # cpu | auto/vaapi | gpu/cuda | cpu (fallback) | ...
+    seq: int = 0  # capture counter; bumps once per frame read off the source
+    stamp: float = 0.0  # history timestamp when buffered, 0.0 when live
+
+    @property
+    def frame_key(self) -> tuple[int, float]:
+        """Identity of the picture in ``frame`` — equal means "same image"."""
+        return (self.seq, self.stamp)
 
 
 class FrameSource(Protocol):
@@ -37,7 +53,7 @@ class FrameSource(Protocol):
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
-    def snapshot(self) -> Snapshot: ...
+    def snapshot(self, *, copy: bool = True) -> Snapshot: ...
     def reconnect(self) -> None: ...
     def apply_buffer_settings(self, display: DisplayConfig) -> None: ...
     def set_paused(self, paused: bool) -> None: ...
@@ -78,6 +94,7 @@ class CameraWorker(threading.Thread):
         self._pause = threading.Event()
         self._lock = threading.Lock()
         self._frame: np.ndarray | None = None
+        self._seq = 0
         self._status: Status = "disconnected"
         self._detail = "starting"
         self._fps = 0.0
@@ -93,6 +110,7 @@ class CameraWorker(threading.Thread):
             rewind_enabled=display.rewind_buffer,
             rewind_seconds=display.rewind_buffer_seconds,
             clip_seconds=display.clip_seconds,
+            history_mode=getattr(display, "frame_history", "auto"),
         )
 
     def start(self) -> None:  # noqa: A003 - Thread.start
@@ -120,16 +138,29 @@ class CameraWorker(threading.Thread):
         self._release()
         self.history.clear()
 
-    def snapshot(self) -> Snapshot:
+    def snapshot(self, *, copy: bool = True) -> Snapshot:
+        """
+        Current picture for this camera.
+
+        ``copy=False`` hands back the worker's own array. That is safe for
+        read-only consumers — nothing mutates a frame after publishing it, and
+        the worker replaces the reference rather than writing into it — and it
+        saves a full-resolution memcpy per tile per rendered frame. Callers
+        that draw on the frame must copy it first (the renderers already do).
+        """
         with self._lock:
             latest = None if self._frame is None else self._frame
+            seq = self._seq
             status = self._status
             fps = self._fps
             detail = self._detail
             decode = self._decode
         view = self._history_view(latest)
+        frame = view.frame
+        if copy and frame is not None:
+            frame = frame.copy()
         return Snapshot(
-            frame=view.frame.copy() if view.frame is not None else None,
+            frame=frame,
             status=status,
             fps=fps,
             detail=detail,
@@ -137,6 +168,8 @@ class CameraWorker(threading.Thread):
             buffered=view.buffered,
             rewinding=view.rewinding,
             decode=decode,
+            seq=seq,
+            stamp=view.stamp,
         )
 
     def _history_view(self, latest: np.ndarray | None) -> HistoryView:
@@ -190,6 +223,7 @@ class CameraWorker(threading.Thread):
             self.history.push(frame, when=now)
             with self._lock:
                 self._frame = frame
+                self._seq += 1
                 if self._fps > 0 and fps > 0:
                     self._fps = self._fps * 0.85 + fps * 0.15
                 else:
@@ -334,6 +368,7 @@ class DemoWorker(threading.Thread):
         self._pause = threading.Event()
         self._lock = threading.Lock()
         self._frame: np.ndarray | None = None
+        self._seq = 0
         self._fps = float(display.fps)
         self.apply_buffer_settings(display)
 
@@ -346,6 +381,7 @@ class DemoWorker(threading.Thread):
             rewind_enabled=display.rewind_buffer,
             rewind_seconds=display.rewind_buffer_seconds,
             clip_seconds=display.clip_seconds,
+            history_mode=getattr(display, "frame_history", "auto"),
         )
 
     def start(self) -> None:  # noqa: A003
@@ -366,12 +402,16 @@ class DemoWorker(threading.Thread):
         self.history.clear()
         return
 
-    def snapshot(self) -> Snapshot:
+    def snapshot(self, *, copy: bool = True) -> Snapshot:
         with self._lock:
             latest = None if self._frame is None else self._frame
+            seq = self._seq
         view = self.history.view(latest=latest)
+        frame = view.frame
+        if copy and frame is not None:
+            frame = frame.copy()
         return Snapshot(
-            frame=view.frame.copy() if view.frame is not None else None,
+            frame=frame,
             status="demo",
             fps=self._fps,
             detail="synthetic",
@@ -379,6 +419,8 @@ class DemoWorker(threading.Thread):
             buffered=view.buffered,
             rewinding=view.rewinding,
             decode="cpu/demo",
+            seq=seq,
+            stamp=view.stamp,
         )
 
     def run(self) -> None:
@@ -420,6 +462,7 @@ class DemoWorker(threading.Thread):
                 self.history.push(frame, when=now)
                 with self._lock:
                     self._frame = frame
+                    self._seq += 1
             except Exception as exc:  # noqa: BLE001
                 print(f"{self.name}: demo error ({exc})")
             self._stop.wait(interval)

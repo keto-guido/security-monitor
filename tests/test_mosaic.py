@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
 from security_monitor.mosaic import (
+    TARGET_FPS_CHOICES,
+    MosaicApp,
     _menu_action_cycles,
+    next_from,
     clamp_center,
     escape_action,
     fallback_canvas,
@@ -22,8 +27,10 @@ from security_monitor.mosaic import (
     visible_menu_range,
     zoom_toward,
 )
+from security_monitor.config import AppConfig, CameraConfig, DisplayConfig
 from security_monitor.overlay import draw_text
-from security_monitor.stream import rotate_frame
+from security_monitor.runtime import RateMeter
+from security_monitor.stream import Snapshot, rotate_frame
 
 
 def test_scale_modes_output_cell_size() -> None:
@@ -216,3 +223,121 @@ def test_root_menu_groups_and_keeps_actions() -> None:
     safe = root_menu_items(fullscreen=True, safe_mode=True)
     assert ("fullscreen", "Windowed mode") in safe
     assert ("exit_safe_mode", "Exit safe mode (restore extras)") in safe
+
+
+def _app(**display_kwargs) -> MosaicApp:
+    display = DisplayConfig(
+        columns=2, rows=1, cell_width=160, cell_height=90, **display_kwargs
+    )
+    cameras = [CameraConfig(name="A", url="demo://a"), CameraConfig(name="B", url="demo://b")]
+    return MosaicApp(AppConfig(display=display, cameras=cameras))
+
+
+def _snap(seq: int, *, fps: float = 25.0) -> Snapshot:
+    return Snapshot(
+        frame=np.full((90, 160, 3), 60, dtype=np.uint8),
+        status="live",
+        fps=fps,
+        seq=seq,
+    )
+
+
+def test_next_from_cycles_and_snaps_unknown_values() -> None:
+    assert next_from(TARGET_FPS_CHOICES, 15, 1) == 20
+    assert next_from(TARGET_FPS_CHOICES, 30, 1) == 8
+    assert next_from(TARGET_FPS_CHOICES, 15, -1) == 12
+    # A value that is not a preset snaps to the first one rather than raising.
+    assert next_from(TARGET_FPS_CHOICES, 23, 1) == TARGET_FPS_CHOICES[0]
+
+
+def _paint_at(app: MosaicApp, name: str, fps: float, *, window: float = 2.0) -> None:
+    """Backdate a camera's displayed-frame meter to a steady ``fps``."""
+    meter = app._shown_meters.setdefault(name, RateMeter(window=window))
+    base = time.monotonic() - window
+    for i in range(int(fps * window)):
+        meter.mark(base + i / fps)
+
+
+def test_tile_fps_reports_what_is_painted_not_what_is_decoded() -> None:
+    """The reported complaint: a steady 25 fps label over a tile updating at 10."""
+    app = _app()
+    _paint_at(app, "A", 10.0)
+    text = app._cell_fps_text("A", _snap(30, fps=25.0))
+    assert text is not None
+    assert "/" in text, text  # shown/source, because the two diverged
+    shown = int(text.split("/")[0].strip())
+    assert 8 <= shown <= 12, text
+    assert "25" in text
+
+
+def test_tile_fps_collapses_when_display_keeps_up() -> None:
+    app = _app()
+    _paint_at(app, "A", 25.0)
+    text = app._cell_fps_text("A", _snap(50, fps=25.0))
+    assert "/" not in text, text
+
+
+def test_tile_fps_is_blank_before_anything_is_painted() -> None:
+    app = _app()
+    assert app._cell_fps_text("A", _snap(0, fps=25.0)) == "-- fps"
+
+
+def test_tile_fps_hidden_when_show_fps_is_off() -> None:
+    app = _app(show_fps=False)
+    assert app._cell_fps_text("A", _snap(1)) is None
+
+
+def test_mark_shown_ignores_a_repeated_picture() -> None:
+    app = _app()
+    snap = _snap(7)
+    app._mark_shown("A", snap)
+    app._mark_shown("A", snap)
+    app._mark_shown("A", snap)
+    assert len(app._shown_meters["A"]._stamps) == 1
+    app._mark_shown("A", _snap(8))
+    assert len(app._shown_meters["A"]._stamps) == 2
+
+
+def test_tile_cache_reuses_a_tile_when_the_frame_has_not_changed() -> None:
+    app = _app()
+    snap = _snap(3)
+    first = app._render_cell(snap, "A", 160, 90)
+    second = app._render_cell(snap, "A", 160, 90)
+    assert second is first  # no rescale, no HUD redraw
+    third = app._render_cell(_snap(4), "A", 160, 90)
+    assert third is not first
+
+
+def test_tile_cache_respects_a_layout_change() -> None:
+    app = _app()
+    snap = _snap(3)
+    first = app._render_cell(snap, "A", 160, 90)
+    resized = app._render_cell(snap, "A", 320, 180)
+    assert resized.shape == (180, 320, 3)
+    assert resized is not first
+
+
+def test_tile_cache_hands_owned_callers_their_own_copy() -> None:
+    """The zoom path draws its overlay after magnify — it must not scribble
+    on the cached tile."""
+    app = _app()
+    snap = _snap(3)
+    app._render_cell(snap, "A", 160, 90, overlay=False, owned=True)
+    owned = app._render_cell(snap, "A", 160, 90, overlay=False, owned=True)
+    cached = app._tile_cache["A"][1]
+    assert owned is not cached
+    owned[:] = 0
+    assert cached.any()
+
+
+def test_adaptive_render_off_rebuilds_every_tile() -> None:
+    app = _app()
+    app.display.adaptive_render = False
+    snap = _snap(3)
+    assert app._render_cell(snap, "A", 160, 90) is not app._render_cell(snap, "A", 160, 90)
+
+
+def test_rendering_status_page_keeps_video_live() -> None:
+    """It reports live frame rates — pausing decode behind it shows zeros."""
+    assert not menu_should_pause_decode(menu_open=True, page="render_status")
+    assert menu_should_pause_decode(menu_open=True, page="video")
