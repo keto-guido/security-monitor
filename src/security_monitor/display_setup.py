@@ -6,6 +6,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -202,6 +204,91 @@ def sanitize_window_size(
     if aspect < 0.85 or aspect > 2.6:
         return int(fb_w), int(fb_h)
     return int(ww), int(wh)
+
+
+# How long a cached probe stays good. The screen mode changes on a hotplug or
+# an xrandr rotate and never otherwise; a window can be dragged at any moment,
+# so its rect is refreshed several times a second.
+SCREEN_PROBE_TTL = 10.0
+WINDOW_PROBE_TTL = 0.25
+
+_UNPROBED = object()
+
+
+@dataclass
+class LayoutProbe:
+    """
+    Cache the two display queries the render loop would otherwise repeat.
+
+    Both were being called once per composed frame, from ``_sync_layout``:
+
+    * ``screen_size`` spawns an ``xrandr`` process, which opens an X11
+      connection and enumerates every mode on every output. At 25 fps that is
+      hundreds of milliseconds of every second spent forking, and the spawn
+      time varies — so it slows the loop *and* makes it jitter.
+    * ``getWindowImageRect`` is a synchronous round trip to the X server.
+
+    Neither answer changes per frame. This caches both, and skips the screen
+    probe entirely when the window is not fullscreen, which is the only case
+    ``sanitize_window_size`` consults it in.
+    """
+
+    screen_ttl: float = SCREEN_PROBE_TTL
+    window_ttl: float = WINDOW_PROBE_TTL
+    _screen: object = _UNPROBED
+    _screen_at: float = 0.0
+    _window: object = _UNPROBED
+    _window_at: float = 0.0
+
+    def invalidate(self) -> None:
+        """Force a fresh probe — after a fullscreen toggle or a screen rotate."""
+        self._screen = _UNPROBED
+        self._window = _UNPROBED
+
+    def screen_size(
+        self,
+        read: Callable[[], tuple[int, int] | None],
+        *,
+        now: float | None = None,
+    ) -> tuple[int, int] | None:
+        now = time.monotonic() if now is None else now
+        if self._screen is _UNPROBED or now - self._screen_at >= self.screen_ttl:
+            self._screen = read()
+            self._screen_at = now
+        return self._screen  # type: ignore[return-value]
+
+    def window_size(
+        self,
+        read: Callable[[], tuple[int, int] | None],
+        *,
+        now: float | None = None,
+    ) -> tuple[int, int] | None:
+        now = time.monotonic() if now is None else now
+        if self._window is _UNPROBED or now - self._window_at >= self.window_ttl:
+            self._window = read()
+            self._window_at = now
+        return self._window  # type: ignore[return-value]
+
+    def resolve(
+        self,
+        *,
+        fullscreen: bool,
+        read_window: Callable[[], tuple[int, int] | None],
+        read_screen: Callable[[], tuple[int, int] | None],
+        fallback: tuple[int, int],
+        now: float | None = None,
+    ) -> tuple[int, int]:
+        """Paint size for this frame, probing at most once per TTL."""
+        now = time.monotonic() if now is None else now
+        window = self.window_size(read_window, now=now)
+        # Windowed mode never consults the screen mode, so never pay for it.
+        screen = self.screen_size(read_screen, now=now) if fullscreen else None
+        return sanitize_window_size(
+            window,
+            fullscreen=fullscreen,
+            screen=screen,
+            fallback=fallback,
+        )
 
 
 def apply_screen_rotate(

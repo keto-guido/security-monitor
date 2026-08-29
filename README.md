@@ -500,7 +500,7 @@ OpenCV’s FFmpeg backend is used for RTSP/RTP. The GUI package must be `opencv-
 - **Started in SAFE MODE** — previous run did not exit cleanly. Esc → Exit safe mode, or `--no-safe-mode`.
 - **Want GPU decode** — set `decode_mode: gpu` (or `auto`) and pick a backend under Video & decode. Confirm with **Decode status…** or `security-monitor check`. Pip wheels frequently lack working CUDA/VAAPI decode; a custom OpenCV/FFmpeg build may be required.
 - **Linux display** — needs an X11/Wayland session. SSH needs X forwarding or a desktop.
-- **Squished / stretched mosaic on Linux** — OpenCV’s Qt window backend often reports the wrong window size (especially fullscreen). This build ignores bad rects and paints at the real screen size from `xrandr`. Update to the latest package, then:
+- **Squished / stretched mosaic on Linux** — OpenCV’s Qt window backend often reports the wrong window size (especially fullscreen). This build ignores bad rects and paints at the real screen size from `xrandr` (cached, and only consulted in fullscreen — it used to be probed once per frame). Update to the latest package, then:
   ```bash
   security-monitor display          # confirm detected screen size
   security-monitor --fullscreen
