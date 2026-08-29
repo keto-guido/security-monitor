@@ -176,6 +176,7 @@ from security_monitor.overlay import (
     HUD_QUALITY_CHOICES,
     draw_dot,
     draw_text,
+    fill_bgr,
     hud_quality_label,
     set_hud_quality,
     shade_bottom_bar,
@@ -191,6 +192,7 @@ from security_monitor.retention import (
     set_capture_locked,
     set_event_locked,
 )
+from security_monitor.display_setup import LayoutProbe
 from security_monitor.stream import Snapshot, build_sources
 from security_monitor.runtime import (
     POWER_MODE_CHOICES,
@@ -605,6 +607,7 @@ class MosaicApp:
         # whenever the render loop cannot keep up — and that gap is exactly
         # what a "smooth 25 fps" readout over a stuttering tile hides.
         self._pacer = FramePacer(target_fps=float(self.display.fps))
+        self._layout = LayoutProbe()
         self._ui_meter = RateMeter(window=1.5)
         self._shown_meters: dict[str, RateMeter] = {}
         self._shown_keys: dict[str, tuple[int, float]] = {}
@@ -1230,6 +1233,8 @@ class MosaicApp:
             self.display.screen_rotate,
             output=self.display.screen_output,
         )
+        # Rotating swaps the screen's width and height.
+        self._layout.invalidate()
         if message:
             print(message)
 
@@ -1252,6 +1257,7 @@ class MosaicApp:
             pass
 
     def _screen_size(self) -> tuple[int, int] | None:
+        """Uncached xrandr probe. Callers on the render path go via ``_layout``."""
         from security_monitor.display_setup import screen_size
 
         return screen_size(self.display.screen_output)
@@ -1266,12 +1272,12 @@ class MosaicApp:
         return int(ww), int(wh)
 
     def _window_size(self) -> tuple[int, int]:
-        from security_monitor.display_setup import sanitize_window_size
-
-        return sanitize_window_size(
-            self._reported_window_size(),
+        # Probes are cached and the xrandr one is skipped outside fullscreen —
+        # see LayoutProbe. This runs on every composed frame.
+        return self._layout.resolve(
             fullscreen=self.fullscreen,
-            screen=self._screen_size(),
+            read_window=self._reported_window_size,
+            read_screen=self._screen_size,
             fallback=self.display.canvas_size,
         )
 
@@ -1327,7 +1333,7 @@ class MosaicApp:
             return self._finish_compose(cell)
 
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
-        canvas[:] = (12, 12, 14)
+        fill_bgr(canvas, (12, 12, 14))
         grid_w = cell_w * d.columns
         grid_h = cell_h * d.rows
         x_off = max(0, (width - grid_w) // 2)
@@ -1569,7 +1575,7 @@ class MosaicApp:
         self, width: int, height: int, frame: np.ndarray
     ) -> np.ndarray:
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
-        canvas[:] = (10, 10, 12)
+        fill_bgr(canvas, (10, 10, 12))
         fitted = scale_frame(frame, width, height, "fit")
         y = max(0, (height - fitted.shape[0]) // 2)
         x = max(0, (width - fitted.shape[1]) // 2)
@@ -1580,7 +1586,7 @@ class MosaicApp:
 
     def _paint_event_playback(self, width: int, height: int) -> np.ndarray:
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
-        canvas[:] = (8, 8, 10)
+        fill_bgr(canvas, (8, 8, 10))
         cap = self._event_playback
         if cap is None:
             return canvas
@@ -5606,7 +5612,7 @@ class MosaicApp:
         d = self.display
         cell_w, cell_h, width, height = self._sync_layout()
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
-        canvas[:] = (12, 12, 14)
+        fill_bgr(canvas, (12, 12, 14))
         grid_w = cell_w * d.columns
         grid_h = cell_h * d.rows
         x_off = max(0, (width - grid_w) // 2)
@@ -6389,6 +6395,8 @@ class MosaicApp:
         prop = getattr(cv2, "WND_PROP_FULLSCREEN", None)
         mode_full = getattr(cv2, "WINDOW_FULLSCREEN", 1)
         mode_normal = getattr(cv2, "WINDOW_NORMAL", 0)
+        # The window is about to change size; do not paint a cached one.
+        self._layout.invalidate()
         if prop is None:
             return
         try:
@@ -6661,8 +6669,12 @@ def _scale_frame(frame: np.ndarray, cell_w: int, cell_h: int, mode: str) -> np.n
     scale = min(cell_w / src_w, cell_h / src_h)
     new_w, new_h = max(1, int(src_w * scale)), max(1, int(src_h * scale))
     resized = _resize(frame, (new_w, new_h))
-    canvas = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
-    canvas[:] = (8, 8, 10)
+    if new_w == cell_w and new_h == cell_h:
+        # 16:9 into a 16:9 tile — the usual case. There is no letterbox to
+        # paint, so skip the spare canvas and the copy into it entirely.
+        return resized
+    canvas = np.empty((cell_h, cell_w, 3), dtype=np.uint8)
+    fill_bgr(canvas, (8, 8, 10))
     x = (cell_w - new_w) // 2
     y = (cell_h - new_h) // 2
     canvas[y : y + new_h, x : x + new_w] = resized
@@ -6671,7 +6683,7 @@ def _scale_frame(frame: np.ndarray, cell_w: int, cell_h: int, mode: str) -> np.n
 
 def placeholder(width: int, height: int, title: str, message: str) -> np.ndarray:
     tile = np.zeros((height, width, 3), dtype=np.uint8)
-    tile[:] = (22, 22, 26)
+    fill_bgr(tile, (22, 22, 26))
     inset = 18
     shade_round_rect(
         tile,

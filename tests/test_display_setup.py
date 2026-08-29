@@ -6,6 +6,7 @@ import pytest
 
 from security_monitor.display_setup import (
     DisplaySetupError,
+    LayoutProbe,
     apply_screen_rotate,
     list_outputs,
     maybe_apply_config_rotation,
@@ -130,3 +131,86 @@ def test_sanitize_falls_back_when_too_small() -> None:
         screen=None,
         fallback=(1280, 720),
     ) == (1280, 720)
+
+
+class _Counter:
+    """A probe stand-in that records how often the render loop asked."""
+
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.value
+
+
+def _run(probe: LayoutProbe, window, screen, *, fullscreen: bool, frames: int = 100):
+    for i in range(frames):
+        size = probe.resolve(
+            fullscreen=fullscreen,
+            read_window=window,
+            read_screen=screen,
+            fallback=(640, 360),
+            now=1000.0 + i * 0.04,  # 25 fps
+        )
+    return size
+
+
+def test_windowed_mode_never_spawns_xrandr() -> None:
+    """sanitize_window_size only reads the screen mode when fullscreen.
+
+    Calling it anyway forked an xrandr process for every composed frame.
+    """
+    window, screen = _Counter((1280, 720)), _Counter((1920, 1080))
+    size = _run(LayoutProbe(), window, screen, fullscreen=False)
+    assert size == (1280, 720)
+    assert screen.calls == 0
+    assert window.calls < 20  # 100 frames, cached at 4 Hz
+
+
+def test_fullscreen_probes_the_screen_once_per_ttl() -> None:
+    window, screen = _Counter((1920, 1080)), _Counter((1920, 1080))
+    size = _run(LayoutProbe(screen_ttl=10.0), window, screen, fullscreen=True)
+    assert size == (1920, 1080)
+    assert screen.calls == 1  # 4 seconds of frames, one 10 s TTL
+
+
+def test_probes_refresh_after_their_ttl() -> None:
+    window, screen = _Counter((1920, 1080)), _Counter((1920, 1080))
+    probe = LayoutProbe(screen_ttl=1.0, window_ttl=0.25)
+    _run(probe, window, screen, fullscreen=True, frames=250)  # 10 seconds
+    # At most one probe per TTL, and the cache never goes stale for long.
+    assert 9 <= screen.calls <= 11  # 10 s at a 1 s TTL
+    assert 30 <= window.calls <= 41  # 10 s at a 0.25 s TTL, snapped to frames
+
+
+def test_invalidate_forces_a_fresh_probe() -> None:
+    window, screen = _Counter((1920, 1080)), _Counter((1920, 1080))
+    probe = LayoutProbe()
+    probe.resolve(
+        fullscreen=True,
+        read_window=window,
+        read_screen=screen,
+        fallback=(640, 360),
+        now=1000.0,
+    )
+    assert (window.calls, screen.calls) == (1, 1)
+    probe.invalidate()  # e.g. the user just toggled fullscreen
+    probe.resolve(
+        fullscreen=True,
+        read_window=window,
+        read_screen=screen,
+        fallback=(640, 360),
+        now=1000.01,
+    )
+    assert (window.calls, screen.calls) == (2, 2)
+
+
+def test_a_missing_probe_result_is_cached_too() -> None:
+    """No xrandr on this machine must not mean re-checking every frame."""
+    window, screen = _Counter(None), _Counter(None)
+    size = _run(LayoutProbe(), window, screen, fullscreen=True)
+    assert size == (640, 360)  # falls back
+    assert screen.calls == 1
+    assert window.calls < 20

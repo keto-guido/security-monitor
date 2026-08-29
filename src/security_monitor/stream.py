@@ -14,6 +14,7 @@ import numpy as np
 from security_monitor.buffer import FrameHistory, HistoryView
 from security_monitor.config import CameraConfig, DisplayConfig
 from security_monitor.decode import apply_ffmpeg_capture_options
+from security_monitor.overlay import fill_bgr
 
 Status = str  # live | reconnecting | disconnected | error | demo
 _OPEN_LOCK = threading.Lock()
@@ -436,7 +437,7 @@ class DemoWorker(threading.Thread):
             try:
                 t = time.monotonic() - started
                 frame = np.zeros((height, width, 3), dtype=np.uint8)
-                frame[:] = (18, 18, 22)
+                fill_bgr(frame, (18, 18, 22))
                 band_y = int((np.sin(t + self.index) * 0.5 + 0.5) * (height - 40))
                 frame[band_y : band_y + 24, :] = color
                 cv2.circle(

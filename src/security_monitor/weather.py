@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from security_monitor.overlay import draw_text, shade_round_rect
+from security_monitor.overlay import blend_region, draw_text, shade_round_rect
 
 VALID_WEATHER_SLOTS = (
     "bottom_left",
@@ -884,12 +884,7 @@ def draw_weather_widget(
             valign="bottom",
         )
 
-    if opacity >= 0.999:
-        canvas[y0:y1, x0:x1] = layer[:lh, :lw]
-        return
-    base = under.astype(np.float32)
-    top = layer.astype(np.float32)
-    canvas[y0:y1, x0:x1] = (base * (1.0 - opacity) + top * opacity).astype(np.uint8)
+    blend_region(under, layer[:lh, :lw], opacity)
 
 
 def nudge_norm(value: float, step: float, lo: float = -0.45, hi: float = 1.0) -> float:

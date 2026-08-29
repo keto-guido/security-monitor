@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 import cv2
 import numpy as np
 
-from security_monitor.overlay import draw_text, shade_round_rect
+from security_monitor.overlay import blend_region, draw_text, shade_round_rect
 
 HA_POLL_CHOICES: tuple[float, ...] = (1.0, 2.0, 3.0, 5.0, 10.0)
 HA_HOLD_CHOICES: tuple[float, ...] = (0.0, 5.0, 8.0, 12.0, 20.0)
@@ -882,11 +882,7 @@ def draw_sensor_chip(
         color=(200, 210, 230),
         valign="center",
     )
-    base = tile[y0 : y0 + box_h, x0 : x0 + box_w].astype(np.float32)
-    top = layer.astype(np.float32)
-    tile[y0 : y0 + box_h, x0 : x0 + box_w] = (
-        base * (1.0 - opacity) + top * opacity
-    ).astype(np.uint8)
+    blend_region(tile[y0 : y0 + box_h, x0 : x0 + box_w], layer, opacity)
 
 
 def draw_door_hud(
@@ -936,11 +932,7 @@ def draw_door_hud(
         color=(230, 230, 235),
         valign="bottom",
     )
-    base = canvas[y0 : y0 + box_h, x0 : x0 + box_w].astype(np.float32)
-    top = layer.astype(np.float32)
-    canvas[y0 : y0 + box_h, x0 : x0 + box_w] = (
-        base * (1.0 - opacity) + top * opacity
-    ).astype(np.uint8)
+    blend_region(canvas[y0 : y0 + box_h, x0 : x0 + box_w], layer, opacity)
 
 
 def door_open_edges(
@@ -1053,11 +1045,7 @@ def draw_ha_popups(
             color=(235, 235, 240),
             valign="bottom",
         )
-        base = canvas[y0 : y0 + box_h, x0 : x0 + box_w].astype(np.float32)
-        top = layer.astype(np.float32)
-        canvas[y0 : y0 + box_h, x0 : x0 + box_w] = (
-            base * (1.0 - opacity) + top * opacity
-        ).astype(np.uint8)
+        blend_region(canvas[y0 : y0 + box_h, x0 : x0 + box_w], layer, opacity)
         y += box_h + 8
 
 
