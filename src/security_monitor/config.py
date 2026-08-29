@@ -13,6 +13,7 @@ from urllib.parse import quote, urlparse, urlunparse
 
 import yaml
 
+from security_monitor.buffer import HISTORY_MODE_CHOICES
 from security_monitor.encroachment import EncroachZone
 from security_monitor.home_assistant import (
     HADoorMapping,
@@ -23,6 +24,7 @@ from security_monitor.home_assistant import (
     parse_door_mappings,
     parse_light_controls,
 )
+from security_monitor.overlay import HUD_QUALITY_CHOICES
 from security_monitor.webhooks import (
     OutgoingWebhook,
     WebhookMapping,
@@ -228,6 +230,17 @@ class DisplayConfig:
     # Low-power: skip extras (detection, weather, HA, rewind) when the UI FPS drops.
     power_mode: str = "auto"  # auto | on | off
     low_power_fps: float = 12.0
+    # Cost of the rolling clip/pre-roll buffer: auto | full | lite | off.
+    # Every camera JPEG-encodes each decoded frame into it, so on weak CPUs
+    # this is often the single biggest background cost. "auto" picks "lite"
+    # on machines with four cores or fewer.
+    frame_history: str = "auto"
+    # HUD text/shape rendering: auto | high | fast. "fast" drops supersampling
+    # and the soft shadow blur. "auto" picks "fast" on four cores or fewer.
+    hud_quality: str = "auto"
+    # Skip repainting a tile whose camera has not produced a new frame. Pure
+    # win in normal use; turn it off to rule it out when diagnosing rendering.
+    adaptive_render: bool = True
     # After an unclean exit, start with video + HUD only until the user recovers.
     safe_mode_on_crash: bool = True
 
@@ -528,6 +541,7 @@ def save_display_settings(config: AppConfig) -> Path | None:
     d = config.display
     display["columns"] = int(d.columns)
     display["rows"] = int(d.rows)
+    display["fps"] = int(d.fps)
     display["smooth_buffer"] = bool(d.smooth_buffer)
     display["smooth_buffer_seconds"] = float(d.smooth_buffer_seconds)
     display["rewind_buffer"] = bool(d.rewind_buffer)
@@ -596,6 +610,9 @@ def save_display_settings(config: AppConfig) -> Path | None:
     display["webhook_outgoing"] = [outgoing_webhook_to_dict(item) for item in d.webhook_outgoing]
     display["power_mode"] = str(d.power_mode)
     display["low_power_fps"] = float(d.low_power_fps)
+    display["frame_history"] = str(d.frame_history)
+    display["hud_quality"] = str(d.hud_quality)
+    display["adaptive_render"] = bool(d.adaptive_render)
     display["safe_mode_on_crash"] = bool(d.safe_mode_on_crash)
 
     raw["cameras"] = [camera_to_dict(cam) for cam in config.cameras]
@@ -843,6 +860,15 @@ def _parse_display(raw: Any) -> DisplayConfig:
     data.low_power_fps = float(raw.get("low_power_fps", data.low_power_fps) or data.low_power_fps)
     if not (4.0 <= data.low_power_fps <= 30.0):
         raise ConfigError("display.low_power_fps must be between 4 and 30")
+    data.frame_history = (
+        str(raw.get("frame_history", data.frame_history)).strip().lower() or "auto"
+    )
+    if data.frame_history not in HISTORY_MODE_CHOICES:
+        raise ConfigError(f"display.frame_history must be one of {HISTORY_MODE_CHOICES}")
+    data.hud_quality = str(raw.get("hud_quality", data.hud_quality)).strip().lower() or "auto"
+    if data.hud_quality not in HUD_QUALITY_CHOICES:
+        raise ConfigError(f"display.hud_quality must be one of {HUD_QUALITY_CHOICES}")
+    data.adaptive_render = bool(raw.get("adaptive_render", data.adaptive_render))
     data.safe_mode_on_crash = _bool(raw, "safe_mode_on_crash", data.safe_mode_on_crash)
     return data
 

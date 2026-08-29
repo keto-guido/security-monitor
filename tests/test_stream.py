@@ -7,7 +7,7 @@ import time
 import numpy as np
 
 from security_monitor.config import CameraConfig, DisplayConfig
-from security_monitor.stream import DemoWorker, safe_cap_read
+from security_monitor.stream import DemoWorker, Snapshot, safe_cap_read
 
 
 class _BoomCap:
@@ -77,3 +77,64 @@ def test_demo_worker_pause_freezes_last_frame() -> None:
     finally:
         worker.stop()
 
+
+
+def _demo_worker() -> DemoWorker:
+    display = DisplayConfig(cell_width=64, cell_height=48, fps=30)
+    return DemoWorker(CameraConfig(name="demo", url="demo://x"), display, 0)
+
+
+def test_snapshot_frame_key_distinguishes_pictures() -> None:
+    assert Snapshot(frame=None, status="live", seq=4).frame_key == (4, 0.0)
+    assert Snapshot(frame=None, status="live", seq=4) .frame_key != (
+        Snapshot(frame=None, status="live", seq=5).frame_key
+    )
+
+
+def test_snapshot_fps_is_the_source_rate_not_the_displayed_rate() -> None:
+    # Documented contract: renderers must not present this as "displayed fps".
+    snap = Snapshot(frame=None, status="live", fps=25.0, seq=1)
+    assert snap.fps == 25.0
+    assert snap.frame_key == (1, 0.0)
+
+
+def test_worker_sequence_advances_with_each_frame() -> None:
+    worker = _demo_worker()
+    worker.start()
+    try:
+        time.sleep(0.3)
+        first = worker.snapshot()
+        time.sleep(0.2)
+        second = worker.snapshot()
+    finally:
+        worker.stop()
+    assert second.seq > first.seq
+    assert second.frame_key != first.frame_key
+
+
+def test_snapshot_copy_false_avoids_a_full_frame_memcpy() -> None:
+    worker = _demo_worker()
+    worker.start()
+    try:
+        time.sleep(0.3)
+        shared = worker.snapshot(copy=False)
+        owned = worker.snapshot()
+    finally:
+        worker.stop()
+    assert shared.frame is not None
+    assert owned.frame is not None
+    # copy=True must hand back an array the caller may safely draw on.
+    assert owned.frame is not shared.frame
+
+
+def test_snapshot_copy_false_returns_the_workers_own_array() -> None:
+    worker = _demo_worker()
+    worker.start()
+    try:
+        time.sleep(0.3)
+        a = worker.snapshot(copy=False)
+        b = worker.snapshot(copy=False)
+    finally:
+        worker.stop()
+    if a.seq == b.seq:
+        assert a.frame is b.frame

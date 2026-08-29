@@ -7,11 +7,14 @@ import time
 import numpy as np
 import pytest
 
+from security_monitor import buffer as buffer_module
 from security_monitor.buffer import (
+    HISTORY_PROFILES,
     REWIND_BUFFER_CHOICES,
     SMOOTH_BUFFER_CHOICES,
     FrameHistory,
     next_choice,
+    resolve_history_mode,
 )
 from security_monitor.config import parse_config, save_display_settings
 
@@ -105,3 +108,122 @@ def test_save_display_settings_roundtrip(tmp_path) -> None:
     assert "smooth_buffer: true" in text
     assert "rewind_buffer: true" in text
     assert "rewind_buffer_seconds: 60" in text
+
+
+def _fill(history: FrameHistory, *, fps: float, seconds: float, start: float = 100.0) -> None:
+    """Feed the history as a camera thread would: one push per decoded frame."""
+    step = 1.0 / fps
+    now = start
+    for i in range(int(fps * seconds)):
+        history.push(_frame(i % 200), when=now)
+        now += step
+
+
+def test_push_honours_the_sample_rate_cap() -> None:
+    """The cap has to save CPU, not just memory.
+
+    It used to re-encode every frame anyway to "refresh the tip", so a 25 fps
+    camera paid 25 JPEG encodes a second to keep a 12-sample-per-second ring.
+    """
+    history = FrameHistory()
+    history.configure(history_mode="full", clip_seconds=15.0)
+    calls: list[int] = []
+    original = buffer_module._encode
+
+    def counting_encode(frame, **kwargs):
+        calls.append(1)
+        return original(frame, **kwargs)
+
+    buffer_module._encode = counting_encode
+    try:
+        _fill(history, fps=25.0, seconds=2.0)
+    finally:
+        buffer_module._encode = original
+    # 50 frames arrived; the store is capped at 12/s, so it must encode far
+    # fewer than one per frame — previously it encoded all 50.
+    cap = HISTORY_PROFILES["full"].max_fps
+    assert len(calls) <= cap * 2 + 1, len(calls)
+    assert len(calls) < 25, len(calls)
+
+
+def test_smooth_playback_still_gets_every_frame() -> None:
+    """Smooth buffering reads the store, so it must not be rate-capped."""
+    history = FrameHistory()
+    history.configure(smooth_enabled=True, smooth_seconds=1.0, history_mode="lite")
+    calls: list[int] = []
+    original = buffer_module._encode
+
+    def counting_encode(frame, **kwargs):
+        calls.append(1)
+        return original(frame, **kwargs)
+
+    buffer_module._encode = counting_encode
+    try:
+        _fill(history, fps=25.0, seconds=1.0)
+    finally:
+        buffer_module._encode = original
+    assert len(calls) == 25
+
+
+def test_history_off_stores_nothing_when_nobody_reads_it() -> None:
+    history = FrameHistory()
+    history.configure(history_mode="off", clip_seconds=15.0)
+    assert history.active is False
+    _fill(history, fps=25.0, seconds=1.0)
+    assert history.span_seconds() == 0.0
+
+
+def test_history_off_still_serves_smooth_and_rewind() -> None:
+    history = FrameHistory()
+    history.configure(history_mode="off", rewind_enabled=True, rewind_seconds=10.0)
+    assert history.active is True
+    _fill(history, fps=25.0, seconds=2.0)
+    assert history.span_seconds() > 0.5
+
+
+def test_live_view_bypasses_the_store_while_rewind_sits_at_live() -> None:
+    """Rewind being armed must not cap live playback at the store's rate."""
+    history = FrameHistory()
+    history.configure(rewind_enabled=True, rewind_seconds=10.0, history_mode="lite")
+    _fill(history, fps=25.0, seconds=2.0)
+    latest = _frame(123)
+    view = history.view(latest=latest)
+    assert view.frame is latest  # no JPEG round trip, no staleness
+    assert view.stamp == 0.0
+    assert view.rewinding is False
+
+
+def test_scrubbed_view_comes_from_the_store() -> None:
+    history = FrameHistory()
+    history.configure(rewind_enabled=True, rewind_seconds=10.0, history_mode="full")
+    _fill(history, fps=25.0, seconds=3.0)
+    history.nudge_rewind(1.0)
+    view = history.view(latest=_frame(123))
+    assert view.rewinding is True
+    assert view.stamp > 0.0
+    assert view.behind == pytest.approx(1.0, abs=0.3)
+
+
+def test_view_decode_is_memoized_for_repeat_calls() -> None:
+    """The mosaic asks several times per composed frame — decode once."""
+    history = FrameHistory()
+    history.configure(smooth_enabled=True, smooth_seconds=0.5, history_mode="full")
+    _fill(history, fps=25.0, seconds=2.0)
+    first = history.view()
+    second = history.view()
+    assert first.frame is second.frame
+
+
+def test_lite_profile_is_cheaper_than_full() -> None:
+    lite, full = HISTORY_PROFILES["lite"], HISTORY_PROFILES["full"]
+    assert lite.max_edge < full.max_edge
+    assert lite.jpeg_quality <= full.jpeg_quality
+    assert lite.max_fps < full.max_fps
+    assert lite.retain is True  # clips and pre-roll still work
+
+
+def test_resolve_history_mode_passes_explicit_choices_through() -> None:
+    assert resolve_history_mode("full") == "full"
+    assert resolve_history_mode("off") == "off"
+    assert resolve_history_mode("auto") in {"full", "lite"}
+    assert resolve_history_mode("nonsense") in {"full", "lite"}

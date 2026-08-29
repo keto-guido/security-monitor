@@ -64,9 +64,12 @@ def _ensure_opencv_qt_fonts() -> None:
         break
 
 from security_monitor.buffer import (
+    HISTORY_MODE_CHOICES,
     REWIND_BUFFER_CHOICES,
     SMOOTH_BUFFER_CHOICES,
+    history_mode_label,
     next_choice,
+    resolve_history_mode,
 )
 from security_monitor.capture import (
     CLIP_LENGTH_CHOICES,
@@ -169,7 +172,15 @@ from security_monitor.webhooks import (
     unique_webhook_path,
     webhook_open_edges,
 )
-from security_monitor.overlay import draw_dot, draw_text, shade_bottom_bar, shade_round_rect
+from security_monitor.overlay import (
+    HUD_QUALITY_CHOICES,
+    draw_dot,
+    draw_text,
+    hud_quality_label,
+    set_hud_quality,
+    shade_bottom_bar,
+    shade_round_rect,
+)
 from security_monitor.retention import (
     RETENTION_DAY_CHOICES,
     RETENTION_GB_CHOICES,
@@ -184,8 +195,10 @@ from security_monitor.stream import Snapshot, build_sources
 from security_monitor.runtime import (
     POWER_MODE_CHOICES,
     CrashGuard,
+    FramePacer,
     PowerPolicy,
     PowerTracker,
+    RateMeter,
     clear_crash_marker,
     power_mode_label,
 )
@@ -224,6 +237,7 @@ HELP_LINES = (
     "Home     reset zoom",
     "r        reconnect all",
     "click    focus tile",
+    "tile fps   shown / decoded",
     "low power  auto when UI FPS drops",
 )
 
@@ -267,6 +281,8 @@ _MENU_LIVE_PAGES = frozenset(
         "events_view",
         "events_delete",
         "events_play",
+        # Reads live frame rates — pausing decode behind it would show zeros.
+        "render_status",
     }
 )
 _MENU_CYCLE_ACTIONS = frozenset(
@@ -279,6 +295,9 @@ _MENU_CYCLE_ACTIONS = frozenset(
         "hud_opacity",
         "power_mode",
         "hwaccel",
+        "target_fps",
+        "frame_history",
+        "hud_quality",
         "clip_length",
         "retention_days",
         "retention_gb",
@@ -313,6 +332,7 @@ _NESTED_MENU_PAGES = frozenset(
         "detection_cams",
         "detection_zones",
         "decode_status",
+        "render_status",
         "weather",
         "weather_place",
         "ha",
@@ -371,6 +391,24 @@ MENU_ROW_H = 42
 MENU_HEADER_H = 26
 _HA_ENTITY_LIST_CAP = 80
 _HA_SEARCH_PAGES = frozenset({"ha_entities", "ha_light_pick"})
+
+
+# Esc → Video & decode → Target FPS. Lower targets give the render loop a
+# realistic deadline to hit, which is steadier than missing a high one.
+TARGET_FPS_CHOICES: tuple[int, ...] = (8, 10, 12, 15, 20, 25, 30)
+
+
+def next_from(choices: tuple, current, step: int):
+    """Cycle a value through a tuple of presets, snapping unknown values."""
+    values = list(choices)
+    if not values:
+        return current
+    try:
+        index = values.index(current)
+    except ValueError:
+        index = 0
+        step = 0 if step > 0 else step
+    return values[(index + int(step)) % len(values)]
 
 
 def menu_section(title: str) -> tuple[str, str]:
@@ -550,6 +588,7 @@ class MosaicApp:
         self._power.set_mode(self.display.power_mode)
         self._low_power = bool(self._power.low_power)
         configure_compute_threads()
+        self._hud_quality = set_hud_quality(self.display.hud_quality)
         self.cameras = config.visible_cameras()
         self._camera_by_name = {cam.name: cam for cam in self.cameras}
         self.sources = build_sources(self.cameras, self.display)
@@ -561,6 +600,17 @@ class MosaicApp:
         self._ui_fps = 0.0
         self._show_help = False
         self._fps_shown: dict[str, tuple[float, int]] = {}
+        # Rate of *new* pictures reaching the screen, per camera. The worker's
+        # own fps counts frames off the wire, which is a different number
+        # whenever the render loop cannot keep up — and that gap is exactly
+        # what a "smooth 25 fps" readout over a stuttering tile hides.
+        self._pacer = FramePacer(target_fps=float(self.display.fps))
+        self._ui_meter = RateMeter(window=1.5)
+        self._shown_meters: dict[str, RateMeter] = {}
+        self._shown_keys: dict[str, tuple[int, float]] = {}
+        # Finished tiles keyed by everything that affects their pixels, so a
+        # camera slower than the render loop is not re-scaled for nothing.
+        self._tile_cache: dict[str, tuple[tuple, np.ndarray]] = {}
         self.view_zoom = 1.0
         self.pan_x = 0.5
         self.pan_y = 0.5
@@ -667,6 +717,9 @@ class MosaicApp:
             setter = getattr(source, "set_paused", None)
             if callable(setter):
                 setter(paused)
+        # The frozen-menu loop is not the live render rate; do not average the
+        # two together across the transition.
+        self._ui_meter.reset()
         self._invalidate_menu_backdrop()
 
     def _invalidate_menu_backdrop(self) -> None:
@@ -1107,8 +1160,7 @@ class MosaicApp:
         elif self._low_power:
             print("Low power is ON (video + HUD only). Esc → Video settings to change.")
 
-        delay = max(1, int(1000 / self.display.fps))
-        stamps: list[float] = []
+        self._pacer.set_target_fps(float(self.display.fps))
         last_canvas: np.ndarray | None = None
         try:
             while self._running:
@@ -1128,25 +1180,31 @@ class MosaicApp:
                     cv2.imshow(self.window, canvas)
                 except Exception as exc:  # noqa: BLE001
                     print(f"Display error: {exc}")
-                    time.sleep(delay / 1000.0)
+                    time.sleep(self._pacer.period)
                     continue
                 now = time.monotonic()
-                stamps.append(now)
-                stamps = [t for t in stamps if now - t <= 1.5]
-                if len(stamps) >= 2:
-                    self._ui_fps = (len(stamps) - 1) / (stamps[-1] - stamps[0])
+                if not self._menu_pauses_decode():
+                    self._ui_meter.mark(now)
+                    self._ui_fps = self._ui_meter.rate(now)
                 try:
                     self._tick_power_mode(now)
                 except Exception as exc:  # noqa: BLE001
                     print(f"Power policy error: {exc}")
                 wait = getattr(cv2, "waitKeyEx", cv2.waitKey)
-                # Snappier keys while the frozen menu is up (no live decode cost).
-                ui_delay = 16 if self._menu_pauses_decode() else delay
+                # Wait out whatever is left of this frame's slot rather than a
+                # fixed period on top of compose — see FramePacer.
+                self._pacer.set_target_fps(float(self.display.fps))
+                if self._menu_pauses_decode():
+                    # Snappier keys while the frozen menu is up (no live decode).
+                    ui_delay = 16
+                    self._pacer.reset()
+                else:
+                    ui_delay = self._pacer.wait_ms(now)
                 try:
                     key = wait(ui_delay)
                 except Exception as exc:  # noqa: BLE001
                     print(f"Input error: {exc}")
-                    time.sleep(delay / 1000.0)
+                    time.sleep(self._pacer.period)
                     continue
                 if key >= 0:
                     try:
@@ -1250,9 +1308,11 @@ class MosaicApp:
         if extras and self._event_playback is not None:
             return self._finalize_ui(self._paint_event_playback(width, height))
         if self.zoom_index is not None and 0 <= self.zoom_index < len(self.sources):
-            snap = self.sources[self.zoom_index].snapshot()
+            snap = self.sources[self.zoom_index].snapshot(copy=False)
             name = self.sources[self.zoom_index].name
-            cell = self._render_cell(snap, name, width, height, overlay=False)
+            self._mark_shown(name, snap)
+            # overlay is drawn after magnify, so this tile is drawn on: owned.
+            cell = self._render_cell(snap, name, width, height, overlay=False, owned=True)
             cell = magnify(cell, self.view_zoom, self.pan_x, self.pan_y)
             self._draw_cell_overlay(cell, snap, name)
             if extras:
@@ -1295,11 +1355,13 @@ class MosaicApp:
             if tw < 2 or th < 2:
                 continue
             if index < len(self.sources):
-                snap = self.sources[index].snapshot()
+                name = self.sources[index].name
+                snap = self.sources[index].snapshot(copy=False)
+                self._mark_shown(name, snap)
                 any_rewind = any_rewind or snap.rewinding
                 tile = self._render_cell(
                     snap,
-                    self.sources[index].name,
+                    name,
                     tw,
                     th,
                     overlay=not zoomed,
@@ -1315,7 +1377,7 @@ class MosaicApp:
         if extras:
             self._draw_zoom_badge(canvas)
             if any_rewind or self.display.smooth_buffer or self.display.rewind_buffer:
-                sample = self.sources[0].snapshot() if self.sources else None
+                sample = self.sources[0].snapshot(copy=False) if self.sources else None
                 if sample is not None:
                     self._draw_buffer_badge(canvas, sample)
             if not pause_decode:
@@ -1329,7 +1391,7 @@ class MosaicApp:
     def _finish_compose(self, canvas: np.ndarray) -> np.ndarray:
         """Dim once into a still when the menu pauses decode; otherwise live UI."""
         if self._menu_pauses_decode():
-            dimmed = np.clip(canvas.astype(np.float32) * 0.36, 0, 255).astype(np.uint8)
+            dimmed = dim_image(canvas, 0.36)
             self._menu_backdrop = dimmed
             self._menu_backdrop_size = (int(dimmed.shape[1]), int(dimmed.shape[0]))
             return self._finalize_ui(dimmed.copy(), dim_menu_background=False)
@@ -1423,7 +1485,7 @@ class MosaicApp:
             if canvas.shape[0] != height or canvas.shape[1] != width:
                 canvas = cv2.resize(canvas, (width, height), interpolation=cv2.INTER_AREA)
         # Dim slightly so the draggable widget reads clearly.
-        canvas[:] = (canvas.astype(np.float32) * 0.72).astype(np.uint8)
+        canvas[:] = dim_image(canvas, 0.72)
         d = self.display
         grid_w = self._cell_w * d.columns
         grid_h = self._cell_h * d.rows
@@ -1513,7 +1575,7 @@ class MosaicApp:
         x = max(0, (width - fitted.shape[1]) // 2)
         canvas[y : y + fitted.shape[0], x : x + fitted.shape[1]] = fitted
         # Dim slightly so the action card stays readable.
-        canvas[:] = (canvas.astype(np.float32) * 0.72).astype(np.uint8)
+        canvas[:] = dim_image(canvas, 0.72)
         return canvas
 
     def _paint_event_playback(self, width: int, height: int) -> np.ndarray:
@@ -1553,18 +1615,93 @@ class MosaicApp:
     ) -> None:
         cols, rows = self.display.columns, self.display.rows
         cell_w, cell_h = self._cell_w, self._cell_h
-        tint = np.array([18, 18, 20], dtype=np.float32)
-        alpha = 0.45
+        alpha_q = 115  # ~0.45 of 255
+        tint = np.array([18, 18, 20], dtype=np.uint16) * alpha_q
+        inv = np.uint16(255 - alpha_q)
+
+        def blend(line: np.ndarray) -> np.ndarray:
+            out = line.astype(np.uint16)
+            out *= inv
+            out += tint
+            out //= 255
+            return out.astype(np.uint8)
+
         for col in range(1, cols):
             x = x_off + col * cell_w
             if 0 <= x < canvas.shape[1]:
-                col_pixels = canvas[:, x].astype(np.float32)
-                canvas[:, x] = (col_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
+                canvas[:, x] = blend(canvas[:, x])
         for row in range(1, rows):
             y = y_off + row * cell_h
             if 0 <= y < canvas.shape[0]:
-                row_pixels = canvas[y, :].astype(np.float32)
-                canvas[y, :] = (row_pixels * (1.0 - alpha) + tint * alpha).astype(np.uint8)
+                canvas[y, :] = blend(canvas[y, :])
+
+    def _mark_shown(self, name: str, snap: Snapshot) -> None:
+        """Record that a *new* picture for this camera reached the screen."""
+        if snap.frame is None:
+            return
+        key = snap.frame_key
+        if self._shown_keys.get(name) == key:
+            return  # same picture as last compose — the tile did not advance
+        self._shown_keys[name] = key
+        meter = self._shown_meters.get(name)
+        if meter is None:
+            meter = self._shown_meters[name] = RateMeter(window=2.0)
+        meter.mark(time.monotonic())
+
+    def displayed_fps(self, name: str) -> float:
+        """Rate of distinct frames actually painted for this camera."""
+        meter = self._shown_meters.get(name)
+        return meter.rate(time.monotonic()) if meter is not None else 0.0
+
+    def _cell_fps_text(self, name: str, snap: Snapshot) -> str | None:
+        """
+        Tile FPS readout: what you are seeing, and what the camera is sending.
+
+        ``snap.fps`` alone is the decoder's rate — it stays at 25 while the
+        window paints 8, which is the "smooth number over a jerky picture"
+        case. Show the displayed rate first, and add the source rate as
+        ``shown/source`` whenever the two have actually diverged.
+        """
+        if not self.display.show_fps:
+            return None
+        shown = self._stable_fps(name, self.displayed_fps(name))
+        source = self._stable_fps(f"{name}\x00src", snap.fps)
+        if not shown:
+            return "-- fps"
+        if source and abs(source - shown) >= 2:
+            return f"{shown:d}/{source:d} fps"
+        return f"{shown:2d} fps"
+
+    def _tile_cache_key(
+        self,
+        snap: Snapshot,
+        name: str,
+        width: int,
+        height: int,
+        *,
+        mode: str,
+        overlay: bool,
+        fps_text: str | None,
+    ) -> tuple:
+        """Everything that changes a tile's pixels, so equality means "reuse"."""
+        return (
+            snap.frame_key,
+            snap.frame is not None,
+            width,
+            height,
+            mode,
+            overlay,
+            snap.status,
+            snap.detail,
+            snap.rewinding,
+            round(float(snap.behind), 1),
+            fps_text,
+            self._door_active.get(name, ""),
+            self._zone_edit_name == name,
+            bool(self.display.show_labels),
+            round(float(self.display.hud_opacity), 3),
+            self._hud_quality,
+        )
 
     def _render_cell(
         self,
@@ -1574,30 +1711,64 @@ class MosaicApp:
         height: int,
         *,
         overlay: bool = True,
+        owned: bool = False,
     ) -> np.ndarray:
+        """
+        Build one camera tile.
+
+        ``owned=True`` promises the caller may draw on the result, so a cached
+        tile is handed back as a copy. Everyone else blits the tile into a
+        canvas and must not mutate it.
+        """
+        cam = self._camera_by_name.get(name)
+        want_people = bool(
+            not self._safe_mode
+            and cam is not None
+            and (
+                (self.display.people_detection and cam.detect_people)
+                or (self.display.encroachment_detection and cam.detect_encroachment)
+            )
+        )
+        want_objects = bool(
+            not self._safe_mode
+            and cam is not None
+            and self.display.object_detection
+            and cam.detect_objects
+        )
+        editing_this = self._zone_edit_name == name
+        encroach_on = bool(
+            cam is not None
+            and (
+                editing_this
+                or (self.display.encroachment_detection and cam.detect_encroachment)
+            )
+        )
+        active = bool(self._encroach_active.get(name))
+        draft = (
+            self._zone_edit_points
+            if self._zone_edit_name == name and self._zone_edit_points
+            else None
+        )
+        mode = self.display.scale_mode if self.view_zoom <= 1.001 else "fill"
+        fps_text = self._cell_fps_text(name, snap) if overlay else None
+
+        # Detection boxes and the encroachment pulse change without the frame
+        # changing, so those tiles are always rebuilt. Plain video is not.
+        animated = bool(want_people or want_objects or encroach_on or draft or active)
+        key = None
+        if self.display.adaptive_render and not animated:
+            key = self._tile_cache_key(
+                snap, name, width, height, mode=mode, overlay=overlay, fps_text=fps_text
+            )
+            cached = self._tile_cache.get(name)
+            if cached is not None and cached[0] == key:
+                return cached[1].copy() if owned else cached[1]
+
         if snap.frame is None:
             message = snap.detail or snap.status.replace("_", " ")
             tile = placeholder(width, height, name, message.upper() or "NO SIGNAL")
         else:
             frame = snap.frame
-            cam = self._camera_by_name.get(name)
-            want_people = bool(
-                not self._safe_mode
-                and cam is not None
-                and (
-                    (self.display.people_detection and cam.detect_people)
-                    or (
-                        self.display.encroachment_detection
-                        and cam.detect_encroachment
-                    )
-                )
-            )
-            want_objects = bool(
-                not self._safe_mode
-                and cam is not None
-                and self.display.object_detection
-                and cam.detect_objects
-            )
             boxes: list = []
             if cam is not None and (want_people or want_objects):
                 boxes = self._detection.process(
@@ -1606,23 +1777,6 @@ class MosaicApp:
                     detect_people=want_people,
                     detect_objects=want_objects,
                 )
-            editing_this = self._zone_edit_name == name
-            encroach_on = bool(
-                cam is not None
-                and (
-                    editing_this
-                    or (
-                        self.display.encroachment_detection
-                        and cam.detect_encroachment
-                    )
-                )
-            )
-            active = bool(self._encroach_active.get(name))
-            draft = (
-                self._zone_edit_points
-                if self._zone_edit_name == name and self._zone_edit_points
-                else None
-            )
             if boxes or encroach_on or draft:
                 frame = frame.copy()
                 if encroach_on and cam is not None:
@@ -1637,7 +1791,6 @@ class MosaicApp:
                     draw_zones(frame, [], draft_points=draft)
                 if boxes:
                     draw_boxes(frame, boxes)
-            mode = self.display.scale_mode if self.view_zoom <= 1.001 else "fill"
             tile = scale_frame(frame, width, height, mode)
             if active:
                 pulse = 0.55 + 0.45 * abs(math.sin(time.monotonic() * 6.0))
@@ -1648,16 +1801,25 @@ class MosaicApp:
                     strong=bool(self.display.encroachment_alarm),
                 )
         if overlay:
-            self._draw_cell_overlay(tile, snap, name)
+            self._draw_cell_overlay(tile, snap, name, fps_text=fps_text)
+        if key is not None:
+            self._tile_cache[name] = (key, tile)
+            if owned:
+                return tile.copy()
         return tile
 
-    def _draw_cell_overlay(self, tile: np.ndarray, snap: Snapshot, name: str) -> None:
+    def _draw_cell_overlay(
+        self,
+        tile: np.ndarray,
+        snap: Snapshot,
+        name: str,
+        *,
+        fps_text: str | None = None,
+    ) -> None:
         if not self.display.show_labels:
             return
-        fps_text = None
-        if self.display.show_fps:
-            shown = self._stable_fps(name, snap.fps)
-            fps_text = f"{shown:2d} fps" if shown else "-- fps"
+        if fps_text is None:
+            fps_text = self._cell_fps_text(name, snap)
         alert = bool(self._encroach_active.get(name))
         door_label = self._door_active.get(name, "")
         draw_status_bar(
@@ -1856,7 +2018,7 @@ class MosaicApp:
         if self._menu_page in _HA_SEARCH_PAGES and self._handle_ha_search_key(ch):
             return
         if ch in (ord("q"), ord("Q")):
-            if self._menu_page == "decode_status":
+            if self._menu_page in {"decode_status", "render_status"}:
                 self._menu_page = "video"
                 self._menu_index = 0
                 return
@@ -1973,7 +2135,7 @@ class MosaicApp:
             self._ha_pending_entity = ""
             self._ha_pending_camera = ""
             return
-        if self._menu_open and self._menu_page == "decode_status":
+        if self._menu_open and self._menu_page in {"decode_status", "render_status"}:
             self._menu_page = "video"
             self._menu_index = 0
             return
@@ -2153,10 +2315,42 @@ class MosaicApp:
                     ),
                 ),
                 ("decode_status", "Decode status…"),
+                menu_section("Performance"),
+                ("target_fps", f"Target FPS: {d.fps}  (painting {self._ui_fps:.0f})"),
+                ("frame_history", f"Clip buffer: {history_mode_label(d.frame_history)}"),
+                ("hud_quality", f"HUD quality: {hud_quality_label(d.hud_quality)}"),
+                (
+                    "adaptive_render",
+                    "Skip idle repaints: "
+                    + ("On" if d.adaptive_render else "Off — repaint every frame"),
+                ),
+                ("render_status", "Rendering status…"),
                 menu_section("Overlay"),
                 ("hud_opacity", f"HUD opacity: {opacity_label(d.hud_opacity)}"),
                 ("video_back", "Back"),
             ]
+        if self._menu_page == "render_status":
+            d = self.display
+            items: list[tuple[str, str]] = [
+                ("render_ui", f"Window: {self._ui_fps:.1f} fps painted (target {d.fps})"),
+                (
+                    "render_hud",
+                    f"HUD: {self._hud_quality}   clip buffer: "
+                    f"{resolve_history_mode(d.frame_history)}",
+                ),
+                menu_section("Per camera — shown vs decoded"),
+            ]
+            for source in self.sources:
+                snap = source.snapshot(copy=False)
+                shown = self.displayed_fps(source.name)
+                items.append(
+                    (
+                        f"render_cam:{source.name}",
+                        f"{source.name}: {shown:.0f} shown / {snap.fps:.0f} decoded",
+                    )
+                )
+            items.append(("render_status_back", "Back"))
+            return items
         if self._menu_page == "decode_status":
             items: list[tuple[str, str]] = [
                 ("decode_summary", opencv_decode_summary()[:70]),
@@ -3552,6 +3746,28 @@ class MosaicApp:
             self._adjust_menu_item("hud_opacity", 1)
         elif action == "power_mode":
             self._adjust_menu_item("power_mode", 1)
+        elif action in {"target_fps", "frame_history", "hud_quality"}:
+            self._adjust_menu_item(action, 1)
+        elif action == "adaptive_render":
+            self._set_adaptive_render(not self.display.adaptive_render)
+        elif action == "render_status":
+            self._menu_page = "render_status"
+            self._menu_index = 0
+            self._reboot_notice = (
+                "Shown = frames actually painted; decoded = frames off the stream"
+            )
+        elif action == "render_status_back":
+            self._menu_page = "video"
+            self._menu_index = 0
+        elif action.startswith("render_cam:"):
+            name = action.split(":", 1)[1]
+            source = next((s for s in self.sources if s.name == name), None)
+            if source is not None:
+                snap = source.snapshot(copy=False)
+                self._reboot_notice = (
+                    f"{name}: painting {self.displayed_fps(name):.1f} fps of the "
+                    f"{snap.fps:.1f} fps this camera is decoding"
+                )
         elif action == "decode_status":
             self._menu_page = "decode_status"
             self._menu_index = 0
@@ -3690,6 +3906,25 @@ class MosaicApp:
             )
             self._apply_buffer_settings(persist=True)
             self._reboot_notice = f"HUD opacity {opacity_label(self.display.hud_opacity)}"
+        elif action == "target_fps":
+            self.display.fps = int(next_from(TARGET_FPS_CHOICES, self.display.fps, step))
+            self._pacer.set_target_fps(float(self.display.fps))
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = f"Target {self.display.fps} fps"
+        elif action == "frame_history":
+            self.display.frame_history = next_from(
+                HISTORY_MODE_CHOICES, self.display.frame_history, step
+            )
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = history_mode_label(self.display.frame_history)
+        elif action == "hud_quality":
+            self.display.hud_quality = next_from(
+                HUD_QUALITY_CHOICES, self.display.hud_quality, step
+            )
+            self._apply_buffer_settings(persist=True)
+            self._reboot_notice = hud_quality_label(self.display.hud_quality)
+        elif action == "adaptive_render":
+            self._set_adaptive_render(not self.display.adaptive_render)
         elif action == "power_mode":
             modes = POWER_MODE_CHOICES
             try:
@@ -4350,6 +4585,14 @@ class MosaicApp:
         self._reboot_notice = f"Baseline saved: {path.name}"
         print(f"Baseline for {cam.name} → {path}")
 
+    def _set_adaptive_render(self, enabled: bool) -> None:
+        self.display.adaptive_render = bool(enabled)
+        self._tile_cache.clear()
+        self._apply_buffer_settings(persist=True)
+        self._reboot_notice = (
+            "Idle repaints skipped" if enabled else "Repainting every tile every frame"
+        )
+
     def _set_smooth_buffer(self, enabled: bool) -> None:
         previous = self.display.smooth_buffer
         self.display.smooth_buffer = bool(enabled)
@@ -4377,6 +4620,11 @@ class MosaicApp:
         extras = self._extras_enabled
         if self.display.auto_person_capture:
             history_clip = max(history_clip, float(self.display.person_pre_roll_seconds))
+        # Low power / safe mode already drop the features that read the rolling
+        # store, so stop paying to fill it as well.
+        history_mode = self.display.frame_history if extras else "off"
+        self._hud_quality = set_hud_quality(self.display.hud_quality)
+        self._tile_cache.clear()
         for source in self.sources:
             source.apply_buffer_settings(self.display)
             source.history.configure(
@@ -4385,6 +4633,7 @@ class MosaicApp:
                 rewind_enabled=bool(self.display.rewind_buffer and extras),
                 rewind_seconds=self.display.rewind_buffer_seconds,
                 clip_seconds=history_clip,
+                history_mode=history_mode,
             )
         self._configure_weather_service()
         self._configure_ha_service()
@@ -4757,6 +5006,9 @@ class MosaicApp:
         self.cameras = self.config.visible_cameras()
         self._camera_by_name = {cam.name: cam for cam in self.cameras}
         self.sources = build_sources(self.cameras, self.display)
+        self._tile_cache.clear()
+        self._shown_meters.clear()
+        self._shown_keys.clear()
         for source in self.sources:
             source.start()
             source.apply_buffer_settings(self.display)
@@ -5551,7 +5803,7 @@ class MosaicApp:
         job = self._reboot_job
         if job is None:
             return canvas
-        canvas[:] = (canvas.astype(np.float32) * 0.38).astype(np.uint8)
+        canvas[:] = dim_image(canvas, 0.38)
         rows = job.rows()
         card_w = min(canvas.shape[1] - 24, 920)
         row_h = 36
@@ -5660,11 +5912,12 @@ class MosaicApp:
             "events_play",
         }
         if dim_background and self._menu_page not in preview_pages:
-            canvas[:] = (canvas.astype(np.float32) * 0.36).astype(np.uint8)
+            canvas[:] = dim_image(canvas, 0.36)
         items = self._menu_items()
         wide = self._menu_page in {
             "video",
             "decode_status",
+            "render_status",
             "capture",
             "detection",
             "detection_cams",
@@ -5691,7 +5944,8 @@ class MosaicApp:
         }
         card_w, row_h, header_h, pad = (
             720
-            if self._menu_page in {"decode_status", "ha_entities", "ha_doors", "ha_notify"}
+            if self._menu_page
+            in {"decode_status", "render_status", "ha_entities", "ha_doors", "ha_notify"}
             else 600
             if wide
             else 520
@@ -5714,6 +5968,7 @@ class MosaicApp:
             "reboot_confirm": "Confirm reboot",
             "video": "Video & decode",
             "decode_status": "Decode status",
+            "render_status": "Rendering status",
             "capture": "Capture",
             "detection": "Detection",
             "detection_cams": "Cameras for detection",
@@ -5818,6 +6073,8 @@ class MosaicApp:
             return "Enter toggle/cycle    ← → adjust    Esc back"
         if self._menu_page == "decode_status":
             return "Per-camera decode path    Esc back"
+        if self._menu_page == "render_status":
+            return "Displayed vs decoded frame rate    Esc back"
         if self._menu_page == "weather":
             return "Place on layout…    ← → adjust    Esc back"
         if self._menu_page == "ha":
@@ -6356,6 +6613,15 @@ class MosaicApp:
             min(max(x / max(ww, 1), 0.0), 1.0),
             min(max(y / max(wh, 1), 0.0), 1.0),
         )
+
+
+def dim_image(image: np.ndarray, factor: float) -> np.ndarray:
+    """Darken a whole canvas.
+
+    ``convertScaleAbs`` does this in one saturating pass; the float32 round
+    trip it replaces allocated two full-canvas temporaries per call.
+    """
+    return cv2.convertScaleAbs(image, alpha=float(factor), beta=0.0)
 
 
 def scale_frame(frame: np.ndarray, cell_w: int, cell_h: int, mode: str) -> np.ndarray:
