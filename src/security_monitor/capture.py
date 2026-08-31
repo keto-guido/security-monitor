@@ -251,6 +251,49 @@ def load_capture_preview(path: Path, *, max_edge: int = 1280) -> np.ndarray | No
     return frame
 
 
+def copy_to_clipboard(text: str) -> None:
+    """Copy text to the system clipboard."""
+    import os
+    import subprocess
+    import sys
+
+    payload = (text or "").strip()
+    if not payload:
+        raise CaptureError("Nothing to copy")
+    try:
+        if os.name == "nt":
+            subprocess.run(  # noqa: S603
+                ["clip"],
+                input=payload,
+                text=True,
+                check=True,
+                shell=True,
+            )
+        elif sys.platform == "darwin":
+            subprocess.run(  # noqa: S603
+                ["pbcopy"],
+                input=payload.encode("utf-8"),
+                check=True,
+            )
+        else:
+            for cmd in (
+                ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"],
+            ):
+                try:
+                    subprocess.run(  # noqa: S603
+                        cmd,
+                        input=payload.encode("utf-8"),
+                        check=True,
+                    )
+                    return
+                except (FileNotFoundError, subprocess.CalledProcessError):
+                    continue
+            raise OSError("no clipboard tool found (install xclip or xsel)")
+    except OSError as exc:
+        raise CaptureError(f"Could not copy to clipboard: {exc}") from exc
+
+
 def reveal_in_file_manager(path: Path) -> str:
     """Open the captures folder (or parent of a file) in the OS file manager."""
     import os

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from security_monitor.home_assistant import DoorState
@@ -146,13 +146,135 @@ class WebhookSnapshot:
             return f"Listening :{self.port}{extra}"
         return "Webhooks: off"
 
-    def receive_url(self, path: str = "") -> str:
-        if not self.listening:
+    def receive_url(self, path: str = "", *, secret: str = "") -> str:
+        if not self.listening or not self.port:
             return ""
-        host = self.host if self.host not in {"0.0.0.0", "::", ""} else "127.0.0.1"
-        slug = slugify_path(path)
-        suffix = f"/{slug}" if slug else ""
-        return f"http://{host}:{self.port}/webhook{suffix}"
+        return format_webhook_receive_url(
+            self.host,
+            self.port,
+            path,
+            secret=secret,
+        )
+
+
+def guess_lan_ip() -> str:
+    """Best-effort local IPv4 for URLs sent by other devices on the network."""
+    import socket
+
+    def _valid(ip: str) -> bool:
+        if not ip or ip.startswith("127."):
+            return False
+        parts = ip.split(".")
+        return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+    # Default-route trick (works on most LANs).
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ip = str(sock.getsockname()[0])
+            if _valid(ip):
+                return ip
+    except OSError:
+        pass
+
+    # Probe common private gateways (no packets need to arrive).
+    for probe in ("192.168.1.1", "192.168.0.1", "192.168.10.1", "10.0.0.1"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect((probe, 1))
+                ip = str(sock.getsockname()[0])
+                if _valid(ip):
+                    return ip
+        except OSError:
+            continue
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = str(info[4][0])
+            if _valid(ip):
+                return ip
+    except OSError:
+        pass
+
+    return ""
+
+
+def resolve_webhook_public_host(bind_host: str) -> str:
+    """Host for URLs copied to remote senders — always prefer this PC's LAN IP."""
+    host = (bind_host or "0.0.0.0").strip() or "0.0.0.0"
+    lan = guess_lan_ip()
+    if lan:
+        return lan
+    if host not in {"0.0.0.0", "::", "", "127.0.0.1", "localhost"}:
+        return host
+    return "127.0.0.1"
+
+
+def webhook_bind_blocks_remote(bind_host: str) -> bool:
+    host = (bind_host or "0.0.0.0").strip() or "0.0.0.0"
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def format_webhook_receive_url(
+    host: str,
+    port: int,
+    path: str = "",
+    *,
+    secret: str = "",
+) -> str:
+    """Build the POST URL shown/copied for incoming webhooks."""
+    display_host = resolve_webhook_public_host(host)
+    port_num = int(port or 8765)
+    slug = slugify_path(path)
+    suffix = f"/{slug}" if slug else ""
+    url = f"http://{display_host}:{port_num}/webhook{suffix}"
+    token = (secret or "").strip()
+    if token:
+        url = f"{url}?{urlencode({'token': token})}"
+    return url
+
+
+def webhook_json_body(*, state: str = "open") -> str:
+    """JSON payload for webhook body fields (Synology, HA, etc.)."""
+    return json.dumps({"state": state})
+
+
+def format_webhook_sendto_copy(url: str, *, state: str = "open") -> str:
+    """Clipboard text: URL line + JSON body line for sending-app setup."""
+    target = (url or "").strip()
+    body = webhook_json_body(state=state)
+    if not target:
+        return body
+    return f"{target}\n{body}"
+
+
+def webhook_curl_example(url: str, *, state: str = "open") -> str:
+    """Return a curl one-liner for terminal testing (not for webhook body fields)."""
+    target = (url or "").strip()
+    if not target:
+        return ""
+    body = webhook_json_body(state=state)
+    return (
+        f'curl -X POST "{target}" '
+        f'-H "Content-Type: application/json" '
+        f"-d '{body}'"
+    )
+
+
+def webhook_setup_hint(
+    *,
+    enabled: bool,
+    listening: bool,
+    mapping_count: int,
+) -> str:
+    """Short next-step guidance for the webhook setup menu."""
+    if not enabled:
+        return "Next: turn on Receive alerts"
+    if not listening:
+        return "Next: check Listener settings (port / status)"
+    if mapping_count <= 0:
+        return "Next: Quick setup or add an alert route"
+    return "Next: open a route → Copy URL → paste in sending app"
 
 
 def webhook_mapping_to_dict(item: WebhookMapping) -> dict[str, Any]:

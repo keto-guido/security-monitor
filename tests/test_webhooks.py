@@ -15,14 +15,21 @@ from security_monitor.webhooks import (
     WebhookMapping,
     WebhookService,
     fire_outgoing_webhooks,
+    format_webhook_receive_url,
+    format_webhook_sendto_copy,
+    resolve_webhook_public_host,
+    webhook_bind_blocks_remote,
     parse_incoming_webhooks,
     parse_outgoing_webhooks,
     parse_webhook_action,
     slugify_path,
     toggle_outgoing_event,
     unique_webhook_path,
+    webhook_curl_example,
     webhook_entity_id,
+    webhook_json_body,
     webhook_open_edges,
+    webhook_setup_hint,
 )
 from security_monitor.home_assistant import DoorState
 
@@ -121,6 +128,63 @@ def test_config_webhook_roundtrip(tmp_path) -> None:
     assert "bell" in text
     with pytest.raises(ConfigError):
         parse_config({"display": {"webhook_incoming": "nope"}, "cameras": []})
+
+
+def test_format_webhook_receive_url_without_listener(monkeypatch) -> None:
+    monkeypatch.setattr("security_monitor.webhooks.guess_lan_ip", lambda: "192.168.10.116")
+    url = format_webhook_receive_url("0.0.0.0", 8765, "front_door", secret="tok")
+    assert url == "http://192.168.10.116:8765/webhook/front_door?token=tok"
+    url_local_bind = format_webhook_receive_url("127.0.0.1", 9123, "porch", secret="s")
+    assert url_local_bind.startswith("http://192.168.10.116:9123/webhook/porch")
+    assert format_webhook_receive_url("192.168.1.10", 9123, "") == "http://192.168.10.116:9123/webhook"
+
+
+def test_resolve_webhook_public_host_prefers_lan(monkeypatch) -> None:
+    monkeypatch.setattr("security_monitor.webhooks.guess_lan_ip", lambda: "192.168.10.116")
+    assert resolve_webhook_public_host("127.0.0.1") == "192.168.10.116"
+    assert resolve_webhook_public_host("0.0.0.0") == "192.168.10.116"
+    assert webhook_bind_blocks_remote("127.0.0.1") is True
+    assert webhook_bind_blocks_remote("0.0.0.0") is False
+
+
+def test_webhook_json_body() -> None:
+    assert webhook_json_body() == '{"state": "open"}'
+    assert webhook_json_body(state="closed") == '{"state": "closed"}'
+    assert "-d" not in webhook_json_body()
+
+
+def test_format_webhook_sendto_copy() -> None:
+    text = format_webhook_sendto_copy(
+        "http://192.168.1.5:9123/webhook/porch?token=abc"
+    )
+    lines = text.splitlines()
+    assert lines[0] == "http://192.168.1.5:9123/webhook/porch?token=abc"
+    assert lines[1] == '{"state": "open"}'
+
+
+def test_receive_url_includes_secret_token() -> None:
+    service = WebhookService()
+    service.configure(enabled=True, host="127.0.0.1", port=0, secret="s3cret")
+    try:
+        snap = service.snapshot
+        assert snap.listening
+        url = snap.receive_url("front_door", secret="s3cret")
+        assert f":{snap.port}/webhook/front_door?" in url
+        assert "token=s3cret" in url
+        assert not url.startswith("http://127.0.0.1:")
+    finally:
+        service.stop()
+
+
+def test_webhook_curl_example_and_setup_hint() -> None:
+    url = "http://127.0.0.1:8765/webhook/front?token=abc"
+    curl = webhook_curl_example(url)
+    assert "curl -X POST" in curl
+    assert url in curl
+    assert '"state"' in curl and "open" in curl
+    assert webhook_setup_hint(enabled=False, listening=False, mapping_count=0).startswith("Next:")
+    assert "alert route" in webhook_setup_hint(enabled=True, listening=True, mapping_count=0).lower()
+    assert "copy" in webhook_setup_hint(enabled=True, listening=True, mapping_count=2).lower()
 
 
 def test_webhook_service_http_roundtrip() -> None:

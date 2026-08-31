@@ -11,6 +11,7 @@ from security_monitor.buffer import FrameHistory
 from security_monitor.capture import (
     CaptureError,
     LiveClipJob,
+    copy_to_clipboard,
     delete_capture,
     list_captures,
     load_capture_preview,
@@ -107,3 +108,23 @@ def test_history_export_and_config(tmp_path: Path) -> None:
     resolved = resolve_save_directory(cfg.display.save_directory)
     assert resolved == (tmp_path / "out").resolve()
     assert resolved.is_dir()
+
+
+def test_copy_to_clipboard_rejects_empty() -> None:
+    with pytest.raises(CaptureError, match="Nothing to copy"):
+        copy_to_clipboard("   ")
+
+
+def test_copy_to_clipboard_windows(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def _run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["input"] = kwargs.get("input")
+        seen["text"] = kwargs.get("text")
+
+    monkeypatch.setattr("subprocess.run", _run)
+    copy_to_clipboard("http://127.0.0.1:8765/webhook/front")
+    assert seen["cmd"] == ["clip"]
+    assert seen["input"] == "http://127.0.0.1:8765/webhook/front"
+    assert seen["text"] is True

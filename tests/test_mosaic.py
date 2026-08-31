@@ -15,7 +15,9 @@ from security_monitor.mosaic import (
     fallback_canvas,
     first_selectable_index,
     is_menu_header,
+    is_menu_info,
     magnify,
+    menu_info,
     menu_section,
     menu_should_pause_decode,
     placeholder,
@@ -134,6 +136,10 @@ def test_menu_sections_are_headers() -> None:
     assert is_menu_header(action)
     assert label == "Cameras"
     assert not is_menu_header("cameras")
+    info_action, info_label = menu_info("Helper text")
+    assert is_menu_info(info_action)
+    assert info_label == "Helper text"
+    assert is_menu_info("cameras") is False
     assert _menu_action_cycles("layout")
     assert _menu_action_cycles("clip_length")
     assert not _menu_action_cycles("cameras")
@@ -144,20 +150,21 @@ def test_menu_navigation_skips_headers() -> None:
     items = [
         menu_section("Cameras"),
         ("cameras", "Cameras…"),
+        menu_info("Pick a camera to configure"),
         menu_section("Media"),
         ("capture", "Capture…"),
         ("exit", "Exit"),
     ]
     assert first_selectable_index(items) == 1
-    assert first_selectable_index(items, start=2) == 3
-    assert step_menu_index(items, 1, 1) == 3
-    assert step_menu_index(items, 3, 1) == 4
-    assert step_menu_index(items, 4, 1) == 1
-    assert step_menu_index(items, 1, -1) == 4
+    assert first_selectable_index(items, start=2) == 4
+    assert step_menu_index(items, 1, 1) == 4
+    assert step_menu_index(items, 4, 1) == 5
+    assert step_menu_index(items, 5, 1) == 1
+    assert step_menu_index(items, 1, -1) == 5
     assert selectable_menu_entries(items) == [
         (1, "cameras"),
-        (3, "capture"),
-        (4, "exit"),
+        (4, "capture"),
+        (5, "exit"),
     ]
 
 

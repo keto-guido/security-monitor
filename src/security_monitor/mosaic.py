@@ -76,6 +76,7 @@ from security_monitor.capture import (
     CaptureError,
     CaptureItem,
     LiveClipJob,
+    copy_to_clipboard,
     default_save_directory,
     delete_capture,
     delete_captures,
@@ -167,10 +168,17 @@ from security_monitor.webhooks import (
     WebhookMapping,
     WebhookService,
     fire_outgoing_webhooks,
+    format_webhook_receive_url,
+    format_webhook_sendto_copy,
+    resolve_webhook_public_host,
     slugify_path,
     toggle_outgoing_event,
     unique_webhook_path,
+    webhook_bind_blocks_remote,
+    webhook_curl_example,
+    webhook_json_body,
     webhook_open_edges,
+    webhook_setup_hint,
 )
 from security_monitor.overlay import (
     HUD_QUALITY_CHOICES,
@@ -347,6 +355,8 @@ _NESTED_MENU_PAGES = frozenset(
         "ha_lights",
         "ha_light_pick",
         "webhooks",
+        "webhooks_setup",
+        "webhooks_listen",
         "webhooks_in",
         "webhooks_in_edit",
         "webhooks_in_camera",
@@ -389,8 +399,10 @@ STATUS_COLOR = {
 }
 
 MENU_HEADER_PREFIX = "hdr:"
+MENU_INFO_PREFIX = "info:"
 MENU_ROW_H = 42
 MENU_HEADER_H = 26
+MENU_INFO_H = 30
 _HA_ENTITY_LIST_CAP = 80
 _HA_SEARCH_PAGES = frozenset({"ha_entities", "ha_light_pick"})
 
@@ -417,8 +429,20 @@ def menu_section(title: str) -> tuple[str, str]:
     return (f"{MENU_HEADER_PREFIX}{title}", title)
 
 
+def menu_info(text: str) -> tuple[str, str]:
+    return (f"{MENU_INFO_PREFIX}{text}", text)
+
+
 def is_menu_header(action: str) -> bool:
     return action.startswith(MENU_HEADER_PREFIX)
+
+
+def is_menu_info(action: str) -> bool:
+    return action.startswith(MENU_INFO_PREFIX)
+
+
+def is_menu_non_selectable(action: str) -> bool:
+    return is_menu_header(action) or is_menu_info(action)
 
 
 def _menu_action_cycles(action: str) -> bool:
@@ -429,9 +453,17 @@ def _menu_action_cycles(action: str) -> bool:
 
 
 def menu_row_height(
-    action: str, *, row_h: int = MENU_ROW_H, header_h: int = MENU_HEADER_H
+    action: str,
+    *,
+    row_h: int = MENU_ROW_H,
+    header_h: int = MENU_HEADER_H,
+    info_h: int = MENU_INFO_H,
 ) -> int:
-    return header_h if is_menu_header(action) else row_h
+    if is_menu_header(action):
+        return header_h
+    if is_menu_info(action):
+        return info_h
+    return row_h
 
 
 def first_selectable_index(items: list[tuple[str, str]], start: int = 0) -> int:
@@ -440,10 +472,10 @@ def first_selectable_index(items: list[tuple[str, str]], start: int = 0) -> int:
     n = len(items)
     start = min(max(0, start), n - 1)
     for i in range(start, n):
-        if not is_menu_header(items[i][0]):
+        if not is_menu_non_selectable(items[i][0]):
             return i
     for i in range(start):
-        if not is_menu_header(items[i][0]):
+        if not is_menu_non_selectable(items[i][0]):
             return i
     return start
 
@@ -459,7 +491,7 @@ def step_menu_index(items: list[tuple[str, str]], index: int, delta: int) -> int
     i = index
     for _ in range(n):
         i = (i + direction) % n
-        if not is_menu_header(items[i][0]):
+        if not is_menu_non_selectable(items[i][0]):
             return i
     return index
 
@@ -469,7 +501,7 @@ def selectable_menu_entries(items: list[tuple[str, str]]) -> list[tuple[int, str
     return [
         (i, action)
         for i, (action, _label) in enumerate(items)
-        if not is_menu_header(action)
+        if not is_menu_non_selectable(action)
     ]
 
 
@@ -480,6 +512,7 @@ def visible_menu_range(
     *,
     row_h: int = MENU_ROW_H,
     header_h: int = MENU_HEADER_H,
+    info_h: int = MENU_INFO_H,
 ) -> tuple[int, int]:
     """Inclusive-start, exclusive-end slice that keeps ``selected`` on screen."""
     n = len(items)
@@ -488,7 +521,7 @@ def visible_menu_range(
     selected = min(max(0, selected), n - 1)
 
     def height(i: int) -> int:
-        return header_h if is_menu_header(items[i][0]) else row_h
+        return menu_row_height(items[i][0], row_h=row_h, header_h=header_h, info_h=info_h)
 
     if sum(height(i) for i in range(n)) <= max_height:
         return 0, n
@@ -790,6 +823,100 @@ class MosaicApp:
         self._wh_out_draft = None
         self._wh_out_edit_index = None
 
+    def _webhook_receive_url(self, path: str = "") -> str:
+        d = self.display
+        if not d.webhook_enabled:
+            return ""
+        snap = self._webhooks.snapshot
+        secret = (d.webhook_secret or "").strip()
+        host = snap.host if snap.listening else (d.webhook_listen_host or "0.0.0.0")
+        port = snap.port if snap.listening and snap.port else int(d.webhook_listen_port or 8765)
+        return format_webhook_receive_url(host, port, path, secret=secret)
+
+    def _ensure_webhook_listener(self) -> None:
+        if self.display.webhook_enabled:
+            self._configure_webhook_service()
+
+    def _copy_webhook_url(self, path: str = "") -> None:
+        if not self.display.webhook_enabled:
+            self._reboot_notice = "Turn on Receive alerts first"
+            return
+        self._ensure_webhook_listener()
+        url = self._webhook_receive_url(path)
+        if not url:
+            self._reboot_notice = "Could not build webhook URL"
+            return
+        payload = format_webhook_sendto_copy(url)
+        try:
+            copy_to_clipboard(payload)
+        except CaptureError as exc:
+            self._reboot_notice = str(exc)
+            return
+        body = webhook_json_body()
+        shown = url if len(url) <= 48 else f"{url[:47]}…"
+        notice = f"Copied URL + body — URL field: {shown} · Body: {body}"
+        bind_host = self.display.webhook_listen_host or "0.0.0.0"
+        if webhook_bind_blocks_remote(bind_host):
+            notice += " · Bind is localhost — set Listener Bind to 0.0.0.0"
+        snap = self._webhooks.snapshot
+        if not snap.listening:
+            if not self._extras_enabled:
+                notice += " (paused: safe mode / low power)"
+            elif snap.error:
+                notice += f" (listener: {snap.error[:28]})"
+            else:
+                notice += " (listener starting…)"
+        self._reboot_notice = notice
+
+    def _copy_webhook_curl(self, path: str = "", *, state: str = "open") -> None:
+        if not self.display.webhook_enabled:
+            self._reboot_notice = "Turn on Receive alerts first"
+            return
+        self._ensure_webhook_listener()
+        url = self._webhook_receive_url(path)
+        if not url:
+            self._reboot_notice = "Could not build webhook URL"
+            return
+        command = webhook_curl_example(url, state=state)
+        if not command:
+            self._reboot_notice = "Nothing to copy"
+            return
+        try:
+            copy_to_clipboard(command)
+        except CaptureError as exc:
+            self._reboot_notice = str(exc)
+            return
+        self._reboot_notice = "Copied curl command — for terminal only, not Synology Body field"
+
+    def _start_webhook_quick_setup(self) -> None:
+        if not self.display.webhook_enabled:
+            self.display.webhook_enabled = True
+            self._configure_webhook_service()
+            self._apply_buffer_settings(persist=True)
+        self._prompt = TextPrompt(
+            title="What should trigger an alert? (e.g. Front door)",
+            kind="webhook_quick_name",
+            value="",
+        )
+
+    def _begin_webhook_quick_mapping(self, name: str) -> None:
+        text = (name or "").strip()
+        if not text:
+            self._reboot_notice = "Name required"
+            return
+        slug = slugify_path(text) or unique_webhook_path(
+            [m.slug for m in self.display.webhook_incoming],
+            "alert",
+        )
+        self._wh_draft = WebhookMapping(path=slug, label=text)
+        self._wh_edit_index = None
+        self._menu_page = "webhooks_in_edit"
+        self._menu_index = 0
+        self._copy_webhook_url(slug)
+        self._reboot_notice = (
+            "Quick setup: URL copied — paste in sending app, link a camera, Save"
+        )
+
     def _edit_webhook_mapping(self, index: int) -> None:
         if index < 0 or index >= len(self.display.webhook_incoming):
             return
@@ -820,7 +947,7 @@ class MosaicApp:
             self._wh_draft.path = slug
         self._menu_page = "webhooks_in_edit"
         self._menu_index = 0
-        self._reboot_notice = f"POST /webhook/{slug}"
+        self._reboot_notice = f"Route /webhook/{slug} — copy send-to URL next"
 
     def _save_webhook_draft(self) -> None:
         draft = self._wh_draft
@@ -841,7 +968,7 @@ class MosaicApp:
             self.display.webhook_incoming.append(draft)
         self._configure_webhook_service()
         self._apply_buffer_settings(persist=True)
-        self._reboot_notice = f"Saved /webhook/{draft.slug}"
+        self._reboot_notice = f"Saved {draft.display_label} — copy URL if you have not yet"
         self._reset_webhook_wizard()
         self._menu_page = "webhooks_in"
         self._menu_index = 0
@@ -2081,7 +2208,7 @@ class MosaicApp:
                 self._menu_page = "webhooks_out"
                 self._menu_index = 0
                 return
-            if self._menu_page in {"webhooks_in", "webhooks_out"}:
+            if self._menu_page in {"webhooks_in", "webhooks_out", "webhooks_setup", "webhooks_listen"}:
                 self._reset_webhook_wizard()
                 self._menu_page = "webhooks"
                 self._menu_index = 0
@@ -2201,7 +2328,7 @@ class MosaicApp:
             self._menu_page = "webhooks_out"
             self._menu_index = 0
             return
-        if self._menu_open and self._menu_page in {"webhooks_in", "webhooks_out"}:
+        if self._menu_open and self._menu_page in {"webhooks_in", "webhooks_out", "webhooks_setup", "webhooks_listen"}:
             self._reset_webhook_wizard()
             self._menu_page = "webhooks"
             self._menu_index = 0
@@ -2790,33 +2917,71 @@ class MosaicApp:
             d = self.display
             snap = self._webhooks.snapshot
             enabled = "On" if d.webhook_enabled else "Off"
+            hint = webhook_setup_hint(
+                enabled=d.webhook_enabled,
+                listening=snap.listening,
+                mapping_count=len(d.webhook_incoming),
+            )
+            return [
+                menu_section("Receive alerts"),
+                ("webhook_toggle", f"Enabled: {enabled}"),
+                menu_info(snap.status_line()[:64]),
+                menu_info(hint[:70]),
+                ("webhook_quick_setup", "Quick setup…"),
+                ("webhooks_in", f"Alert routes ({len(d.webhook_incoming)})"),
+                ("webhooks_setup", "Setup guide…"),
+                ("webhooks_listen", "Listener settings…"),
+                menu_section("Send alerts"),
+                ("webhooks_out", f"Outgoing targets ({len(d.webhook_outgoing)})"),
+                ("webhooks_back", "Back"),
+            ]
+        if self._menu_page == "webhooks_listen":
+            d = self.display
+            snap = self._webhooks.snapshot
             host = d.webhook_listen_host or "0.0.0.0"
             secret = mask_token(d.webhook_secret)
             pulse = f"{d.webhook_pulse_seconds:g}s"
             return [
-                menu_section("Listener"),
-                ("webhook_toggle", f"Incoming webhooks: {enabled}"),
-                ("webhook_status", snap.status_line()[:64]),
+                menu_section("HTTP listener"),
+                menu_info(snap.status_line()[:64]),
+                menu_info(f"Use this PC's IP ({resolve_webhook_public_host(d.webhook_listen_host)}) in copied URLs"),
                 ("webhook_host", f"Bind: {host}"),
                 ("webhook_port", f"Port: {d.webhook_listen_port}"),
                 ("webhook_secret", f"Secret: {secret}"),
-                ("webhook_pulse", f"Pulse length: {pulse}"),
-                menu_section("Routes"),
-                ("webhooks_in", f"Incoming mappings ({len(d.webhook_incoming)})"),
-                ("webhooks_out", f"Outgoing targets ({len(d.webhook_outgoing)})"),
-                ("webhooks_back", "Back"),
+                ("webhook_pulse", f"Auto-clear pulse after: {pulse}"),
+                ("webhooks_listen_back", "Back"),
+            ]
+        if self._menu_page == "webhooks_setup":
+            return [
+                menu_section("How it works"),
+                menu_info("Your sending app POSTs JSON to a URL on this PC."),
+                menu_info("Security Monitor shows the same toast / peek as HA sensors."),
+                menu_section("Setup"),
+                menu_info("1. Turn on Receive alerts"),
+                menu_info("2. Quick setup or add an alert route"),
+                menu_info("3. Copy send-to URL → paste in sending app"),
+                menu_info("4. Save route → Send test event"),
+                menu_section("Sending app"),
+                menu_info("POST · Content-Type: application/json"),
+                menu_info('Body field: line 2 from Copy URL + body'),
+                menu_info('Also works: {"state":"closed"} · {"state":"trigger"}'),
+                ("webhook_quick_setup", "Quick setup…"),
+                ("webhooks_setup_back", "Back"),
             ]
         if self._menu_page == "webhooks_in":
             items: list[tuple[str, str]] = [
-                ("webhook_in_add", "Add incoming webhook…"),
+                ("webhook_quick_setup", "Quick setup…"),
+                ("webhook_in_add", "Add alert route…"),
             ]
             if self.display.webhook_incoming:
-                items.append(menu_section("Mappings"))
+                items.append(menu_section("Routes"))
+            else:
+                items.append(menu_info("(no routes yet)"))
             snap = self._webhooks.snapshot
             open_ids = {d.entity_id.lower() for d in snap.doors if d.open}
             for index, mapping in enumerate(self.display.webhook_incoming):
                 state = "OPEN" if mapping.entity_id.lower() in open_ids else "idle"
-                cam = mapping.camera or "toast only"
+                cam = mapping.camera or "HUD only"
                 items.append(
                     (
                         f"webhook_in:{index}",
@@ -2842,14 +3007,20 @@ class MosaicApp:
             draft = self._wh_draft
             if draft is None:
                 return [("webhooks_in_back", "Back")]
-            snap = self._webhooks.snapshot
-            url = snap.receive_url(draft.slug) or f"/webhook/{draft.slug}"
+            url = self._webhook_receive_url(draft.slug) or f"/webhook/{draft.slug}"
+            url_label = url if len(url) <= 40 else f"{url[:39]}…"
             has_cam = bool(draft.camera)
             items = [
-                ("webhook_in_path", f"Path: /webhook/{draft.slug}"),
-                ("webhook_in_url", url[:64]),
+                menu_section("Paste into sending app (Synology, HA, …)"),
+                menu_info("Copy puts URL + JSON body on clipboard (2 lines)"),
+                menu_info("Line 1 → URL field · Line 2 → Body field"),
+                ("webhook_in_url", f"Copy URL + body: {url_label}"),
+                ("webhook_in_curl", "Copy terminal test (curl only)"),
+                menu_section("Route"),
                 ("webhook_in_name", f"Name: {draft.display_label}"),
+                ("webhook_in_path", f"Path: /webhook/{draft.slug}"),
                 ("webhook_in_camera_pick", f"Camera: {draft.camera or 'HUD only'}"),
+                menu_section("Notifications"),
                 ("webhook_in_popup", f"Popup toast: {'On' if draft.notify_popup else 'Off'}"),
                 ("webhook_in_hud", f"Tile note while open: {'On' if draft.notify_hud else 'Off'}"),
                 (
@@ -2864,10 +3035,10 @@ class MosaicApp:
                 ),
                 ("webhook_in_sound", f"Alarm sound: {'On' if draft.notify_sound else 'Off'}"),
                 ("webhook_in_test", "Send test event"),
-                ("webhook_in_save", "Save mapping"),
+                ("webhook_in_save", "Save route"),
             ]
             if self._wh_edit_index is not None:
-                items.append(("webhook_in_delete", "Remove this mapping"))
+                items.append(("webhook_in_delete", "Remove route"))
             items.append(("webhooks_in_edit_back", "Back"))
             return items
         if self._menu_page == "webhooks_out":
@@ -2876,6 +3047,8 @@ class MosaicApp:
             ]
             if self.display.webhook_outgoing:
                 items.append(menu_section("Targets"))
+            else:
+                items.append(menu_info("(no targets yet)"))
             for index, target in enumerate(self.display.webhook_outgoing):
                 flag = "" if target.enabled else " (off)"
                 events = ",".join(target.events) if target.events else "none"
@@ -3294,10 +3467,22 @@ class MosaicApp:
             self._configure_webhook_service()
             self._apply_buffer_settings(persist=True)
             self._reboot_notice = (
-                "Incoming webhooks on" if self.display.webhook_enabled else "Incoming webhooks off"
+                "Receive alerts on" if self.display.webhook_enabled else "Receive alerts off"
             )
-        elif action == "webhook_status":
-            self._reboot_notice = self._webhooks.snapshot.status_line()
+        elif action == "webhook_quick_setup":
+            self._start_webhook_quick_setup()
+        elif action == "webhooks_setup":
+            self._menu_page = "webhooks_setup"
+            self._menu_index = 0
+        elif action == "webhooks_setup_back":
+            self._menu_page = "webhooks"
+            self._menu_index = 0
+        elif action == "webhooks_listen":
+            self._menu_page = "webhooks_listen"
+            self._menu_index = 0
+        elif action == "webhooks_listen_back":
+            self._menu_page = "webhooks"
+            self._menu_index = 0
         elif action == "webhook_host":
             self._adjust_menu_item("webhook_host", 1)
         elif action == "webhook_port":
@@ -3319,7 +3504,7 @@ class MosaicApp:
             self._menu_index = 0
         elif action == "webhook_in_add":
             self._prompt = TextPrompt(
-                title="Webhook path (POST /webhook/<path>)",
+                title="Alert name (e.g. Front door)",
                 kind="webhook_path",
                 value="",
             )
@@ -3339,9 +3524,10 @@ class MosaicApp:
                 )
         elif action == "webhook_in_url":
             draft = self._wh_draft
-            snap = self._webhooks.snapshot
-            url = snap.receive_url(draft.slug if draft else "") or "(enable incoming first)"
-            self._reboot_notice = url
+            self._copy_webhook_url(draft.slug if draft else "")
+        elif action == "webhook_in_curl":
+            draft = self._wh_draft
+            self._copy_webhook_curl(draft.slug if draft else "")
         elif action == "webhook_in_name":
             draft = self._wh_draft
             if draft is not None:
@@ -5231,12 +5417,19 @@ class MosaicApp:
                 else "Webhook secret cleared"
             )
             return
+        if prompt.kind == "webhook_quick_name":
+            self._prompt = None
+            self._begin_webhook_quick_mapping(text)
+            return
         if prompt.kind == "webhook_path":
             self._prompt = None
             if not slugify_path(text):
-                self._reboot_notice = "Path required"
+                self._reboot_notice = "Name required"
                 return
             self._begin_webhook_mapping(text)
+            draft = self._wh_draft
+            if draft is not None and not draft.label:
+                draft.label = text.strip()
             return
         if prompt.kind == "webhook_path_edit":
             self._prompt = None
@@ -5939,6 +6132,8 @@ class MosaicApp:
             "ha_lights",
             "ha_light_pick",
             "webhooks",
+            "webhooks_setup",
+            "webhooks_listen",
             "webhooks_in",
             "webhooks_in_edit",
             "webhooks_in_camera",
@@ -5990,10 +6185,12 @@ class MosaicApp:
             "ha_lights": "Light panel",
             "ha_light_pick": "Add lights",
             "webhooks": "Webhooks",
-            "webhooks_in": "Incoming webhooks",
-            "webhooks_in_edit": "Webhook mapping",
+            "webhooks_setup": "Setup guide",
+            "webhooks_listen": "Listener settings",
+            "webhooks_in": "Alert routes",
+            "webhooks_in_edit": "Edit route",
             "webhooks_in_camera": "Link camera",
-            "webhooks_out": "Outgoing webhooks",
+            "webhooks_out": "Outgoing targets",
             "webhooks_out_edit": "Outgoing target",
             "cameras": "Cameras & layout",
             "cameras_arrange": "Arrange tiles",
@@ -6102,11 +6299,15 @@ class MosaicApp:
         if self._menu_page == "ha_light_pick":
             return "Type to search    Enter add/remove    Esc back"
         if self._menu_page == "webhooks":
-            return "Incoming listener + outgoing POSTs    Esc back"
+            return "Quick setup · Alert routes · Listener settings    Esc back"
+        if self._menu_page == "webhooks_setup":
+            return "Step-by-step help    Esc back"
+        if self._menu_page == "webhooks_listen":
+            return "Port · secret · bind address    ← → adjust    Esc back"
         if self._menu_page == "webhooks_in":
-            return "POST /webhook/<path>    Enter edit    Esc back"
+            return "Enter edit route · Copy URL inside route    Esc back"
         if self._menu_page == "webhooks_in_edit":
-            return "Same alerts as HA sensors    Test event    Esc back"
+            return "Copy URL + body · line 1 URL · line 2 Body · Test    Esc back"
         if self._menu_page == "webhooks_in_camera":
             return "Enter choose camera    Esc back"
         if self._menu_page == "webhooks_out":
@@ -6149,6 +6350,8 @@ class MosaicApp:
             "ha_lights",
             "ha_light_pick",
             "webhooks",
+            "webhooks_setup",
+            "webhooks_listen",
             "webhooks_in",
             "webhooks_in_edit",
             "webhooks_in_camera",
@@ -6247,6 +6450,17 @@ class MosaicApp:
                     (58, 64, 82),
                     1,
                     cv2.LINE_AA,
+                )
+                ry += row_height
+                continue
+            if is_menu_info(action):
+                draw_text(
+                    canvas,
+                    label,
+                    (box[0] + 14, ry + 5),
+                    size=13,
+                    color=(132, 140, 158),
+                    valign="top",
                 )
                 ry += row_height
                 continue
@@ -6597,7 +6811,7 @@ class MosaicApp:
         px, py = self._event_to_pixel(x, y)
         for action, absolute, x0, y0, x1, y1 in self._menu_hitboxes:
             if x0 <= px <= x1 and y0 <= py <= y1:
-                if is_menu_header(action):
+                if is_menu_non_selectable(action):
                     return
                 self._menu_index = absolute
                 self._menu_activated_by_mouse = True
